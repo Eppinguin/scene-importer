@@ -30,7 +30,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
                     if (isValidType) {
                         try {
-                            await addItemsFromVTT(file, false);
+                            await addItemsFromVTT(file, true);
                         } catch (error) {
                             console.error(error);
                             await OBR.notification.show(
