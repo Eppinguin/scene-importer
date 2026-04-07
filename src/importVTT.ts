@@ -37,9 +37,13 @@ export function hasMapImage(data: unknown): boolean {
 export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
     let padX = 0;
     let padY = 0;
+
+    // Resolve grid size handling for both Foundry V11 (numeric) and V12+ (object)
+    const gridSize = typeof foundryData.grid === 'object' ? (foundryData.grid?.size || 100) : (Number(foundryData.grid) || 100);
+
     if (foundryData.padding !== undefined) {
-        padX = Math.ceil((foundryData.width * foundryData.padding) / foundryData.grid) * foundryData.grid;
-        padY = Math.ceil((foundryData.height * foundryData.padding) / foundryData.grid) * foundryData.grid;
+        padX = Math.ceil((foundryData.width * foundryData.padding) / gridSize) * gridSize;
+        padY = Math.ceil((foundryData.height * foundryData.padding) / gridSize) * gridSize;
     }
     const bgShiftX = foundryData.shiftX || (foundryData.background && foundryData.background.offsetX) || 0;
     const bgShiftY = foundryData.shiftY || (foundryData.background && foundryData.background.offsetY) || 0;
@@ -50,8 +54,8 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
     const walls: Vector2[][] = foundryData.walls
         .filter(wall => wall.door === 0) // Non-door walls
         .map(wall => [
-            { x: (wall.c[0] - offsetX) / foundryData.grid, y: (wall.c[1] - offsetY) / foundryData.grid },
-            { x: (wall.c[2] - offsetX) / foundryData.grid, y: (wall.c[3] - offsetY) / foundryData.grid }
+            { x: (wall.c[0] - offsetX) / gridSize, y: (wall.c[1] - offsetY) / gridSize },
+            { x: (wall.c[2] - offsetX) / gridSize, y: (wall.c[3] - offsetY) / gridSize }
         ]);
 
     const portals = foundryData.walls
@@ -59,8 +63,8 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
         .map(wall => ({
             position: { x: 0, y: 0 }, // Not actually used by OBR sdk in same way
             bounds: [
-                { x: (wall.c[0] - offsetX) / foundryData.grid, y: (wall.c[1] - offsetY) / foundryData.grid },
-                { x: (wall.c[2] - offsetX) / foundryData.grid, y: (wall.c[3] - offsetY) / foundryData.grid }
+                { x: (wall.c[0] - offsetX) / gridSize, y: (wall.c[1] - offsetY) / gridSize },
+                { x: (wall.c[2] - offsetX) / gridSize, y: (wall.c[3] - offsetY) / gridSize }
             ],
             rotation: 0,
             closed: wall.ds === 0, // Assuming ds=0 means closed, ds=1 means open
@@ -70,8 +74,8 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
     return {
         resolution: {
             map_origin: { x: 0, y: 0 },
-            map_size: { x: foundryData.width / foundryData.grid, y: foundryData.height / foundryData.grid },
-            pixels_per_grid: foundryData.grid
+            map_size: { x: foundryData.width / gridSize, y: foundryData.height / gridSize },
+            pixels_per_grid: gridSize
         },
         line_of_sight: walls,
         objects_line_of_sight: [],

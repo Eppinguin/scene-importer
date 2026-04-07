@@ -30,7 +30,7 @@ export interface FoundryVTTData {
     name: string;
     width: number;
     height: number;
-    grid: number;
+    grid: number | { size: number; [key: string]: any };
     gridDistance?: number;
     gridUnits?: string;
     padding?: number;
