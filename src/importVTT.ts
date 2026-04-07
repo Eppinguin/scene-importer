@@ -9,6 +9,8 @@ import { createWallItems, createDoorItems } from "./vttItems";
 
 type VTTData = VTTMapData;
 
+import JSZip from 'jszip';
+
 export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
     const d = data as Partial<FoundryVTTData>;
     return !!d
@@ -19,7 +21,7 @@ export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
             Array.isArray(w.c) && w.c.length === 4);
 }
 
-function isUniversalVTTData(data: unknown): data is UniversalVTT {
+export function isUniversalVTTData(data: any): data is UniversalVTT {
     const d = data as Partial<UniversalVTT>;
     return !!d
         && typeof d.format === 'number'
@@ -32,36 +34,48 @@ export function hasMapImage(data: unknown): boolean {
     return !!(data && typeof data === 'object' && 'image' in data && (data as { image?: string }).image);
 }
 
-function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
+export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
+    let padX = 0;
+    let padY = 0;
+    if (foundryData.padding !== undefined) {
+        padX = Math.ceil((foundryData.width * foundryData.padding) / foundryData.grid) * foundryData.grid;
+        padY = Math.ceil((foundryData.height * foundryData.padding) / foundryData.grid) * foundryData.grid;
+    }
+    const bgShiftX = foundryData.shiftX || (foundryData.background && foundryData.background.offsetX) || 0;
+    const bgShiftY = foundryData.shiftY || (foundryData.background && foundryData.background.offsetY) || 0;
+
+    const offsetX = padX + bgShiftX;
+    const offsetY = padY + bgShiftY;
+
     const walls: Vector2[][] = foundryData.walls
         .filter(wall => wall.door === 0) // Non-door walls
         .map(wall => [
-            { x: wall.c[0] / foundryData.grid, y: wall.c[1] / foundryData.grid },
-            { x: wall.c[2] / foundryData.grid, y: wall.c[3] / foundryData.grid }
+            { x: (wall.c[0] - offsetX) / foundryData.grid, y: (wall.c[1] - offsetY) / foundryData.grid },
+            { x: (wall.c[2] - offsetX) / foundryData.grid, y: (wall.c[3] - offsetY) / foundryData.grid }
         ]);
 
-    const doors = foundryData.walls
-        .filter(wall => wall.door === 1)
+    const portals = foundryData.walls
+        .filter(wall => wall.door === 1) // Door walls
         .map(wall => ({
-            position: { x: 0, y: 0 }, // Not used in OBR
+            position: { x: 0, y: 0 }, // Not actually used by OBR sdk in same way
             bounds: [
-                { x: wall.c[0] / foundryData.grid, y: wall.c[1] / foundryData.grid },
-                { x: wall.c[2] / foundryData.grid, y: wall.c[3] / foundryData.grid }
+                { x: (wall.c[0] - offsetX) / foundryData.grid, y: (wall.c[1] - offsetY) / foundryData.grid },
+                { x: (wall.c[2] - offsetX) / foundryData.grid, y: (wall.c[3] - offsetY) / foundryData.grid }
             ],
             rotation: 0,
-            closed: true,
+            closed: wall.ds === 0, // Assuming ds=0 means closed, ds=1 means open
             freestanding: false
         }));
 
     return {
-        line_of_sight: walls,
-        objects_line_of_sight: [],
-        portals: doors,
         resolution: {
             map_origin: { x: 0, y: 0 },
-            map_size: { x: foundryData.width, y: foundryData.height },
+            map_size: { x: foundryData.width / foundryData.grid, y: foundryData.height / foundryData.grid },
             pixels_per_grid: foundryData.grid
-        }
+        },
+        line_of_sight: walls,
+        objects_line_of_sight: [],
+        portals: portals
     };
 }
 
@@ -255,48 +269,70 @@ export async function uploadSceneFromVTT(file: File, compressionMode: Compressio
     await OBR.assets.uploadScenes([sceneToUpload]);
 }
 
-const BATCH_SIZE = 50;
+export async function uploadFoundryScene(foundryData: FoundryVTTData, imageBlob: Blob, name: string, compressionMode: CompressionMode = 'standard'): Promise<void> {
+    OBR.notification.show("Importing scene..", "INFO");
+    const vttMapDataSource = convertFoundryToVTTData(foundryData);
 
-// Helper function to process items in batches
+    const optimizationOptions: OptimizationOptions = {
+        compressionMode,
+        maxSizeInMB: compressionMode === 'high' ? 49 : 24,
+        maxMegapixels: compressionMode === 'standard' ? 67 : 144
+    };
+
+    const optimizedBlob = await optimizeImage(imageBlob, optimizationOptions);
+    const fileExtension = compressionMode === 'none' ?
+        (imageBlob.type === 'image/webp' ? 'webp' : 'png') :
+        'webp';
+    const imageFile = new File([optimizedBlob], `map.${fileExtension}`, { type: optimizedBlob.type });
+
+    const imageUpload = buildImageUpload(imageFile)
+        .dpi(vttMapDataSource.resolution.pixels_per_grid)
+        .name(name)
+        .build();
+
+    const defaultPosition: Vector2 = { x: 0, y: 0 };
+    const defaultScale: Vector2 = { x: 1, y: 1 };
+
+    const wallItems = await createWallItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    let doorItems: Item[] = [];
+    if (vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
+        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    }
+    const allItems = [...wallItems, ...doorItems];
+
+    let sceneBuilder = buildSceneUpload()
+        .name(name)
+        .baseMap(imageUpload)
+        .gridType("SQUARE");
+
+    if (allItems.length > 0) {
+        sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
+    }
+
+    const sceneToUpload = sceneBuilder.build();
+
+    await OBR.assets.uploadScenes([sceneToUpload]);
+}
+
+const BATCH_SIZE = 75;
+
+// Helper function to process items in batches with rate-limit pacing
 async function addItemsInBatches(items: Item[], batchSize: number): Promise<void> {
     for (let i = 0; i < items.length; i += batchSize) {
         const batch = items.slice(i, i + batchSize);
         await OBR.scene.items.addItems(batch);
+
+        // Respect rate limits for subsequent batches
+        if (i + batchSize < items.length) {
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
     }
 }
 
-// Add items from VTT file to the current scene
-export async function addItemsFromVTT(file: File, context: boolean): Promise<void> {
+export async function addItemsFromData(processedData: VTTMapData, context: boolean): Promise<void> {
     if (!await OBR.scene.isReady()) {
         console.error("Scene is not ready. Please wait until the scene is fully loaded.");
         return;
-    }
-
-    // Read and parse the file
-    const text = await readFileAsText(file);
-    const fileData = JSON.parse(text);
-
-    let processedData: VTTMapData;
-    // let fileName = file.name;
-
-    try {
-        // Detect file type and convert if necessary
-        if (isFoundryVTTData(fileData)) {
-            console.log("Detected FoundryVTT format");
-            processedData = convertFoundryToVTTData(fileData);
-            // fileName = fileData.name || fileName;
-        } else if (isUniversalVTTData(fileData)) {
-            console.log("Detected UniversalVTT format");
-            // Remove the image property to free up memory for UVTT files
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { image: _, ...vttData } = fileData;
-            processedData = vttData as VTTMapData;
-        } else {
-            throw new Error("Unsupported file format. Please use a valid UVTT, DD2VTT, or FoundryVTT JSON file.");
-        }
-    } catch (error) {
-        console.error("Error processing file:", error);
-        throw new Error("Failed to process the file. Make sure it's a valid UVTT, DD2VTT, or FoundryVTT JSON file.");
     }
 
     if (!processedData.resolution?.pixels_per_grid) {
@@ -312,7 +348,6 @@ export async function addItemsFromVTT(file: File, context: boolean): Promise<voi
             if (items.length > 0) {
                 const selectedItem = items[0];
                 position = selectedItem.position;
-                // Get scale from the selected item if it exists
                 if ('scale' in selectedItem) {
                     scale = selectedItem.scale;
                 }
@@ -322,13 +357,11 @@ export async function addItemsFromVTT(file: File, context: boolean): Promise<voi
 
     const dpi = await OBR.scene.grid.getDpi();
 
-    // Create and add walls in batches
     const walls = await createWallItems(processedData, position, scale, dpi);
     if (walls.length > 0) {
         await addItemsInBatches(walls, BATCH_SIZE);
     }
 
-    // Create and add doors in batches
     if (processedData.portals && processedData.portals.length > 0) {
         const doors = await createDoorItems(processedData, position, scale, dpi);
         if (doors.length > 0) {
@@ -340,6 +373,31 @@ export async function addItemsFromVTT(file: File, context: boolean): Promise<voi
     await OBR.notification.show("Import complete!", "SUCCESS");
 }
 
+export async function addItemsFromVTT(file: File, context: boolean): Promise<void> {
+    const text = await readFileAsText(file);
+    const fileData = JSON.parse(text);
+
+    let processedData: VTTMapData;
+
+    try {
+        if (isFoundryVTTData(fileData)) {
+            console.log("Detected FoundryVTT format");
+            processedData = convertFoundryToVTTData(fileData);
+        } else if (isUniversalVTTData(fileData)) {
+            console.log("Detected UniversalVTT format");
+            const { image: _, ...vttData } = fileData;
+            processedData = vttData as VTTMapData;
+        } else {
+            throw new Error("Unsupported file format. Please use a valid UVTT, DD2VTT, or FoundryVTT JSON file.");
+        }
+    } catch (error) {
+        console.error("Error processing file:", error);
+        throw new Error("Failed to process the file. Make sure it's a valid UVTT, DD2VTT, or FoundryVTT JSON file.");
+    }
+
+    await addItemsFromData(processedData, context);
+}
+
 // Helper function to read file as text
 function readFileAsText(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -348,4 +406,43 @@ function readFileAsText(file: File): Promise<string> {
         reader.onerror = reject;
         reader.readAsText(file);
     });
+}
+
+export async function extractImageFromZip(zip: JSZip, imgPath: string): Promise<Blob> {
+    if (!imgPath) {
+        throw new Error('Image path is empty.');
+    }
+    // Handle specific replacement for Foundry internal paths
+    if (imgPath.startsWith('modules/')) {
+        const parts = imgPath.split('/');
+        parts.shift(); // remove 'modules'
+        imgPath = parts.join('/');
+    }
+
+    let file = zip.file(imgPath);
+    if (!file) {
+        const allFiles = Object.keys(zip.files);
+        let match = allFiles.find(p => p.endsWith(imgPath));
+        if (!match) {
+            match = allFiles.find(p => imgPath.endsWith(p));
+        }
+        if (match) {
+            file = zip.file(match);
+        }
+    }
+
+    if (!file) {
+        throw new Error(`Image not found in ZIP: ${imgPath}`);
+    }
+
+    const arrayBuffer = await file.async('arraybuffer');
+
+    let type = 'image/png';
+    if (imgPath.toLowerCase().endsWith('.jpg') || imgPath.toLowerCase().endsWith('.jpeg')) {
+        type = 'image/jpeg';
+    } else if (imgPath.toLowerCase().endsWith('.webp')) {
+        type = 'image/webp';
+    }
+
+    return new Blob([arrayBuffer], { type });
 }

@@ -14,9 +14,15 @@ export function setupContextMenu() {
                 },
             },
         ],
-        embed: {
-            url: "/src/contextMenu.html",
-            height: 60
+        onClick: async () => {
+            const width = 600;
+            const height = 700;
+            await OBR.modal.open({
+                id: `${ID}/modal`,
+                url: "/index.html?context=true",
+                height: height,
+                width: width
+            });
         }
     });
 }

@@ -19,10 +19,11 @@ export interface VTTMapData {
 
 export interface FoundryVTTWall {
     c: number[];  // coordinates [x1, y1, x2, y2]
-    move: number;
-    sense: number;
-    door: number;
-    sound: number;
+    move?: number;
+    sense?: number;
+    door: number; // 0 for normal wall, 1 for door
+    ds?: number;
+    sound?: number;
 }
 
 export interface FoundryVTTData {
@@ -30,8 +31,15 @@ export interface FoundryVTTData {
     width: number;
     height: number;
     grid: number;
-    gridDistance: number;
-    gridUnits: string;
+    gridDistance?: number;
+    gridUnits?: string;
+    padding?: number;
+    shiftX?: number;
+    shiftY?: number;
+    background?: {
+        offsetX?: number;
+        offsetY?: number;
+    };
     walls: FoundryVTTWall[];
 }
 
