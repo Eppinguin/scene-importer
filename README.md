@@ -25,7 +25,7 @@ Designed for use with the [Dynamic Fog Extension](https://extensions.owlbear.rod
 This will create a new scene, complete with the map image, walls, and doors from your VTT file.
 
 1. Click the UVTT Importer icon in the top left corner.
-2. Select your `.uvtt`, `.dd2vtt`, or `.zip` module file, or paste a direct URL link. *(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. For full image support, upload the a Foundry ZIP module instead).*
+2. Select your `.uvtt`, `.dd2vtt`, or `.zip` module file, or paste a direct URL link. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. For full image support, upload a Foundry ZIP module instead)._
 3. Choose your compression mode (see below).
 4. Click "Create New Scene". This can take a moment, depending on the image size and compression.
 5. Once the process is complete, a new scene with your map and all its walls and doors will be available in your scenes list.
@@ -57,15 +57,30 @@ You can add walls and doors to an existing scene in two ways:
 
 ## Compression Modes
 
-When importing maps, you can choose from three compression modes:
+Owlbear Rodeo has specific file size limits depending on your subscription tier. The extension dynamically adjusts the available compression options based on whether you are importing an image or a video to match these limits.
 
-| Mode     | Description                                           |
-| -------- | ----------------------------------------------------- |
-| Standard | Best for most maps (optimizes to ~24MB)               |
-| Bestling | Better quality for detailed maps (optimizes to ~49MB) |
-| None     | Uses original image format                            |
+Select the option that includes your current Owlbear Rodeo subscription tier:
 
-The two compressions will first convert the image to WebP and then incrementally reduce the quality of the image to fit the constraints.
+- **Images:** Nestling / Fledgeling (max 25MB) or Bestling (max 50MB)
+- **Videos:** Nestling (max 50MB) or Fledgeling / Bestling (max 100MB)
+
+### How the Modes Work
+
+| Mode               | Behavior                                                                                                                                                           |
+| :----------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No Compression** | Uploads the original file without modification. The upload will fail if the file exceeds your account's size limit.                                                |
+| **Your Tier Name** | Compresses the file to fit your selected tier's limit. Images are converted to WebP and quality is incrementally reduced until the file is under the maximum size. |
+
+### Advanced Video Options
+
+When importing video maps, you can adjust the following settings to control how the files are processed:
+
+- **VP9/WebM:** Default format. Balances file size and browser compatibility.
+- **AV1:** Yields the smallest file sizes, but takes longer to process.
+- **H.264:** Maximum compatibility across older browsers and mobile devices.
+- **Remove audio:** Removes the audio track to reduce file size.
+- **Transcode anyway:** Compresses the video even if it is already under the size limit to save storage space.
+- **Max video dimension:** Limits the longest side in pixels (example: `1920`) to reduce processing time and file size. Leave empty to keep the original resolution.
 
 ## Installing
 

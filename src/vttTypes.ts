@@ -30,7 +30,7 @@ export interface FoundryVTTData {
     name: string;
     width: number;
     height: number;
-    grid: number | { size: number; [key: string]: any };
+    grid: number | { size: number;[key: string]: unknown };
     gridDistance?: number;
     gridUnits?: string;
     padding?: number;
@@ -39,8 +39,9 @@ export interface FoundryVTTData {
     background?: {
         offsetX?: number;
         offsetY?: number;
+        src?: string;
     };
-    walls: FoundryVTTWall[];
+    walls?: FoundryVTTWall[];
 }
 
 export interface UniversalVTT extends VTTMapData {

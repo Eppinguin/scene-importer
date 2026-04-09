@@ -260,15 +260,41 @@ button:disabled {
   font-size: 0.8rem;
   user-select: none;
 }
+ 
+.video-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 10;
+  backdrop-filter: blur(2px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.video-badge svg {
+  width: 14px;
+  height: 14px;
+}
 
 .scene-name {
-  padding: 0.5rem;
-  font-size: 0.8rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.7rem;
+  line-height: 1.15;
   color: var(--text-primary);
   text-align: center;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
+  word-break: break-word;
 }
 
 /* Floating ENLARGED Preview */
@@ -289,7 +315,8 @@ button:disabled {
   align-items: center;
 }
 
-.scene-preview-float img {
+.scene-preview-float img,
+.scene-preview-float video {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
@@ -310,4 +337,45 @@ button:disabled {
   button {
     width: auto;
   }
+}
+
+/* --- VIDEO COMPRESSION PROGRESS BAR --- */
+.compression-progress {
+  margin: 0.5rem 0 0.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.compression-progress-label {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.compression-progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.2);
+  overflow: hidden;
+}
+
+.compression-progress-bar {
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    var(--primary-main) 0%,
+    var(--primary-light) 50%,
+    var(--primary-main) 100%
+  );
+  background-size: 200% 100%;
+  animation: progress-shimmer 1.5s linear infinite;
+  transition: width 0.3s ease-out;
+}
+
+@keyframes progress-shimmer {
+  0%   { background-position: 200% center; }
+  100% { background-position: -200% center; }
 }
