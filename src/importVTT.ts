@@ -936,6 +936,8 @@ export async function addItemsFromData(processedData: VTTMapData, context: boole
 
     let position = { x: 0, y: 0 };
     let scale = { x: 1, y: 1 };
+    const dpi = await OBR.scene.grid.getDpi();
+
     if (context) {
         const selection = await OBR.player.getSelection();
         if (selection && selection.length > 0) {
@@ -946,11 +948,38 @@ export async function addItemsFromData(processedData: VTTMapData, context: boole
                 if ('scale' in selectedItem) {
                     scale = selectedItem.scale;
                 }
+
+                // Keep walls aligned to the selected map even when the map has been resized.
+                const sourceWidth = processedData.resolution?.map_size?.x;
+                const sourceHeight = processedData.resolution?.map_size?.y;
+                const selectedWithSize = selectedItem as {
+                    width?: unknown;
+                    height?: unknown;
+                };
+                const selectedWidth = typeof selectedWithSize.width === 'number' ? selectedWithSize.width : undefined;
+                const selectedHeight = typeof selectedWithSize.height === 'number' ? selectedWithSize.height : undefined;
+
+                if (
+                    typeof sourceWidth === 'number' && sourceWidth > 0
+                    && typeof sourceHeight === 'number' && sourceHeight > 0
+                    && typeof selectedWidth === 'number' && selectedWidth > 0
+                    && typeof selectedHeight === 'number' && selectedHeight > 0
+                ) {
+                    const renderedWidth = selectedWidth * scale.x;
+                    const renderedHeight = selectedHeight * scale.y;
+                    const scaleFromWidth = renderedWidth / (sourceWidth * dpi);
+                    const scaleFromHeight = renderedHeight / (sourceHeight * dpi);
+
+                    if (Number.isFinite(scaleFromWidth) && scaleFromWidth > 0) {
+                        scale.x = scaleFromWidth;
+                    }
+                    if (Number.isFinite(scaleFromHeight) && scaleFromHeight > 0) {
+                        scale.y = scaleFromHeight;
+                    }
+                }
             }
         }
     }
-
-    const dpi = await OBR.scene.grid.getDpi();
 
     const walls = await createWallItems(processedData, position, scale, dpi);
     if (walls.length > 0) {
