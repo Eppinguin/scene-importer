@@ -16,7 +16,7 @@ export function setupContextMenu() {
         ],
         onClick: async () => {
             const width = 600;
-            const height = 700;
+            const height = 560;
             await OBR.modal.open({
                 id: `${ID}/modal`,
                 url: "/index.html?context=true",

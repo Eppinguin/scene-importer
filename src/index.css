@@ -23,7 +23,50 @@
 
 body {
   min-width: 175px;
-  min-height: 100vh;
+  min-height: 0;
+  height: auto;
+  background: transparent !important;
   overflow-y: auto;
   scrollbar-gutter: stable;
+}
+
+html,
+#root {
+  background: transparent !important;
+}
+
+:not(html):not(body)::-webkit-scrollbar {
+  background-color: transparent;
+  border-radius: 100px;
+}
+
+:not(html):not(body)::-webkit-scrollbar:vertical {
+  width: 10px;
+}
+
+:not(html):not(body)::-webkit-scrollbar:horizontal {
+  height: 10px;
+}
+
+:not(html):not(body)::-webkit-scrollbar:hover {
+  background-color: rgba(var(--text-primary-rgb, 127, 127, 127), 0.09);
+}
+
+:not(html):not(body)::-webkit-scrollbar-thumb {
+  background-color: rgba(var(--text-primary-rgb, 127, 127, 127), 0.45);
+  border-radius: 16px;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+:not(html):not(body)::-webkit-scrollbar-thumb:vertical {
+  min-height: 10px;
+}
+
+:not(html):not(body)::-webkit-scrollbar-thumb:horizontal {
+  min-width: 10px;
+}
+
+:not(html):not(body)::-webkit-scrollbar-thumb:active {
+  background-color: rgba(var(--text-primary-rgb, 127, 127, 127), 0.6);
 }
