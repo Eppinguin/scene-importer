@@ -116,6 +116,12 @@ function App() {
     ? sceneHasWallData(selectedModuleScene.data)
     : true;
   const selectedSceneIsVideo = !!selectedModuleScene?.isVideo;
+  const selectedFileIsVideo =
+    !!selectedFile &&
+    (selectedFile.type.startsWith("video/") ||
+      /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(selectedFile.name.toLowerCase()));
+  const selectedInputIsVideo =
+    availableScenes.length > 0 ? selectedSceneIsVideo : selectedFileIsVideo;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
 
   useEffect(
@@ -1231,7 +1237,8 @@ function App() {
               <Typography
                 className="compression-progress-label"
                 variant="caption">
-                Compressing video… {uploadProgress}%
+                Compressing {selectedInputIsVideo ? "video" : "image"}…{" "}
+                {uploadProgress}%
               </Typography>
               <LinearProgress
                 variant="determinate"
