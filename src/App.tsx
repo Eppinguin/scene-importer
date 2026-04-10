@@ -834,11 +834,24 @@ function App() {
         }
         return "Unknown error";
       };
+      const toNotificationMessage = (text: string, max = 240): string =>
+        text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 
       const message = getErrorMessage(error);
       const lowerMessage = message.toLowerCase();
       if (lowerMessage.includes("aborted")) {
         OBR.notification.show("Compression canceled.", "INFO");
+      } else if (
+        lowerMessage.includes("timed out") ||
+        lowerMessage.includes("stalled") ||
+        lowerMessage.includes("hardware-accelerated")
+      ) {
+        OBR.notification.show(
+          toNotificationMessage(
+            "This browser could not finish video compression in time. Try a browser/device with hardware-accelerated video encoding, or lower Max video dimension.",
+          ),
+          "WARNING",
+        );
       } else if (
         lowerMessage.includes("too large") ||
         lowerMessage.includes("size") ||
@@ -849,9 +862,15 @@ function App() {
           compressionMode === "high"
             ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max video dimension in Advanced options."
             : "Try reducing Max video dimension in Advanced options or using H.264 codec.";
-        OBR.notification.show(`${message}. ${hint}`, "WARNING");
+        OBR.notification.show(
+          toNotificationMessage(`${message}. ${hint}`),
+          "WARNING",
+        );
       } else {
-        OBR.notification.show(`Failed to create scene: ${message}`, "ERROR");
+        OBR.notification.show(
+          toNotificationMessage(`Failed to create scene: ${message}`),
+          "ERROR",
+        );
       }
     } finally {
       compressionAbortRef.current = null;
@@ -1104,12 +1123,12 @@ function App() {
                     disabled={isLoading}>
                     <MenuItem value="none">No Compression</MenuItem>
                     <MenuItem value="standard">
-                      {selectedSceneIsVideo
+                      {selectedInputIsVideo
                         ? "Nestling (Max 50MB)"
                         : "Nestling / Fledgeling (Max 25MB)"}
                     </MenuItem>
                     <MenuItem value="high">
-                      {selectedSceneIsVideo
+                      {selectedInputIsVideo
                         ? "Fledgeling / Bestling (Max 100MB)"
                         : "Bestling Tier (Max 50MB)"}
                     </MenuItem>
@@ -1126,7 +1145,7 @@ function App() {
 
                   {compressionMode === "standard" && (
                     <Typography variant="body2">
-                      {selectedSceneIsVideo
+                      {selectedInputIsVideo
                         ? "Compresses the video to a maximum of 50MB to fit Nestling account limits."
                         : "Compresses the image to a maximum of 25MB to fit Nestling and Fledgeling account limits."}
                     </Typography>
@@ -1134,7 +1153,7 @@ function App() {
 
                   {compressionMode === "high" && (
                     <Typography variant="body2">
-                      {selectedSceneIsVideo
+                      {selectedInputIsVideo
                         ? "Compresses the video to a maximum of 100MB to fit Fledgeling and Bestling account limits."
                         : "Compresses the image to a maximum of 50MB to fit Bestling account limits."}
                     </Typography>
