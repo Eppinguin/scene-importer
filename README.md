@@ -34,6 +34,8 @@ This will create a new scene using your VTT file or raw media file. If a VTT fil
 4. Click "Create New Scene". This can take a moment, depending on the file size and compression.
 5. Once the process is complete, a new scene with your map will be available in your scenes list.
 
+![create scene from file](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-map-from-menu.gif)
+
 _Note: If your UVTT file does not contain a map image, you will not be able to use the "Create New Scene" option. In this case, you should first set up your scene with a map image manually, and then use the "Add Walls to Current Scene" feature._
 
 ### Add Walls and Doors to an Existing Scene
