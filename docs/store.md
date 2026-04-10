@@ -1,6 +1,6 @@
 ---
 title: UVTT Importer
-description: Import Universal VTT files with walls and doors for Dynamic Fog
+description: Import VTT wall data (.uvtt, .dd2vtt, Foundry) for Dynamic Fog, or automatically compress raw media uploads to fit your tier limits.
 author: Eppinguin
 image: https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/header.webp
 icon: https://uvtt-importer.pages.dev/Logo.webp
@@ -12,21 +12,21 @@ learn-more: https://github.com/Eppinguin/uvtt-importer
 
 # UVTT Importer
 
-Import walls and doors from Universal VTT (.uvtt), DD2VTT (.dd2vtt), and FoundryVTT scene (.json) files directly for [Dynamic Fog](https://extensions.owlbear.rodeo/dynamic-fog). Perfect for bringing in maps from Dungeondraft, Dungeon Alchemist, and other VTT map creation tools.
+Import VTT wall data directly for [Dynamic Fog](https://extensions.owlbear.rodeo/dynamic-fog) using Universal VTT (.uvtt), DD2VTT (.dd2vtt), or FoundryVTT files (JSON, ZIP, or URLs). Alternatively, you can upload raw image and video files and let the extension automatically compress them to fit your Owlbear Rodeo subscription limits.
 
 This importer is designed to work with the Dynamic Fog Extension, providing an easy way to import walls and doors from your existing maps. For users seeking advanced features like dynamic lighting and custom fog backgrounds, check out the excellent [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
 
 ![add walls from menu](https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/import-walls-from-menu.gif)
 
-## Import a New Map with Walls and Doors
+## Import a New Map
 
-This will create a new scene, complete with the map image, walls, and doors from your VTT file.
+This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls and doors.
 
 1. Click the UVTT Importer icon in the top left corner.
-2. Select your .uvtt or .dd2vtt file. (FoundryVTT .json files are not supported for new scene creation as they typically don't include a map image).
+2. Select your `.uvtt`, `.dd2vtt`, `.zip` module file, raw image, raw video, or paste a URL. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. Upload a Foundry ZIP module instead)._
 3. Choose your compression mode ([see below](#compression-modes)).
-4. Click "Create New Scene". This can take a moment, depending on the image size and compression.
-5. Once the process is complete, a new scene with your map and all its walls and doors will be available in your scenes list.
+4. Click "Create New Scene". This can take a moment, depending on the file size and compression.
+5. Once the process is complete, a new scene with your map will be available in your scenes list.
 
 _Note: If your UVTT file does not contain a map image, you will not be able to use the "Create New Scene" option. In this case, you should first set up your scene with a map image manually, and then use the "Add Walls to Current Scene" feature._
 
@@ -38,33 +38,37 @@ This option is for adding walls and doors to a scene that already exists or to a
 
 1. Open the scene where you want to add walls/doors.
 2. Click the UVTT Importer button in the toolbar.
-3. Select your .uvtt, .dd2vtt, or .json file.
+3. Select your `.uvtt`, `.dd2vtt`, `.json`, `.zip` file, or paste a URL.
 4. Click "Add Walls to Current Scene".
 5. The walls and doors will be added to the current scene.
 
 ### Using the Map's Context Menu (for existing maps):
 
-For existing maps, you can add Walls and Doors using the Map's Context Menu (right-click menu). This method will automatically position the Walls relative to the Map's current location and scale. This is particularly useful when you have already positioned or resized the Map in your Scene, or when working with multiple Maps in a single Scene.
+For existing maps, you can add Walls and Doors using the Map's Context Menu (right-click menu). This method automatically positions the walls relative to the map's current location and scale, which is useful when you have already positioned or resized the map, or when working with multiple maps in a single scene.
 
 1. Select the Map you want to Import Walls for.
 2. Right Click it.
-3. Click "Import UVTT/DD2VTT File".
-4. Select a File.
+3. Click "Import Walls".
+4. The extension will automatically open the Importer Selector so you can choose exactly which wall structure to cast onto your highlighted image.
 5. Wait for Walls and Doors to be added to the Map.
 
 ![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/import-walls-from-context-menu.gif)
 
 ## Compression Modes
 
-When importing maps, you can choose from three compression modes:
+Owlbear Rodeo has specific file size limits depending on your subscription tier. The extension dynamically adjusts the available compression options based on whether you are importing an image or a video to match these limits.
 
-| Mode     | Description                                           |
-| -------- | ----------------------------------------------------- |
-| Standard | Best for most maps (optimizes to ~24MB)               |
-| Bestling | Better quality for detailed maps (optimizes to ~49MB) |
-| None     | Uses original image format                            |
+Select the option that includes your current Owlbear Rodeo subscription tier:
 
-The two compressions will first convert the image to WebP and then incrementally reduce the quality of the image to fit the constraints.
+- **Images:** Nestling / Fledgeling (max 25MB) or Bestling (max 50MB)
+- **Videos:** Nestling (max 50MB) or Fledgeling / Bestling (max 100MB)
+
+| Mode               | Description                                                                                                                                                        |
+| :----------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **No Compression** | Uploads the original file without modification. The upload will fail if the file exceeds your account's size limit.                                                |
+| **Your Tier Name** | Compresses the file to fit your selected tier's limit. Images are converted to WebP and quality is incrementally reduced until the file is under the maximum size. |
+
+_Advanced video compression settings (such as format selection, audio removal, and resolution limits) are also available directly in the importer window._
 
 ## Acknowledgments
 

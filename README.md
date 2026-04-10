@@ -1,11 +1,12 @@
 # UVTT Importer for Owlbear Rodeo
 
-A Virtual Tabletop (VTT) map importer extension for [Owlbear Rodeo](https://www.owlbear.rodeo/). It imports maps with walls and doors from:
+A Virtual Tabletop (VTT) map importer extension for [Owlbear Rodeo](https://www.owlbear.rodeo/). It imports maps, complete with walls and doors (where applicable), from:
 
 - Universal VTT (.uvtt) files
 - DD2VTT (.dd2vtt) files
 - FoundryVTT scene JSON files
-- **FoundryVTT Module ZIPs and `module.json` manifest URLs (Includes map image & walls)**
+- FoundryVTT Module ZIPs and `module.json` manifest URLs (Includes map image & walls)
+- **Raw image and video files (to utilize the extension's compression features)**
 
 Designed for use with the [Dynamic Fog Extension](https://extensions.owlbear.rodeo/dynamic-fog) for basic wall and door functionality. For advanced features, consider the [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
 
@@ -13,22 +14,23 @@ Designed for use with the [Dynamic Fog Extension](https://extensions.owlbear.rod
 
 - Import maps from UVTT/DD2VTT files, and complete FoundryVTT module ZIP archives
 - Import payloads dynamically via Web URLs or natively wrapped `module.json` configuration links
-- Automatic wall and door creation from the imported data
-- Smart image optimization with multiple compression modes
+- Upload raw image and video files to take advantage of the built-in file compression
+- Automatic wall and door creation from imported VTT data
+- Image and video compression modes that target Owlbear Rodeo subscription limits
 - Support for placing walls and doors relative to selected items
 - Automatic DPI adjustment based on grid size
 
 ## Usage
 
-### Import a New Map with Walls and Doors
+### Import a New Map or Scene
 
-This will create a new scene, complete with the map image, walls, and doors from your VTT file.
+This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls and doors.
 
 1. Click the UVTT Importer icon in the top left corner.
-2. Select your `.uvtt`, `.dd2vtt`, or `.zip` module file, or paste a direct URL link. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. For full image support, upload a Foundry ZIP module instead)._
+2. Select your `.uvtt`, `.dd2vtt`, `.zip` module file, raw image, raw video, or paste a direct URL link. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. For full image support, upload a Foundry ZIP module instead)._
 3. Choose your compression mode (see below).
-4. Click "Create New Scene". This can take a moment, depending on the image size and compression.
-5. Once the process is complete, a new scene with your map and all its walls and doors will be available in your scenes list.
+4. Click "Create New Scene". This can take a moment, depending on the file size and compression.
+5. Once the process is complete, a new scene with your map will be available in your scenes list.
 
 _Note: If your UVTT file does not contain a map image, you will not be able to use the "Create New Scene" option. In this case, you should first set up your scene with a map image manually, and then use the "Add Walls to Current Scene" feature._
 

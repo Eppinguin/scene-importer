@@ -580,6 +580,25 @@ function App() {
     setZipObject(null);
   };
 
+  const isRawMediaFile = (file: File): boolean => {
+    const lowerName = file.name.toLowerCase();
+    return (
+      file.type.startsWith("image/") ||
+      file.type.startsWith("video/") ||
+      /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(
+        lowerName,
+      )
+    );
+  };
+
+  const processMediaFile = (file: File) => {
+    setSelectedFile(file);
+    setIsFoundryFormat(false);
+    setHasImage(true);
+    setAvailableScenes([]);
+    setZipObject(null);
+  };
+
   const handleFetchUrl = async () => {
     if (!moduleUrl) return;
     setIsLoading(true);
@@ -622,6 +641,24 @@ function App() {
             e,
           );
         }
+      }
+
+      const mediaUrlPattern =
+        /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)(\?.*)?$/i;
+      const isMediaUrl =
+        contentType.startsWith("image/") ||
+        contentType.startsWith("video/") ||
+        mediaUrlPattern.test(moduleUrl.toLowerCase());
+
+      if (isMediaUrl) {
+        const mediaBlob = await res.blob();
+        const fileName =
+          moduleUrl.split("/").pop()?.split("?")[0] || "downloaded.asset";
+        const file = new File([mediaBlob], fileName, { type: mediaBlob.type });
+        processMediaFile(file);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        setIsLoading(false);
+        return;
       }
 
       // Next, try parsing it as text/json
@@ -667,6 +704,11 @@ function App() {
         return;
       }
 
+      if (isRawMediaFile(file)) {
+        processMediaFile(file);
+        return;
+      }
+
       const isValidExtension =
         fileName.endsWith(".uvtt") ||
         fileName.endsWith(".dd2vtt") ||
@@ -693,7 +735,7 @@ function App() {
             await OBR.notification.show(errMessage, "ERROR");
           } else {
             await OBR.notification.show(
-              "Error reading file. Make sure it's a valid VTT file or module package.",
+              "Error reading file. Make sure it's a valid VTT file, module package, image, or video.",
               "WARNING",
             );
           }
@@ -707,7 +749,7 @@ function App() {
         }
       } else {
         await OBR.notification.show(
-          "Please select a valid .uvtt, .dd2vtt, .json or .zip file",
+          "Please select a valid .uvtt, .dd2vtt, .json, .zip, image, or video file",
           "WARNING",
         );
         if (fileInputRef.current) {
@@ -869,7 +911,7 @@ function App() {
           <Stack className="file-upload" spacing={1}>
             <input
               type="file"
-              accept=".uvtt,.dd2vtt,.json,.zip,application/json,application/octet-stream,application/zip"
+              accept=".uvtt,.dd2vtt,.json,.zip,application/json,application/octet-stream,application/zip,image/*,video/*"
               capture={undefined}
               onChange={handleFileSelect}
               ref={fileInputRef}
@@ -882,7 +924,7 @@ function App() {
                 <TextField
                   value={moduleUrl}
                   onChange={(e) => setModuleUrl(e.target.value)}
-                  placeholder="Enter asset URL (e.g. .uvtt, .zip, or module.json)"
+                  placeholder="Enter asset URL (e.g. .uvtt, .zip, image, or video)"
                   size="small"
                   fullWidth
                   disabled={isLoading}
