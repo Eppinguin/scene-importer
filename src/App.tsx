@@ -814,7 +814,7 @@ function App() {
       setIsLoading(true);
 
       OBR.notification.show("Scene created successfully!", "SUCCESS");
-      OBR.modal.close("com.eppinguin.uvtt-importer/modal");
+      OBR.modal.close("com.eppinguin.scene-importer/modal");
     } catch (error) {
       console.error("Error creating scene:", error);
       const getErrorMessage = (err: unknown): string => {
@@ -877,7 +877,7 @@ function App() {
       }
 
       if (isContextMenuMode) {
-        await OBR.modal.close("com.eppinguin.uvtt-importer/modal");
+        await OBR.modal.close("com.eppinguin.scene-importer/modal");
       }
     } catch (error) {
       console.error("Error adding items to scene:", error);
@@ -905,7 +905,7 @@ function App() {
       ) : (
         <>
           <Typography variant="h6" sx={{ fontWeight: 600 }}>
-            UVTT Importer
+            Scene Importer
           </Typography>
 
           <Stack className="file-upload" spacing={1}>

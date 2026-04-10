@@ -1,4 +1,6 @@
-# UVTT Importer for Owlbear Rodeo
+# Scene Importer for Owlbear Rodeo
+
+Formerly: UVTT Importer.
 
 A Virtual Tabletop (VTT) map importer extension for [Owlbear Rodeo](https://www.owlbear.rodeo/). It imports maps, complete with walls and doors (where applicable), from:
 
@@ -26,7 +28,7 @@ Designed for use with the [Dynamic Fog Extension](https://extensions.owlbear.rod
 
 This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls and doors.
 
-1. Click the UVTT Importer icon in the top left corner.
+1. Click the Scene Importer icon in the top left corner.
 2. Select your `.uvtt`, `.dd2vtt`, `.zip` module file, raw image, raw video, or paste a direct URL link. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. For full image support, upload a Foundry ZIP module instead)._
 3. Choose your compression mode (see below).
 4. Click "Create New Scene". This can take a moment, depending on the file size and compression.
@@ -38,12 +40,12 @@ _Note: If your UVTT file does not contain a map image, you will not be able to u
 
 You can add walls and doors to an existing scene in two ways:
 
-![add walls from menu](https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/import-walls-from-menu.gif)
+![add walls from menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-menu.gif)
 
 #### Using the Importer Window:
 
 1. Open the scene where you want to add walls/doors
-2. Click the UVTT Importer button in the toolbar
+2. Click the Scene Importer button in the toolbar
 3. Select your `.uvtt`, `.dd2vtt`, `.json`, `.zip` file, or paste a valid URL.
 4. Click "Add Walls to Current Scene"
 
@@ -55,7 +57,7 @@ You can add walls and doors to an existing scene in two ways:
 4. The extension will automatically open the Importer Selector so you can choose exactly which Wall structure you're casting onto your highlighted image.
 5. Wait for Walls and Doors to be added to the Map
 
-![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/import-walls-from-context-menu.gif)
+![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-context-menu.gif)
 
 ## Compression Modes
 
@@ -86,7 +88,7 @@ When importing video maps, you can adjust the following settings to control how 
 
 ## Installing
 
-The extension can be installed from https://uvtt-importer.pages.dev/manifest.json
+The extension can be installed from https://scene-importer.pages.dev/manifest.json
 
 ## Development
 

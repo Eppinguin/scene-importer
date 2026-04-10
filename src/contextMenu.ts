@@ -1,5 +1,5 @@
 import OBR from "@owlbear-rodeo/sdk";
-const ID = "com.eppinguin.uvtt-importer";
+const ID = "com.eppinguin.scene-importer";
 
 export function setupContextMenu() {
     OBR.contextMenu.create({

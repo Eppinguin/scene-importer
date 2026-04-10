@@ -1,13 +1,13 @@
 {
-  "name": "UVTT-Importer",
+  "name": "scene-importer",
   "description": "Import Universal VTT files with walls and doors for the Dynamic Fog extension",
   "version": "1.0.3",
   "manifest_version": 1,
   "icon": "/Logo.webp",
   "author": "Eppinguin",
-  "homepage_url": "https://github.com/Eppinguin/uvtt-importer",
+  "homepage_url": "https://github.com/Eppinguin/scene-importer",
   "action": {
-    "title": "UVTT-Importer",
+    "title": "scene-importer",
     "icon": "/Icon.svg",
     "popover": "/",
     "height": 450,

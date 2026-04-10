@@ -1,28 +1,28 @@
 ---
-title: UVTT Importer
+title: Scene Importer
 description: Import VTT wall data (.uvtt, .dd2vtt, Foundry) for Dynamic Fog, or automatically compress raw media uploads to fit your tier limits.
 author: Eppinguin
-image: https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/header.webp
-icon: https://uvtt-importer.pages.dev/Logo.webp
+image: https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/header.webp
+icon: https://scene-importer.pages.dev/Logo.webp
 tags:
   - fog
-manifest: https://uvtt-importer.pages.dev/manifest.json
-learn-more: https://github.com/Eppinguin/uvtt-importer
+manifest: https://scene-importer.pages.dev/manifest.json
+learn-more: https://github.com/Eppinguin/scene-importer
 ---
 
-# UVTT Importer
+# Scene Importer
 
 Import VTT wall data directly for [Dynamic Fog](https://extensions.owlbear.rodeo/dynamic-fog) using Universal VTT (.uvtt), DD2VTT (.dd2vtt), or FoundryVTT files (JSON, ZIP, or URLs). Alternatively, you can upload raw image and video files and let the extension automatically compress them to fit your Owlbear Rodeo subscription limits.
 
 This importer is designed to work with the Dynamic Fog Extension, providing an easy way to import walls and doors from your existing maps. For users seeking advanced features like dynamic lighting and custom fog backgrounds, check out the excellent [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
 
-![add walls from menu](https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/import-walls-from-menu.gif)
+![add walls from menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-menu.gif)
 
 ## Import a New Map
 
 This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls and doors.
 
-1. Click the UVTT Importer icon in the top left corner.
+1. Click the Scene Importer icon in the top left corner.
 2. Select your `.uvtt`, `.dd2vtt`, `.zip` module file, raw image, raw video, or paste a URL. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. Upload a Foundry ZIP module instead)._
 3. Choose your compression mode ([see below](#compression-modes)).
 4. Click "Create New Scene". This can take a moment, depending on the file size and compression.
@@ -37,7 +37,7 @@ This option is for adding walls and doors to a scene that already exists or to a
 ### Using the Importer Window:
 
 1. Open the scene where you want to add walls/doors.
-2. Click the UVTT Importer button in the toolbar.
+2. Click the Scene Importer button in the toolbar.
 3. Select your `.uvtt`, `.dd2vtt`, `.json`, `.zip` file, or paste a URL.
 4. Click "Add Walls to Current Scene".
 5. The walls and doors will be added to the current scene.
@@ -52,7 +52,7 @@ For existing maps, you can add Walls and Doors using the Map's Context Menu (rig
 4. The extension will automatically open the Importer Selector so you can choose exactly which wall structure to cast onto your highlighted image.
 5. Wait for Walls and Doors to be added to the Map.
 
-![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/uvtt-importer/main/docs/import-walls-from-context-menu.gif)
+![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-context-menu.gif)
 
 ## Compression Modes
 
@@ -76,4 +76,4 @@ The map featured in the header image and demonstration GIFs are from [mbround18'
 
 ## Support
 
-For questions, bug reports, or feature requests, please visit the [GitHub repository issues page](https://github.com/Eppinguin/uvtt-importer/issues).
+For questions, bug reports, or feature requests, please visit the [GitHub repository issues page](https://github.com/Eppinguin/scene-importer/issues).
