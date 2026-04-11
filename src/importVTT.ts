@@ -872,6 +872,7 @@ async function compressVideo(
     let lastStage = '';
     const reportStage = (stage: string) => {
         if (!options.onStage || stage === lastStage) return;
+        lastReportedProgress = -1;
         lastStage = stage;
         options.onStage(stage);
     };
@@ -1136,13 +1137,11 @@ async function compressVideo(
         codecPreference: TranscodeCodecPreference,
         bitrate: number,
         codecDefaultsForPass: ReturnType<typeof getCodecEncodingDefaults>,
-        stageLabel: string,
-        progressStart: number,
-        progressSpan: number
+        stageLabel: string
     ): Promise<Blob> => {
         throwIfAborted();
         reportStage(stageLabel);
-        reportProgress(progressStart);
+        reportProgress(0);
 
         const codec = codecPreference === 'h264'
             ? 'avc'
@@ -1226,7 +1225,7 @@ async function compressVideo(
                     lastProgressValue = progress;
                     lastProgressAt = Date.now();
                 }
-                const scopedProgress = progressStart + (Math.max(0, Math.min(1, progress)) * progressSpan);
+                const scopedProgress = Math.max(0, Math.min(1, progress)) * 100;
                 reportProgress(scopedProgress);
             };
 
@@ -1306,16 +1305,6 @@ async function compressVideo(
     };
 
     const bitrateScales = getBitrateScalesForCodec(effectiveCodec);
-    const totalPlannedPasses = bitrateScales.length;
-    let attemptedPasses = 0;
-    const getPassProgressWindow = (): { start: number; span: number } => {
-        attemptedPasses += 1;
-        const completedFraction = Math.max(0, Math.min(1, (attemptedPasses - 1) / Math.max(1, totalPlannedPasses)));
-        const nextFraction = Math.max(0, Math.min(1, attemptedPasses / Math.max(1, totalPlannedPasses)));
-        const start = 5 + (completedFraction * 90);
-        const end = 5 + (nextFraction * 90);
-        return { start, span: Math.max(1, end - start) };
-    };
     reportStage('Preparing video compression');
     let output: Blob | null = null;
     let bestOverBudgetOutput: Blob | null = null;
@@ -1345,15 +1334,12 @@ async function compressVideo(
     try {
         let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
         let currentPass = 1;
-        let passWindow = getPassProgressWindow();
         const codecLabel = effectiveCodec.toUpperCase();
         let candidateOutput = await transcodeOnce(
             effectiveCodec,
             attemptedBitrate,
             codecDefaults,
-            `Encoding video (${codecLabel}, pass ${currentPass})`,
-            passWindow.start,
-            passWindow.span
+            `Encoding video (${codecLabel}, pass ${currentPass})`
         );
 
         for (let i = 1; i < bitrateScales.length; i++) {
@@ -1378,14 +1364,11 @@ async function compressVideo(
 
             attemptedBitrate = candidateBitrate;
             currentPass += 1;
-            passWindow = getPassProgressWindow();
             candidateOutput = await transcodeOnce(
                 effectiveCodec,
                 candidateBitrate,
                 codecDefaults,
-                `Encoding video (${codecLabel}, pass ${currentPass})`,
-                passWindow.start,
-                passWindow.span
+                `Encoding video (${codecLabel}, pass ${currentPass})`
             );
         }
 
