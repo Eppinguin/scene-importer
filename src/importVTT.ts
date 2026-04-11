@@ -120,6 +120,7 @@ export type VideoCompressionErrorCode =
     | 'VIDEO_COMPRESSION_ABORTED'
     | 'VIDEO_COMPRESSION_METADATA_FAILED'
     | 'VIDEO_COMPRESSION_NO_PROGRESS'
+    | 'VIDEO_COMPRESSION_DECODE_FAILED'
     | 'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER'
     | 'VIDEO_COMPRESSION_SIZE_LIMIT'
     | 'VIDEO_COMPRESSION_SOURCE_TOO_LARGE';
@@ -428,6 +429,7 @@ async function getVideoMetadata(fileBlob: Blob): Promise<VideoMeta> {
         const video = document.createElement('video');
         video.preload = 'metadata';
         video.muted = true;
+        video.playsInline = true;
         let settled = false;
         let timeoutId: number | null = null;
 
@@ -438,6 +440,8 @@ async function getVideoMetadata(fileBlob: Blob): Promise<VideoMeta> {
             }
             video.onloadeddata = null;
             video.onloadedmetadata = null;
+            video.ondurationchange = null;
+            video.oncanplay = null;
             video.onerror = null;
             if (video.src) {
                 URL.revokeObjectURL(video.src);
@@ -446,20 +450,19 @@ async function getVideoMetadata(fileBlob: Blob): Promise<VideoMeta> {
             }
         };
 
-        const finalize = () => {
+        const tryFinalize = () => {
             if (settled) return;
-            settled = true;
 
             const duration = Number(video.duration);
             const width = Number(video.videoWidth);
             const height = Number(video.videoHeight);
 
-            cleanup();
-
             if (!Number.isFinite(duration) || duration <= 0 || width <= 0 || height <= 0) {
-                reject(new Error('Failed to read complete video metadata.'));
                 return;
             }
+
+            settled = true;
+            cleanup();
 
             resolve({
                 duration,
@@ -469,8 +472,10 @@ async function getVideoMetadata(fileBlob: Blob): Promise<VideoMeta> {
             });
         };
 
-        video.onloadeddata = finalize;
-        video.onloadedmetadata = finalize;
+        video.onloadeddata = tryFinalize;
+        video.onloadedmetadata = tryFinalize;
+        video.ondurationchange = tryFinalize;
+        video.oncanplay = tryFinalize;
 
         video.onerror = () => {
             if (settled) return;
@@ -482,9 +487,21 @@ async function getVideoMetadata(fileBlob: Blob): Promise<VideoMeta> {
         timeoutId = window.setTimeout(() => {
             if (settled) return;
             settled = true;
+            const duration = Number(video.duration);
+            const width = Number(video.videoWidth);
+            const height = Number(video.videoHeight);
             cleanup();
-            reject(new Error('Timed out while reading video metadata'));
-        }, 15000);
+            if (Number.isFinite(duration) && duration > 0 && width > 0 && height > 0) {
+                resolve({
+                    duration,
+                    width,
+                    height,
+                    frameRate: 30,
+                });
+                return;
+            }
+            reject(new Error('Timed out while reading complete video metadata'));
+        }, 25000);
 
         video.src = URL.createObjectURL(fileBlob);
     });
@@ -602,6 +619,14 @@ function getVideoNoProgressTimeoutMs(
     return Math.round(Math.min(240_000, baseMs + sizeAllowanceMs + durationAllowanceMs + resolutionAllowanceMs));
 }
 
+function isLikelyDecodeFailure(message: string): boolean {
+    const lower = message.toLowerCase();
+    return lower.includes('decoder failure')
+        || lower.includes('decode failure')
+        || lower.includes('failed to decode')
+        || (lower.includes('decoder') && lower.includes('failed'));
+}
+
 async function compressVideo(
     fileBlob: Blob,
     compressionMode: CompressionMode,
@@ -693,10 +718,6 @@ async function compressVideo(
     }
 
     const pixels = outWidth * outHeight;
-    const getCodecFallbackOrder = (preferred: VideoCodecPreference): VideoCodecPreference[] => {
-        const ordered: VideoCodecPreference[] = [preferred, 'h264', 'vp9', 'av1'];
-        return Array.from(new Set(ordered));
-    };
     const getBitrateScalesForCodec = (codec: VideoCodecPreference): number[] => {
         if (codec === 'av1') return [1, 0.9, 0.8, 0.72, 0.64, 0.56, 0.5];
         if (codec === 'h264') return [1, 0.9, 0.82, 0.74, 0.66];
@@ -727,31 +748,25 @@ async function compressVideo(
     if (requiresTranscode && isLikelyIOSBrowser()) {
         const iosTranscodeErrorMessage = 'This iOS browser cannot transcode video in this context. Try no compression, a lower Max video dimension, or a browser/device with hardware video encoding support.';
         if (canEncodeVideo) {
-            const iosCodecCandidates = getCodecFallbackOrder(preferredCodec);
-            const iosProbeModes: Array<'prefer-hardware' | 'no-preference'> = ['prefer-hardware', 'no-preference'];
+            const probeCodec = preferredCodec === 'h264' ? 'avc' : preferredCodec;
+            const iosProbeModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = ['prefer-hardware', 'no-preference', 'prefer-software'];
             let iosTranscodeSupported = false;
 
-            for (const codecCandidate of iosCodecCandidates) {
-                const probeCodec = codecCandidate === 'h264' ? 'avc' : codecCandidate;
-                for (const hardwareAcceleration of iosProbeModes) {
-                    try {
-                        const supported = await canEncodeVideo(probeCodec, {
-                            width: outWidth,
-                            height: outHeight,
-                            bitrate: Math.max(450_000, bitrateFromBudget),
-                            frameRate: outputFrameRate,
-                            hardwareAcceleration,
-                        });
-                        if (supported) {
-                            iosTranscodeSupported = true;
-                            break;
-                        }
-                    } catch {
-                        // Ignore probe failures and keep checking other candidates/modes.
+            for (const hardwareAcceleration of iosProbeModes) {
+                try {
+                    const supported = await canEncodeVideo(probeCodec, {
+                        width: outWidth,
+                        height: outHeight,
+                        bitrate: Math.max(450_000, bitrateFromBudget),
+                        frameRate: outputFrameRate,
+                        hardwareAcceleration,
+                    });
+                    if (supported) {
+                        iosTranscodeSupported = true;
+                        break;
                     }
-                }
-                if (iosTranscodeSupported) {
-                    break;
+                } catch {
+                    // Ignore probe failures and keep checking other modes.
                 }
             }
 
@@ -971,6 +986,15 @@ async function compressVideo(
             }
         }
 
+        if (lastError && isLikelyDecodeFailure(lastError.message)) {
+            throw new VideoCompressionError(
+                'VIDEO_COMPRESSION_DECODE_FAILED',
+                `This browser failed to decode/process the source video at ${outWidth}x${outHeight}. ` +
+                `Try lowering Max video dimension, converting the source video to H.264 (MP4), or using another browser/device.` +
+                availableCodecs
+            );
+        }
+
         throw new VideoCompressionError(
             'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
             `This browser build cannot encode ${codecPreference.toUpperCase()} at ${outWidth}x${outHeight}. ` +
@@ -980,11 +1004,8 @@ async function compressVideo(
         );
     };
 
-    const codecCandidates = getCodecFallbackOrder(preferredCodec);
-    const totalPlannedPasses = codecCandidates.reduce(
-        (sum, codecCandidate) => sum + getBitrateScalesForCodec(codecCandidate).length,
-        0
-    );
+    const bitrateScales = getBitrateScalesForCodec(preferredCodec);
+    const totalPlannedPasses = bitrateScales.length;
     let attemptedPasses = 0;
     const getPassProgressWindow = (): { start: number; span: number } => {
         attemptedPasses += 1;
@@ -997,92 +1018,83 @@ async function compressVideo(
     reportStage('Preparing video compression');
     let output: Blob | null = null;
     let bestOverBudgetOutput: Blob | null = null;
-    let selectedCodec = preferredCodec;
     let lastCodecError: Error | null = null;
-
-    for (const codecCandidate of codecCandidates) {
-        const codecDefaults = getCodecEncodingDefaults(codecCandidate);
-        const bitrateScales = getBitrateScalesForCodec(codecCandidate);
-        const qualityBitrate = Math.floor(pixels * outputFrameRate * codecDefaults.qualityFactor);
-        const seededBitrateBase = preserveQualityUnderLimit
-            ? Math.min(bitrateFromBudget, sourceEquivalentBitrate)
-            : Math.min(
-                bitrateFromBudget,
-                qualityBitrate,
-                sourceEquivalentBitrate
-            );
-        const boundedQualityFloorBitrate = Math.max(
-            codecDefaults.minBitrate,
-            Math.min(codecDefaults.maxBitrate, qualityFloorBitrate)
+    const codecDefaults = getCodecEncodingDefaults(preferredCodec);
+    const qualityBitrate = Math.floor(pixels * outputFrameRate * codecDefaults.qualityFactor);
+    const seededBitrateBase = preserveQualityUnderLimit
+        ? Math.min(bitrateFromBudget, sourceEquivalentBitrate)
+        : Math.min(
+            bitrateFromBudget,
+            qualityBitrate,
+            sourceEquivalentBitrate
         );
-        const boundedSeedBitrate = Math.max(
-            codecDefaults.minBitrate,
-            Math.min(codecDefaults.maxBitrate, seededBitrateBase)
+    const boundedQualityFloorBitrate = Math.max(
+        codecDefaults.minBitrate,
+        Math.min(codecDefaults.maxBitrate, qualityFloorBitrate)
+    );
+    const boundedSeedBitrate = Math.max(
+        codecDefaults.minBitrate,
+        Math.min(codecDefaults.maxBitrate, seededBitrateBase)
+    );
+    const seededBitrate = Math.max(
+        boundedQualityFloorBitrate,
+        boundedSeedBitrate
+    );
+
+    try {
+        let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
+        let currentPass = 1;
+        let passWindow = getPassProgressWindow();
+        const codecLabel = preferredCodec.toUpperCase();
+        let candidateOutput = await transcodeOnce(
+            preferredCodec,
+            attemptedBitrate,
+            codecDefaults,
+            `Encoding video (${codecLabel}, pass ${currentPass})`,
+            passWindow.start,
+            passWindow.span
         );
-        const seededBitrate = Math.max(
-            boundedQualityFloorBitrate,
-            boundedSeedBitrate
-        );
 
-        try {
-            let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
-            let currentPass = 1;
-            let passWindow = getPassProgressWindow();
-            let candidateOutput = await transcodeOnce(
-                codecCandidate,
-                attemptedBitrate,
-                codecDefaults,
-                `Encoding video (${codecCandidate.toUpperCase()}, pass ${currentPass})`,
-                passWindow.start,
-                passWindow.span
-            );
-
-            for (let i = 1; i < bitrateScales.length; i++) {
-                if (candidateOutput.size <= maxBytes) {
-                    break;
-                }
-
-                const currentSizeMb = (candidateOutput.size / 1000 / 1000).toFixed(1);
-                OBR.notification.show(
-                    `Output is still ${currentSizeMb}MB, running an additional compression pass.`,
-                    "INFO"
-                );
-
-                const minimumPassBitrate = codecDefaults.minBitrate;
-                const candidateBitrate = Math.max(
-                    minimumPassBitrate,
-                    Math.floor(seededBitrate * bitrateScales[i])
-                );
-                if (candidateBitrate >= attemptedBitrate) {
-                    break;
-                }
-
-                attemptedBitrate = candidateBitrate;
-                currentPass += 1;
-                passWindow = getPassProgressWindow();
-                candidateOutput = await transcodeOnce(
-                    codecCandidate,
-                    candidateBitrate,
-                    codecDefaults,
-                    `Encoding video (${codecCandidate.toUpperCase()}, pass ${currentPass})`,
-                    passWindow.start,
-                    passWindow.span
-                );
-            }
-
+        for (let i = 1; i < bitrateScales.length; i++) {
             if (candidateOutput.size <= maxBytes) {
-                output = candidateOutput;
-                selectedCodec = codecCandidate;
                 break;
             }
 
-            if (!bestOverBudgetOutput || candidateOutput.size < bestOverBudgetOutput.size) {
-                bestOverBudgetOutput = candidateOutput;
-                selectedCodec = codecCandidate;
+            const currentSizeMb = (candidateOutput.size / 1000 / 1000).toFixed(1);
+            OBR.notification.show(
+                `Output is still ${currentSizeMb}MB, running an additional compression pass.`,
+                "INFO"
+            );
+
+            const minimumPassBitrate = codecDefaults.minBitrate;
+            const candidateBitrate = Math.max(
+                minimumPassBitrate,
+                Math.floor(seededBitrate * bitrateScales[i])
+            );
+            if (candidateBitrate >= attemptedBitrate) {
+                break;
             }
-        } catch (error) {
-            lastCodecError = error instanceof Error ? error : new Error(String(error));
+
+            attemptedBitrate = candidateBitrate;
+            currentPass += 1;
+            passWindow = getPassProgressWindow();
+            candidateOutput = await transcodeOnce(
+                preferredCodec,
+                candidateBitrate,
+                codecDefaults,
+                `Encoding video (${codecLabel}, pass ${currentPass})`,
+                passWindow.start,
+                passWindow.span
+            );
         }
+
+        if (candidateOutput.size <= maxBytes) {
+            output = candidateOutput;
+        } else {
+            bestOverBudgetOutput = candidateOutput;
+        }
+    } catch (error) {
+        lastCodecError = error instanceof Error ? error : new Error(String(error));
     }
 
     if (!output) {
@@ -1093,17 +1105,13 @@ async function compressVideo(
                 `Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try a lower Max video dimension, remove audio, or use H.264.`
             );
         }
+        if (lastCodecError instanceof VideoCompressionError) {
+            throw lastCodecError;
+        }
         throw new VideoCompressionError(
             'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
             lastCodecError?.message ||
-            `This browser build cannot encode video at ${outWidth}x${outHeight}. Try a lower Max video dimension or another codec.`
-        );
-    }
-
-    if (selectedCodec !== preferredCodec) {
-        OBR.notification.show(
-            `Preferred codec unavailable at this resolution; switched to ${selectedCodec.toUpperCase()}.`,
-            "INFO"
+            `This browser build cannot encode ${preferredCodec.toUpperCase()} at ${outWidth}x${outHeight}. Try a lower Max video dimension or another codec.`
         );
     }
 

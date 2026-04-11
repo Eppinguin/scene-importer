@@ -873,6 +873,7 @@ function App() {
       } else if (
         errorCode === "VIDEO_COMPRESSION_NO_PROGRESS" ||
         errorCode === "VIDEO_COMPRESSION_METADATA_FAILED" ||
+        errorCode === "VIDEO_COMPRESSION_DECODE_FAILED" ||
         errorCode === "VIDEO_COMPRESSION_UNSUPPORTED_ENCODER" ||
         errorCode === "VIDEO_COMPRESSION_SIZE_LIMIT" ||
         errorCode === "VIDEO_COMPRESSION_SOURCE_TOO_LARGE"
