@@ -8,6 +8,7 @@ import {
   extractImageFromZip,
   convertFoundryToVTTData,
   type CompressionMode,
+  type VideoCompressionErrorCode,
   type VideoCodecPreference,
   type VideoCompressionOptions,
   isFoundryVTTData,
@@ -852,13 +853,31 @@ function App() {
         }
         return "Unknown error";
       };
+      const getErrorCode = (err: unknown): VideoCompressionErrorCode | null => {
+        if (!err || typeof err !== "object") return null;
+        const value = (err as { code?: unknown }).code;
+        if (typeof value !== "string") return null;
+        return value as VideoCompressionErrorCode;
+      };
       const toNotificationMessage = (text: string, max = 240): string =>
         text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 
       const message = getErrorMessage(error);
+      const errorCode = getErrorCode(error);
       const lowerMessage = message.toLowerCase();
-      if (lowerMessage.includes("aborted")) {
+      if (
+        errorCode === "VIDEO_COMPRESSION_ABORTED" ||
+        lowerMessage.includes("aborted")
+      ) {
         OBR.notification.show("Compression canceled.", "INFO");
+      } else if (
+        errorCode === "VIDEO_COMPRESSION_NO_PROGRESS" ||
+        errorCode === "VIDEO_COMPRESSION_METADATA_FAILED" ||
+        errorCode === "VIDEO_COMPRESSION_UNSUPPORTED_ENCODER" ||
+        errorCode === "VIDEO_COMPRESSION_SIZE_LIMIT" ||
+        errorCode === "VIDEO_COMPRESSION_SOURCE_TOO_LARGE"
+      ) {
+        OBR.notification.show(toNotificationMessage(message), "WARNING");
       } else if (
         lowerMessage.includes("timed out") ||
         lowerMessage.includes("stalled") ||
@@ -880,8 +899,9 @@ function App() {
           compressionMode === "high"
             ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max video dimension in Advanced options."
             : "Try reducing Max video dimension in Advanced options or using H.264 codec.";
+        const suffix = message.endsWith(".") ? "" : ".";
         OBR.notification.show(
-          toNotificationMessage(`${message}. ${hint}`),
+          toNotificationMessage(`${message}${suffix} ${hint}`),
           "WARNING",
         );
       } else {
@@ -1276,7 +1296,7 @@ function App() {
                 className="compression-progress-label"
                 variant="caption">
                 {selectedInputIsVideo
-                  ? `Compressing video… ${uploadProgress}%`
+                  ? `${compressionStage ?? "Compressing video"} (${uploadProgress}%)`
                   : (compressionStage ?? "Compressing image…")}
               </Typography>
               <LinearProgress

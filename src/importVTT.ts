@@ -116,6 +116,23 @@ function getImageTypeFromBase64(base64Data: string): 'image/png' | 'image/webp' 
 // Compression options for image optimization
 export type CompressionMode = 'none' | 'standard' | 'high';
 export type VideoCodecPreference = 'av1' | 'vp9' | 'h264';
+export type VideoCompressionErrorCode =
+    | 'VIDEO_COMPRESSION_ABORTED'
+    | 'VIDEO_COMPRESSION_METADATA_FAILED'
+    | 'VIDEO_COMPRESSION_NO_PROGRESS'
+    | 'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER'
+    | 'VIDEO_COMPRESSION_SIZE_LIMIT'
+    | 'VIDEO_COMPRESSION_SOURCE_TOO_LARGE';
+
+export class VideoCompressionError extends Error {
+    code: VideoCompressionErrorCode;
+
+    constructor(code: VideoCompressionErrorCode, message: string) {
+        super(message);
+        this.name = 'VideoCompressionError';
+        this.code = code;
+    }
+}
 
 interface OptimizationOptions {
     compressionMode?: CompressionMode;
@@ -389,6 +406,7 @@ export interface VideoCompressionOptions {
     preferredCodec?: VideoCodecPreference;
     forceTranscodeUnderLimit?: boolean;
     abortSignal?: AbortSignal;
+    onStage?: (stage: string) => void;
 }
 
 function toEvenDimension(value: number): number {
@@ -567,6 +585,23 @@ function getCodecRatePolicy(
     return { equivalentFactor, qualityFloorFactor };
 }
 
+function getVideoNoProgressTimeoutMs(
+    sourceBytes: number,
+    durationSeconds: number,
+    outputPixels: number,
+    needsResize: boolean
+): number {
+    const sourceSizeMb = sourceBytes / 1000 / 1000;
+    const outputMegaPixels = outputPixels / 1_000_000;
+
+    const baseMs = needsResize ? 45_000 : 35_000;
+    const sizeAllowanceMs = Math.min(90_000, Math.max(0, sourceSizeMb - 8) * 600);
+    const durationAllowanceMs = Math.min(90_000, Math.max(0, durationSeconds - 20) * 900);
+    const resolutionAllowanceMs = Math.min(45_000, Math.max(0, outputMegaPixels - 2) * 7_500);
+
+    return Math.round(Math.min(240_000, baseMs + sizeAllowanceMs + durationAllowanceMs + resolutionAllowanceMs));
+}
+
 async function compressVideo(
     fileBlob: Blob,
     compressionMode: CompressionMode,
@@ -581,15 +616,38 @@ async function compressVideo(
         lastReportedProgress = normalized;
         onProgress(normalized);
     };
+    let lastStage = '';
+    const reportStage = (stage: string) => {
+        if (!options.onStage || stage === lastStage) return;
+        lastStage = stage;
+        options.onStage(stage);
+    };
 
     const throwIfAborted = () => {
         if (options.abortSignal?.aborted) {
-            throw new Error('Video Compression Aborted');
+            throw new VideoCompressionError('VIDEO_COMPRESSION_ABORTED', 'Video compression canceled.');
         }
     };
 
     throwIfAborted();
-    const { duration, width, height, frameRate } = await getVideoMetadata(fileBlob);
+    reportStage('Reading video metadata');
+    let duration: number;
+    let width: number;
+    let height: number;
+    let frameRate: number;
+    try {
+        const metadata = await getVideoMetadata(fileBlob);
+        duration = metadata.duration;
+        width = metadata.width;
+        height = metadata.height;
+        frameRate = metadata.frameRate;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to read video metadata.';
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_METADATA_FAILED',
+            `${message} Try another browser or upload without compression.`
+        );
+    }
     const preferredCodec = options.preferredCodec ?? 'vp9';
     const targetSizeMB = compressionMode === 'high' ? 99 : 49;
     // Use decimal MB to match user-facing size limits (50MB / 100MB) more closely.
@@ -623,6 +681,7 @@ async function compressVideo(
         && !options.forceTranscodeUnderLimit;
 
     if (!requiresTranscode) {
+        reportStage('Using original video');
         reportProgress(100);
         return {
             blob: fileBlob,
@@ -648,7 +707,10 @@ async function compressVideo(
     const frameRateFactor = outputFrameRate / Math.max(sourceFrameRate, 1);
     const sourceTotalBitrate = Math.max(250_000, Math.floor((fileBlob.size * 8) / Math.max(duration, 1)));
     const assumedAudioBitrate = options.keepAudio === false ? 0 : 128_000;
+    const noProgressTimeoutMs = getVideoNoProgressTimeoutMs(fileBlob.size, duration, pixels, needsResize);
+    const noProgressTimeoutSeconds = Math.round(noProgressTimeoutMs / 1000);
 
+    reportStage('Loading video encoder');
     const mb = await import('mediabunny') as unknown as MediabunnyModule;
     const {
         Input,
@@ -694,7 +756,7 @@ async function compressVideo(
             }
 
             if (!iosTranscodeSupported) {
-                throw new Error(iosTranscodeErrorMessage);
+                throw new VideoCompressionError('VIDEO_COMPRESSION_UNSUPPORTED_ENCODER', iosTranscodeErrorMessage);
             }
         }
     }
@@ -704,6 +766,7 @@ async function compressVideo(
     let sourceAudioBitrate = 0;
     const skipDetailedPacketStats = fileBlob.size > 60_000_000;
 
+    reportStage('Analyzing source video');
     try {
         const analysisInput = new Input({
             source: new BlobSource(fileBlob),
@@ -757,46 +820,17 @@ async function compressVideo(
     const sourceEquivalentBitrate = Math.floor(sourceVideoBitrate * equivalentFactor * resizeFactor * frameRateFactor);
     const qualityFloorBitrate = Math.floor(sourceVideoBitrate * qualityFloorFactor * resizeFactor * frameRateFactor);
 
-    const highRiskSoftwareResize = needsResize
-        && (fileBlob.size > 55_000_000 || pixels > 20_000_000);
-
-    if (highRiskSoftwareResize && canEncodeVideo) {
-        const codecCandidates = getCodecFallbackOrder(preferredCodec);
-        let hasHardwareResizePath = false;
-
-        for (const codecCandidate of codecCandidates) {
-            const probeCodec = codecCandidate === 'h264' ? 'avc' : codecCandidate;
-            try {
-                const supported = await canEncodeVideo(probeCodec, {
-                    width: outWidth,
-                    height: outHeight,
-                    bitrate: Math.max(450_000, bitrateFromBudget),
-                    frameRate: outputFrameRate,
-                    hardwareAcceleration: 'prefer-hardware',
-                });
-                if (supported) {
-                    hasHardwareResizePath = true;
-                    break;
-                }
-            } catch {
-                // Ignore probing issues and continue checking other codecs.
-            }
-        }
-
-        if (!hasHardwareResizePath) {
-            throw new Error(
-                'This resize request is too heavy for software encoding in this browser and may crash. ' +
-                'Use a browser/device with hardware-accelerated video encoding, lower Max video dimension further, or pre-resize the video first.'
-            );
-        }
-    }
-
     const transcodeOnce = async (
         codecPreference: VideoCodecPreference,
         bitrate: number,
-        codecDefaultsForPass: ReturnType<typeof getCodecEncodingDefaults>
+        codecDefaultsForPass: ReturnType<typeof getCodecEncodingDefaults>,
+        stageLabel: string,
+        progressStart: number,
+        progressSpan: number
     ): Promise<Blob> => {
         throwIfAborted();
+        reportStage(stageLabel);
+        reportProgress(progressStart);
 
         const codec = codecPreference === 'h264' ? 'avc' : codecPreference;
         const outputFormat = codecPreference === 'h264'
@@ -860,46 +894,32 @@ async function compressVideo(
             }
 
             if (!conversion.isValid) {
-                lastError = new Error('Unable to initialize MediaBunny conversion for this video in the current browser.');
+                lastError = new VideoCompressionError(
+                    'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
+                    'Unable to initialize video conversion in this browser.'
+                );
                 continue;
             }
 
-            let stallDetected = false;
-            let timeoutDetected = false;
+            let noProgressDetected = false;
             let lastProgressAt = Date.now();
             let lastProgressValue = 0;
-            const startedAt = Date.now();
             let stallIntervalId: number | null = null;
-            const stallThresholdMs = needsResize ? 18000 : 25000;
-            const maxAttemptDurationMs = needsResize ? 90000 : 120000;
-
-            const setProgressTimestamp = () => {
-                lastProgressAt = Date.now();
-            };
-
-            setProgressTimestamp();
             conversion.onProgress = (progress: number) => {
-                if (progress > lastProgressValue + 0.001) {
+                if (progress > lastProgressValue + 0.0005) {
                     lastProgressValue = progress;
-                    setProgressTimestamp();
+                    lastProgressAt = Date.now();
                 }
-                reportProgress(Math.min(99, Math.round(progress * 100)));
+                const scopedProgress = progressStart + (Math.max(0, Math.min(1, progress)) * progressSpan);
+                reportProgress(scopedProgress);
             };
 
             stallIntervalId = window.setInterval(() => {
-                const elapsedMs = Date.now() - startedAt;
-                if (elapsedMs > maxAttemptDurationMs) {
-                    timeoutDetected = true;
-                    void conversion.cancel();
-                    return;
-                }
-
-                const stalledForMs = Date.now() - lastProgressAt;
-                if (stalledForMs > stallThresholdMs) {
-                    stallDetected = true;
+                if ((Date.now() - lastProgressAt) > noProgressTimeoutMs) {
+                    noProgressDetected = true;
                     void conversion.cancel();
                 }
-            }, 3000);
+            }, 2000);
 
             const onAbort = () => {
                 void conversion.cancel();
@@ -910,17 +930,12 @@ async function compressVideo(
                 await conversion.execute();
             } catch (error) {
                 if (options.abortSignal?.aborted) {
-                    throw new Error('Video Compression Aborted');
+                    throw new VideoCompressionError('VIDEO_COMPRESSION_ABORTED', 'Video compression canceled.');
                 }
-                if (timeoutDetected) {
-                    lastError = new Error(
-                        'Video encoding timed out in this browser. Try a browser with hardware-accelerated video encoding or reduce Max video dimension.'
-                    );
-                    continue;
-                }
-                if (stallDetected) {
-                    lastError = new Error(
-                        'Video encoder stalled in this browser. Try a browser with hardware-accelerated video encoding or reduce Max video dimension.'
+                if (noProgressDetected) {
+                    lastError = new VideoCompressionError(
+                        'VIDEO_COMPRESSION_NO_PROGRESS',
+                        `Video compression made no progress for ${noProgressTimeoutSeconds}s and was stopped. Try a lower Max video dimension, H.264, or another browser/device.`
                     );
                     continue;
                 }
@@ -956,7 +971,8 @@ async function compressVideo(
             }
         }
 
-        throw new Error(
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
             `This browser build cannot encode ${codecPreference.toUpperCase()} at ${outWidth}x${outHeight}. ` +
             `Try a lower max video dimension, switch codec, or use a Chromium build with WebCodecs encoding enabled.` +
             availableCodecs +
@@ -965,6 +981,20 @@ async function compressVideo(
     };
 
     const codecCandidates = getCodecFallbackOrder(preferredCodec);
+    const totalPlannedPasses = codecCandidates.reduce(
+        (sum, codecCandidate) => sum + getBitrateScalesForCodec(codecCandidate).length,
+        0
+    );
+    let attemptedPasses = 0;
+    const getPassProgressWindow = (): { start: number; span: number } => {
+        attemptedPasses += 1;
+        const completedFraction = Math.max(0, Math.min(1, (attemptedPasses - 1) / Math.max(1, totalPlannedPasses)));
+        const nextFraction = Math.max(0, Math.min(1, attemptedPasses / Math.max(1, totalPlannedPasses)));
+        const start = 5 + (completedFraction * 90);
+        const end = 5 + (nextFraction * 90);
+        return { start, span: Math.max(1, end - start) };
+    };
+    reportStage('Preparing video compression');
     let output: Blob | null = null;
     let bestOverBudgetOutput: Blob | null = null;
     let selectedCodec = preferredCodec;
@@ -996,10 +1026,15 @@ async function compressVideo(
 
         try {
             let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
+            let currentPass = 1;
+            let passWindow = getPassProgressWindow();
             let candidateOutput = await transcodeOnce(
                 codecCandidate,
                 attemptedBitrate,
-                codecDefaults
+                codecDefaults,
+                `Encoding video (${codecCandidate.toUpperCase()}, pass ${currentPass})`,
+                passWindow.start,
+                passWindow.span
             );
 
             for (let i = 1; i < bitrateScales.length; i++) {
@@ -1023,10 +1058,15 @@ async function compressVideo(
                 }
 
                 attemptedBitrate = candidateBitrate;
+                currentPass += 1;
+                passWindow = getPassProgressWindow();
                 candidateOutput = await transcodeOnce(
                     codecCandidate,
                     candidateBitrate,
-                    codecDefaults
+                    codecDefaults,
+                    `Encoding video (${codecCandidate.toUpperCase()}, pass ${currentPass})`,
+                    passWindow.start,
+                    passWindow.span
                 );
             }
 
@@ -1048,11 +1088,15 @@ async function compressVideo(
     if (!output) {
         if (bestOverBudgetOutput) {
             const finalSize = (bestOverBudgetOutput.size / 1000 / 1000).toFixed(1);
-            throw new Error(`Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try Standard mode, a lower max video dimension, or H.264.`);
+            throw new VideoCompressionError(
+                'VIDEO_COMPRESSION_SIZE_LIMIT',
+                `Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try a lower Max video dimension, remove audio, or use H.264.`
+            );
         }
-        throw new Error(
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
             lastCodecError?.message ||
-            `This browser build cannot encode video at ${outWidth}x${outHeight}. Try a lower max video dimension or another codec.`
+            `This browser build cannot encode video at ${outWidth}x${outHeight}. Try a lower Max video dimension or another codec.`
         );
     }
 
@@ -1065,7 +1109,10 @@ async function compressVideo(
 
     if (output.size > maxBytes) {
         const finalSize = (output.size / 1000 / 1000).toFixed(1);
-        throw new Error(`Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try Standard mode, a lower max video dimension, or H.264.`);
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_SIZE_LIMIT',
+            `Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try a lower Max video dimension, remove audio, or use H.264.`
+        );
     }
 
     if (
@@ -1077,6 +1124,7 @@ async function compressVideo(
         output = fileBlob;
     }
 
+    reportStage('Finalizing video');
     reportProgress(100);
     return {
         blob: output,
@@ -1115,9 +1163,12 @@ async function uploadRawMediaScene(
         if (compressionMode !== 'none') {
             const sizeInMb = file.size / (1024 * 1024);
             if (sizeInMb > 500) {
-                throw new Error(`Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`);
+                throw new VideoCompressionError(
+                    'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                    `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                );
             }
-            const compressed = await compressVideo(file, compressionMode, onProgress, videoOptions);
+            const compressed = await compressVideo(file, compressionMode, onProgress, { ...videoOptions, onStage });
             finalBlob = compressed.blob;
             fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
         }
@@ -1260,9 +1311,12 @@ export async function uploadFoundryScene(
         const sizeInMb = imageBlob.size / (1024 * 1024);
         if (compressionMode !== 'none') {
             if (sizeInMb > 500) {
-                throw new Error(`Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`);
+                throw new VideoCompressionError(
+                    'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                    `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                );
             }
-            const compressed = await compressVideo(imageBlob, compressionMode, onProgress, videoOptions);
+            const compressed = await compressVideo(imageBlob, compressionMode, onProgress, { ...videoOptions, onStage });
             finalBlob = compressed.blob;
             if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
                 effectiveDpi = vttMapDataSource.resolution.pixels_per_grid * (compressed.outputWidth / compressed.sourceWidth);
