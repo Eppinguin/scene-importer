@@ -1389,8 +1389,7 @@ async function compressVideo(
             throw new VideoCompressionError(
                 'VIDEO_COMPRESSION_DECODE_FAILED',
                 `This browser failed while decoding/processing source frames (source: ${width}x${height}, target: ${outWidth}x${outHeight}). ` +
-                `Even when output is downscaled, the browser still has to decode full-size source frames first. ` +
-                `Try reducing source resolution before upload (most effective). Converting to H.264 (MP4) can help, but codec-only conversion may still fail if source frames remain very large.` +
+                `Try another Browser or reducing source resolution before upload (most effective).` +
                 availableCodecs
             );
         }
