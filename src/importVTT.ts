@@ -1750,25 +1750,48 @@ export async function addItemsFromData(processedData: VTTMapData, context: boole
                 }
 
                 // Keep walls aligned to the selected map even when the map has been resized.
-                const sourceWidth = processedData.resolution?.map_size?.x;
-                const sourceHeight = processedData.resolution?.map_size?.y;
-                const selectedWithSize = selectedItem as {
+                const sourceMapWidth = processedData.resolution?.map_size?.x;
+                const sourceMapHeight = processedData.resolution?.map_size?.y;
+                const sourcePixelsPerGrid = processedData.resolution?.pixels_per_grid;
+                const selectedWithImage = selectedItem as {
+                    image?: {
+                        width?: unknown;
+                        height?: unknown;
+                    };
+                    grid?: {
+                        dpi?: unknown;
+                    };
                     width?: unknown;
                     height?: unknown;
                 };
-                const selectedWidth = typeof selectedWithSize.width === 'number' ? selectedWithSize.width : undefined;
-                const selectedHeight = typeof selectedWithSize.height === 'number' ? selectedWithSize.height : undefined;
+                const selectedWidth = typeof selectedWithImage.image?.width === 'number'
+                    ? selectedWithImage.image.width
+                    : typeof selectedWithImage.width === 'number'
+                        ? selectedWithImage.width
+                        : undefined;
+                const selectedHeight = typeof selectedWithImage.image?.height === 'number'
+                    ? selectedWithImage.image.height
+                    : typeof selectedWithImage.height === 'number'
+                        ? selectedWithImage.height
+                        : undefined;
+                const selectedImageDpi = typeof selectedWithImage.grid?.dpi === 'number'
+                    ? selectedWithImage.grid.dpi
+                    : dpi;
 
                 if (
-                    typeof sourceWidth === 'number' && sourceWidth > 0
-                    && typeof sourceHeight === 'number' && sourceHeight > 0
+                    typeof sourceMapWidth === 'number' && sourceMapWidth > 0
+                    && typeof sourceMapHeight === 'number' && sourceMapHeight > 0
+                    && typeof sourcePixelsPerGrid === 'number' && sourcePixelsPerGrid > 0
                     && typeof selectedWidth === 'number' && selectedWidth > 0
                     && typeof selectedHeight === 'number' && selectedHeight > 0
+                    && typeof selectedImageDpi === 'number' && selectedImageDpi > 0
                 ) {
-                    const renderedWidth = selectedWidth * scale.x;
-                    const renderedHeight = selectedHeight * scale.y;
-                    const scaleFromWidth = renderedWidth / (sourceWidth * dpi);
-                    const scaleFromHeight = renderedHeight / (sourceHeight * dpi);
+                    const renderedWidth = (selectedWidth * dpi / selectedImageDpi) * scale.x;
+                    const renderedHeight = (selectedHeight * dpi / selectedImageDpi) * scale.y;
+                    const sourceSceneWidth = sourceMapWidth * dpi;
+                    const sourceSceneHeight = sourceMapHeight * dpi;
+                    const scaleFromWidth = renderedWidth / sourceSceneWidth;
+                    const scaleFromHeight = renderedHeight / sourceSceneHeight;
 
                     if (Number.isFinite(scaleFromWidth) && scaleFromWidth > 0) {
                         scale.x = scaleFromWidth;
