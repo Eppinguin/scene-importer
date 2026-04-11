@@ -81,16 +81,12 @@ Select the option that includes your current Owlbear Rodeo subscription tier:
 
 When importing video maps, you can adjust the following settings to control how the files are processed:
 
-- **Auto:** Automatically selects the best available codec supported by your browser (prioritizing AV1, then H.265, VP9, and finally H.264).
-- **VP9/WebM:** Good balance of file size and browser compatibility.
+- **VP9/WebM:** Default format. Balances file size and browser compatibility.
 - **AV1:** Yields the smallest file sizes, but takes longer to process.
-- **H.265 (HEVC):** Excellent compression, though hardware support varies.
 - **H.264:** Maximum compatibility across older browsers and mobile devices.
 - **Remove audio:** Removes the audio track to reduce file size.
 - **Transcode anyway:** Compresses the video even if it is already under the size limit to save storage space.
 - **Max video dimension:** Limits the longest side in pixels (example: `1920`) to reduce processing time and file size. Leave empty to keep the original resolution.
-
-> **💡 Hint:** Video conversion depends on built-in browser capabilities, which can vary wildly. For the most reliable compression experience and widest codec support, we recommend using a **Chromium-based browser** (like Chrome, Edge, or Brave). Browsers like Safari have strict source decoding and memory limits that might cause processing to fail on larger files.
 
 ## Installing
 
