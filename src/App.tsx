@@ -104,6 +104,7 @@ function App() {
   const [maxVideoDimension, setMaxVideoDimension] = useState<string>("");
 
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [compressionStage, setCompressionStage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [isGM, setIsGM] = useState(false);
@@ -771,7 +772,20 @@ function App() {
   const handleCreateNewScene = async () => {
     if (!selectedFile && availableScenes.length === 0) return;
 
+    const waitForProgressFrame = async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          window.setTimeout(resolve, 0);
+        });
+      });
+    };
+
     setIsLoading(true);
+    setUploadProgress(0);
+    setCompressionStage(
+      selectedInputIsVideo ? "Preparing video encoder" : "Preparing image",
+    );
+    await waitForProgressFrame();
     try {
       const fileToUpload = selectedFile;
       const abortController = new AbortController();
@@ -803,9 +817,11 @@ function App() {
           compressionMode,
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
+          (stage) => setCompressionStage(stage),
         );
         // Compression done — clear progress bar, show uploading state
         setUploadProgress(null);
+        setCompressionStage(null);
         setIsLoading(true);
       } else if (fileToUpload) {
         await uploadSceneFromVTT(
@@ -813,10 +829,12 @@ function App() {
           compressionMode,
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
+          (stage) => setCompressionStage(stage),
         );
       }
       // Compression done — clear progress bar, show uploading state
       setUploadProgress(null);
+      setCompressionStage(null);
       setIsLoading(true);
 
       OBR.notification.show("Scene created successfully!", "SUCCESS");
@@ -875,6 +893,7 @@ function App() {
     } finally {
       compressionAbortRef.current = null;
       setUploadProgress(null);
+      setCompressionStage(null);
       setIsLoading(false);
     }
   };
@@ -1256,12 +1275,13 @@ function App() {
               <Typography
                 className="compression-progress-label"
                 variant="caption">
-                Compressing {selectedInputIsVideo ? "video" : "image"}…{" "}
-                {uploadProgress}%
+                {selectedInputIsVideo
+                  ? `Compressing video… ${uploadProgress}%`
+                  : (compressionStage ?? "Compressing image…")}
               </Typography>
               <LinearProgress
-                variant="determinate"
-                value={uploadProgress}
+                variant={selectedInputIsVideo ? "determinate" : "indeterminate"}
+                value={selectedInputIsVideo ? uploadProgress : undefined}
                 sx={{ height: 6, borderRadius: 999 }}
               />
               <Button
@@ -1270,6 +1290,7 @@ function App() {
                 onClick={() => {
                   compressionAbortRef.current?.abort();
                   setUploadProgress(null);
+                  setCompressionStage(null);
                 }}>
                 Cancel Compression
               </Button>

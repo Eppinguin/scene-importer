@@ -149,7 +149,8 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality?: num
 async function optimizeImage(
     imageBlob: Blob,
     options: OptimizationOptions = {},
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    onStage?: (stage: string) => void
 ): Promise<Blob> {
     let lastProgress = -1;
     const reportProgress = (progress: number) => {
@@ -159,6 +160,12 @@ async function optimizeImage(
         lastProgress = normalized;
         onProgress(normalized);
     };
+    let lastStage = "";
+    const reportStage = (stage: string) => {
+        if (!onStage || stage === lastStage) return;
+        lastStage = stage;
+        onStage(stage);
+    };
 
     const {
         compressionMode = 'standard',
@@ -166,10 +173,12 @@ async function optimizeImage(
         maxMegapixels = compressionMode === 'standard' ? 67 : 144
     } = options;
     const maxSizeInBytes = maxSizeInMB * 1024 * 1024;
+    reportStage('Loading image');
     reportProgress(2);
 
     // If no compression is requested and the image is under the maximum size, return it as is
     if (compressionMode === 'none' && imageBlob.size <= maxSizeInBytes) {
+        reportStage('Using original image');
         reportProgress(100);
         return imageBlob;
     }
@@ -181,6 +190,7 @@ async function optimizeImage(
 
         img.onload = () => {
             URL.revokeObjectURL(img.src);
+            reportStage('Preparing image');
             reportProgress(10);
 
             // Start with original dimensions
@@ -196,6 +206,9 @@ async function optimizeImage(
             }
 
             const didResize = width !== img.width || height !== img.height;
+            if (didResize) {
+                reportStage('Resizing image');
+            }
 
             canvas.width = width;
             canvas.height = height;
@@ -210,6 +223,15 @@ async function optimizeImage(
 
             const isUnderSizeLimit = imageBlob.size <= maxSizeInBytes;
             const sourceMimeType = imageBlob.type.toLowerCase();
+
+            // Keep in-limit WebP files as-is unless a resize was required.
+            if (compressionMode !== 'none' && sourceMimeType === 'image/webp' && isUnderSizeLimit && !didResize) {
+                reportStage('Using original image');
+                reportProgress(100);
+                resolve(imageBlob);
+                return;
+            }
+
             const encodeCompressedImage = async (quality: number): Promise<Blob> => {
                 const webpBlob = await canvasToBlob(canvas, 'image/webp', quality);
                 if (webpBlob.type === 'image/webp') {
@@ -219,35 +241,22 @@ async function optimizeImage(
                 return canvasToBlob(canvas, 'image/jpeg', jpegQuality);
             };
 
-            if (compressionMode !== 'none' && isUnderSizeLimit && !didResize) {
-                if (sourceMimeType === 'image/webp') {
-                    reportProgress(100);
-                    resolve(imageBlob);
-                    return;
-                }
-
-                const isLossyNonWebp = sourceMimeType === 'image/jpeg' || sourceMimeType === 'image/jpg';
-                if (!isLossyNonWebp) {
-                    reportProgress(100);
-                    resolve(imageBlob);
-                    return;
-                }
-
-                void (async () => {
-                    reportProgress(65);
-                    const candidate = await encodeCompressedImage(0.85);
-                    reportProgress(100);
-                    resolve(candidate.size > imageBlob.size ? imageBlob : candidate);
-                })().catch(() => {
-                    reportProgress(100);
-                    resolve(imageBlob);
-                });
+            if (compressionMode === 'none') {
+                reportStage('Finalizing image');
+                void canvasToBlob(canvas, imageBlob.type)
+                    .then((blob) => {
+                        const finalBlob = (isUnderSizeLimit && blob.size >= imageBlob.size) ? imageBlob : blob;
+                        reportProgress(100);
+                        resolve(finalBlob);
+                    })
+                    .catch((error) => {
+                        reject(error instanceof Error ? error : new Error('Could not create blob'));
+                    });
                 return;
             }
 
-            // Set initial quality based on compression mode - start with highest possible quality
-            // In browsers, quality=1 can inflate already-compressed sources.
-            const initialQuality = 0.95;
+            // Start high and only step down if needed to meet limits.
+            const initialQuality = 0.85;
             const minQuality = 0.1;
             const qualityStep = 0.05;
             const totalPasses = Math.max(
@@ -255,25 +264,35 @@ async function optimizeImage(
                 Math.ceil((initialQuality - minQuality) / qualityStep) + 1
             );
 
-            // Try different quality settings until we get under maxSizeInMB
+            let bestBlob = imageBlob;
+            let bestQuality = initialQuality;
+
             const tryCompress = (currentQuality: number, passIndex: number) => {
+                reportStage(`Encoding image (pass ${passIndex + 1})`);
                 reportProgress(25 + (passIndex / totalPasses) * 70);
-                void (compressionMode === 'none'
-                    ? canvasToBlob(canvas, imageBlob.type)
-                    : encodeCompressedImage(currentQuality))
+                void encodeCompressedImage(currentQuality)
                     .then((blob) => {
-                        const finalBlob = (isUnderSizeLimit && blob.size > imageBlob.size) ? imageBlob : blob;
-                        const currentSize = finalBlob.size / (1024 * 1024);
-                        if (blob.size > maxSizeInBytes && currentQuality > minQuality && compressionMode !== 'none') {
-                            // Try again with lower quality, use smaller steps for more precise control
-                            tryCompress(currentQuality - qualityStep, passIndex + 1);
-                        } else {
-                            const finalSize = currentSize.toFixed(2);
-                            const quality = (currentQuality * 100).toFixed(0);
-                            OBR.notification.show(`Image compressed: ${quality}% quality (${finalSize}MB)`, "INFO");
-                            reportProgress(100);
-                            resolve(finalBlob);
+                        if (blob.size < bestBlob.size) {
+                            bestBlob = blob;
+                            bestQuality = currentQuality;
                         }
+
+                        const reachedTarget = blob.size <= maxSizeInBytes;
+                        if (!reachedTarget && currentQuality > minQuality) {
+                            tryCompress(currentQuality - qualityStep, passIndex + 1);
+                            return;
+                        }
+
+                        reportStage('Finalizing image');
+                        const finalBlob = (bestBlob.size < imageBlob.size) ? bestBlob : imageBlob;
+                        if (finalBlob !== imageBlob) {
+                            const finalSize = (finalBlob.size / (1024 * 1024)).toFixed(2);
+                            const quality = (bestQuality * 100).toFixed(0);
+                            OBR.notification.show(`Image compressed: ${quality}% quality (${finalSize}MB)`, "INFO");
+                        }
+
+                        reportProgress(100);
+                        resolve(finalBlob);
                     })
                     .catch((error) => {
                         reject(error instanceof Error ? error : new Error('Could not create blob'));
@@ -1081,7 +1100,8 @@ async function uploadRawMediaScene(
     file: File,
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
-    videoOptions?: VideoCompressionOptions
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
 ): Promise<void> {
     OBR.notification.show('Importing scene..', 'INFO');
     const isVideo =
@@ -1107,7 +1127,7 @@ async function uploadRawMediaScene(
             maxSizeInMB: compressionMode === 'high' ? 49 : 24,
             maxMegapixels: compressionMode === 'standard' ? 67 : 144,
         };
-        finalBlob = await optimizeImage(file, optimizationOptions, onProgress);
+        finalBlob = await optimizeImage(file, optimizationOptions, onProgress, onStage);
         fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
     }
 
@@ -1130,10 +1150,11 @@ export async function uploadSceneFromVTT(
     file: File,
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
-    videoOptions?: VideoCompressionOptions
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
 ): Promise<void> {
     if (isRawMediaFile(file)) {
-        return uploadRawMediaScene(file, compressionMode, onProgress, videoOptions);
+        return uploadRawMediaScene(file, compressionMode, onProgress, videoOptions, onStage);
     }
 
     const content = await readFileAsText(file);
@@ -1176,7 +1197,7 @@ export async function uploadSceneFromVTT(
     };
 
     // UVTT data embeds map images, not videos.
-    const finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress);
+    const finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress, onStage);
     const fileExtension = getImageExtensionFromMimeType(finalBlob.type, imageType === 'image/webp' ? 'webp' : 'png');
     const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
 
@@ -1217,7 +1238,8 @@ export async function uploadFoundryScene(
     name: string,
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
-    videoOptions?: VideoCompressionOptions
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
 ): Promise<void> {
     OBR.notification.show("Importing scene..", "INFO");
     const vttMapDataSource = convertFoundryToVTTData(foundryData);
@@ -1248,7 +1270,7 @@ export async function uploadFoundryScene(
             fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
         }
     } else {
-        finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress);
+        finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress, onStage);
         fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
     }
     const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
