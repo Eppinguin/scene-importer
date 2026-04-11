@@ -693,10 +693,6 @@ function App() {
         setIsFoundryFormat(true);
         const firstScene = scenes[0].data;
         setHasImage(!!(firstScene.img || firstScene.background?.src));
-        OBR.notification.show(
-          `Loaded module with ${scenes.length} scenes.`,
-          "SUCCESS",
-        );
       } else {
         OBR.notification.show("No scenes found in this ZIP.", "WARNING");
         setZipObject(null);
@@ -1046,7 +1042,6 @@ function App() {
       setCompressionStage(null);
       setIsLoading(true);
 
-      OBR.notification.show("Scene created successfully!", "SUCCESS");
       OBR.modal.close("com.eppinguin.scene-importer/modal");
     } catch (error) {
       console.error("Error creating scene:", error);
