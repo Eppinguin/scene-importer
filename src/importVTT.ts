@@ -115,7 +115,26 @@ function getImageTypeFromBase64(base64Data: string): 'image/png' | 'image/webp' 
 
 // Compression options for image optimization
 export type CompressionMode = 'none' | 'standard' | 'high';
-export type VideoCodecPreference = 'av1' | 'vp9' | 'h264';
+export type VideoCodecPreference = 'auto' | 'av1' | 'h265' | 'vp9' | 'h264';
+type TranscodeCodecPreference = Exclude<VideoCodecPreference, 'auto'>;
+export type VideoCompressionErrorCode =
+    | 'VIDEO_COMPRESSION_ABORTED'
+    | 'VIDEO_COMPRESSION_METADATA_FAILED'
+    | 'VIDEO_COMPRESSION_NO_PROGRESS'
+    | 'VIDEO_COMPRESSION_DECODE_FAILED'
+    | 'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER'
+    | 'VIDEO_COMPRESSION_SIZE_LIMIT'
+    | 'VIDEO_COMPRESSION_SOURCE_TOO_LARGE';
+
+export class VideoCompressionError extends Error {
+    code: VideoCompressionErrorCode;
+
+    constructor(code: VideoCompressionErrorCode, message: string) {
+        super(message);
+        this.name = 'VideoCompressionError';
+        this.code = code;
+    }
+}
 
 interface OptimizationOptions {
     compressionMode?: CompressionMode;
@@ -149,7 +168,8 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality?: num
 async function optimizeImage(
     imageBlob: Blob,
     options: OptimizationOptions = {},
-    onProgress?: (progress: number) => void
+    onProgress?: (progress: number) => void,
+    onStage?: (stage: string) => void
 ): Promise<Blob> {
     let lastProgress = -1;
     const reportProgress = (progress: number) => {
@@ -159,6 +179,12 @@ async function optimizeImage(
         lastProgress = normalized;
         onProgress(normalized);
     };
+    let lastStage = "";
+    const reportStage = (stage: string) => {
+        if (!onStage || stage === lastStage) return;
+        lastStage = stage;
+        onStage(stage);
+    };
 
     const {
         compressionMode = 'standard',
@@ -166,10 +192,12 @@ async function optimizeImage(
         maxMegapixels = compressionMode === 'standard' ? 67 : 144
     } = options;
     const maxSizeInBytes = maxSizeInMB * 1024 * 1024;
+    reportStage('Loading image');
     reportProgress(2);
 
     // If no compression is requested and the image is under the maximum size, return it as is
     if (compressionMode === 'none' && imageBlob.size <= maxSizeInBytes) {
+        reportStage('Using original image');
         reportProgress(100);
         return imageBlob;
     }
@@ -181,6 +209,7 @@ async function optimizeImage(
 
         img.onload = () => {
             URL.revokeObjectURL(img.src);
+            reportStage('Preparing image');
             reportProgress(10);
 
             // Start with original dimensions
@@ -196,6 +225,9 @@ async function optimizeImage(
             }
 
             const didResize = width !== img.width || height !== img.height;
+            if (didResize) {
+                reportStage('Resizing image');
+            }
 
             canvas.width = width;
             canvas.height = height;
@@ -211,35 +243,39 @@ async function optimizeImage(
             const isUnderSizeLimit = imageBlob.size <= maxSizeInBytes;
             const sourceMimeType = imageBlob.type.toLowerCase();
 
-            if (compressionMode !== 'none' && isUnderSizeLimit && !didResize) {
-                if (sourceMimeType === 'image/webp') {
-                    reportProgress(100);
-                    resolve(imageBlob);
-                    return;
-                }
-
-                const isLossyNonWebp = sourceMimeType === 'image/jpeg' || sourceMimeType === 'image/jpg';
-                if (!isLossyNonWebp) {
-                    reportProgress(100);
-                    resolve(imageBlob);
-                    return;
-                }
-
-                void (async () => {
-                    reportProgress(65);
-                    const candidate = await canvasToBlob(canvas, 'image/webp', 0.85);
-                    reportProgress(100);
-                    resolve(candidate.size > imageBlob.size ? imageBlob : candidate);
-                })().catch(() => {
-                    reportProgress(100);
-                    resolve(imageBlob);
-                });
+            // Keep in-limit WebP files as-is unless a resize was required.
+            if (compressionMode !== 'none' && sourceMimeType === 'image/webp' && isUnderSizeLimit && !didResize) {
+                reportStage('Using original image');
+                reportProgress(100);
+                resolve(imageBlob);
                 return;
             }
 
-            // Set initial quality based on compression mode - start with highest possible quality
-            // In browsers, quality=1 can inflate already-compressed sources.
-            const initialQuality = 0.95;
+            const encodeCompressedImage = async (quality: number): Promise<Blob> => {
+                const webpBlob = await canvasToBlob(canvas, 'image/webp', quality);
+                if (webpBlob.type === 'image/webp') {
+                    return webpBlob;
+                }
+                const jpegQuality = Math.max(0.6, Math.min(0.92, quality));
+                return canvasToBlob(canvas, 'image/jpeg', jpegQuality);
+            };
+
+            if (compressionMode === 'none') {
+                reportStage('Finalizing image');
+                void canvasToBlob(canvas, imageBlob.type)
+                    .then((blob) => {
+                        const finalBlob = (isUnderSizeLimit && blob.size >= imageBlob.size) ? imageBlob : blob;
+                        reportProgress(100);
+                        resolve(finalBlob);
+                    })
+                    .catch((error) => {
+                        reject(error instanceof Error ? error : new Error('Could not create blob'));
+                    });
+                return;
+            }
+
+            // Start high and only step down if needed to meet limits.
+            const initialQuality = 0.85;
             const minQuality = 0.1;
             const qualityStep = 0.05;
             const totalPasses = Math.max(
@@ -247,25 +283,35 @@ async function optimizeImage(
                 Math.ceil((initialQuality - minQuality) / qualityStep) + 1
             );
 
-            // Try different quality settings until we get under maxSizeInMB
-            const tryCompress = (currentQuality: number, passIndex: number) => {
-                reportProgress(25 + (passIndex / totalPasses) * 70);
-                // Always use WebP for better compression unless no compression is requested
-                const mimeType = compressionMode === 'none' ? imageBlob.type : 'image/webp';
+            let bestBlob = imageBlob;
+            let bestQuality = initialQuality;
 
-                void canvasToBlob(canvas, mimeType, compressionMode === 'none' ? undefined : currentQuality)
+            const tryCompress = (currentQuality: number, passIndex: number) => {
+                reportStage(`Encoding image (pass ${passIndex + 1})`);
+                reportProgress(25 + (passIndex / totalPasses) * 70);
+                void encodeCompressedImage(currentQuality)
                     .then((blob) => {
-                        const currentSize = blob.size / (1024 * 1024);
-                        if (blob.size > maxSizeInBytes && currentQuality > minQuality && compressionMode !== 'none') {
-                            // Try again with lower quality, use smaller steps for more precise control
-                            tryCompress(currentQuality - qualityStep, passIndex + 1);
-                        } else {
-                            const finalSize = currentSize.toFixed(2);
-                            const quality = (currentQuality * 100).toFixed(0);
-                            OBR.notification.show(`Image compressed: ${quality}% quality (${finalSize}MB)`, "INFO");
-                            reportProgress(100);
-                            resolve(blob);
+                        if (blob.size < bestBlob.size) {
+                            bestBlob = blob;
+                            bestQuality = currentQuality;
                         }
+
+                        const reachedTarget = blob.size <= maxSizeInBytes;
+                        if (!reachedTarget && currentQuality > minQuality) {
+                            tryCompress(currentQuality - qualityStep, passIndex + 1);
+                            return;
+                        }
+
+                        reportStage('Finalizing image');
+                        const finalBlob = (bestBlob.size < imageBlob.size) ? bestBlob : imageBlob;
+                        if (finalBlob !== imageBlob) {
+                            const finalSize = (finalBlob.size / (1024 * 1024)).toFixed(2);
+                            const quality = (bestQuality * 100).toFixed(0);
+                            OBR.notification.show(`Image compressed: ${quality}% quality (${finalSize}MB)`, "INFO");
+                        }
+
+                        reportProgress(100);
+                        resolve(finalBlob);
                     })
                     .catch((error) => {
                         reject(error instanceof Error ? error : new Error('Could not create blob'));
@@ -325,7 +371,7 @@ interface MediabunnyModule {
     Output: new (options: { format: unknown; target: unknown }) => { target: { buffer: ArrayBuffer | null } };
     BlobSource: new (blob: Blob) => unknown;
     BufferTarget: new () => { buffer: ArrayBuffer | null };
-    canEncodeVideo?: (codec: 'avc' | 'vp9' | 'av1', config: {
+    canEncodeVideo?: (codec: 'avc' | 'hevc' | 'vp9' | 'av1', config: {
         width: number;
         height: number;
         bitrate: number;
@@ -338,7 +384,7 @@ interface MediabunnyModule {
             input: unknown;
             output: unknown;
             video: {
-                codec: 'avc' | 'vp9' | 'av1';
+                codec: 'avc' | 'hevc' | 'vp9' | 'av1';
                 frameRate: number;
                 bitrate: number;
                 keyFrameInterval: number;
@@ -356,57 +402,300 @@ interface MediabunnyModule {
     ALL_FORMATS: unknown;
 }
 
+let cachedBrowserVideoCodecAvailability: Promise<BrowserVideoCodecAvailability> | null = null;
+
+export async function getBrowserVideoCodecAvailability(): Promise<BrowserVideoCodecAvailability> {
+    if (cachedBrowserVideoCodecAvailability) {
+        return cachedBrowserVideoCodecAvailability;
+    }
+
+    cachedBrowserVideoCodecAvailability = (async () => {
+        const defaultAvailability: BrowserVideoCodecAvailability = {
+            auto: true,
+            av1: false,
+            h265: false,
+            vp9: false,
+            h264: false,
+        };
+
+        try {
+            const mb = await import('mediabunny') as unknown as MediabunnyModule;
+            const canEncodeVideo = mb.canEncodeVideo;
+            const getEncodableVideoCodecs = mb.getEncodableVideoCodecs;
+            const baselineProbe = {
+                width: 1280,
+                height: 720,
+                bitrate: 2_000_000,
+                frameRate: 30,
+            };
+            const accelerationModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
+                'prefer-hardware',
+                'no-preference',
+                'prefer-software',
+            ];
+
+            const results = { ...defaultAvailability };
+
+            const tryProbe = async (codec: 'av1' | 'hevc' | 'vp9' | 'avc'): Promise<boolean> => {
+                if (!canEncodeVideo) return false;
+                for (const hardwareAcceleration of accelerationModes) {
+                    try {
+                        const supported = await canEncodeVideo(codec, {
+                            ...baselineProbe,
+                            hardwareAcceleration,
+                        });
+                        if (supported) return true;
+                    } catch {
+                        // Ignore per-mode probe errors.
+                    }
+                }
+                return false;
+            };
+
+            if (getEncodableVideoCodecs) {
+                try {
+                    const encodable = new Set(await getEncodableVideoCodecs());
+                    results.av1 = encodable.has('av1');
+                    results.h265 = encodable.has('hevc');
+                    results.vp9 = encodable.has('vp9');
+                    results.h264 = encodable.has('avc');
+                } catch {
+                    // Fall back to explicit probes below.
+                }
+            }
+
+            if (!results.av1) results.av1 = await tryProbe('av1');
+            if (!results.h265) results.h265 = await tryProbe('hevc');
+            if (!results.vp9) results.vp9 = await tryProbe('vp9');
+            if (!results.h264) results.h264 = await tryProbe('avc');
+
+            return results;
+        } catch {
+            return defaultAvailability;
+        }
+    })();
+
+    return cachedBrowserVideoCodecAvailability;
+}
+
 export interface VideoCompressionOptions {
     keepAudio?: boolean;
     maxDimension?: number;
     preferredCodec?: VideoCodecPreference;
     forceTranscodeUnderLimit?: boolean;
     abortSignal?: AbortSignal;
+    onStage?: (stage: string) => void;
+}
+
+export interface VideoCompressionPreflightResult {
+    supported: boolean;
+    reason?: string;
+    inconclusive?: boolean;
+}
+
+function getDecoderCodecCandidates(
+    codec: unknown,
+    mimeType: string
+): string[] {
+    const normalized = normalizeSourceCodec(codec);
+    const candidates = new Set<string>();
+
+    if (typeof codec === 'string' && codec.trim().length > 0) {
+        candidates.add(codec.trim());
+    }
+
+    if (normalized === 'avc') {
+        candidates.add('avc1.42E01E');
+        candidates.add('avc1.640028');
+    } else if (normalized === 'hevc') {
+        candidates.add('hvc1.1.6.L120.B0');
+        candidates.add('hev1.1.6.L120.B0');
+    } else if (normalized === 'vp9') {
+        candidates.add('vp09.00.10.08');
+        candidates.add('vp9');
+    } else if (normalized === 'av1') {
+        candidates.add('av01.0.08M.08');
+        candidates.add('av1');
+    }
+
+    const lowerMime = mimeType.toLowerCase();
+    if (candidates.size === 0 && lowerMime.includes('webm')) {
+        candidates.add('vp09.00.10.08');
+        candidates.add('vp8');
+        candidates.add('av01.0.08M.08');
+    }
+
+    if (candidates.size === 0 && lowerMime.includes('mp4')) {
+        candidates.add('avc1.42E01E');
+        candidates.add('hvc1.1.6.L120.B0');
+    }
+
+    return Array.from(candidates);
+}
+
+async function isDecoderSupportedForSource(
+    codecCandidates: string[],
+    mimeType: string,
+    width: number,
+    height: number,
+    frameRate: number,
+    bitrate: number
+): Promise<boolean | null> {
+    let hadAnyCheck = false;
+
+    const mediaCapabilities = typeof navigator !== 'undefined'
+        && !!navigator.mediaCapabilities
+        && typeof navigator.mediaCapabilities.decodingInfo === 'function'
+        ? navigator.mediaCapabilities
+        : null;
+
+    if (mediaCapabilities && codecCandidates.length > 0) {
+        for (const codec of codecCandidates) {
+            hadAnyCheck = true;
+            try {
+                const info = await mediaCapabilities.decodingInfo({
+                    type: 'file',
+                    video: {
+                        contentType: `${mimeType}; codecs="${codec}"`,
+                        width,
+                        height,
+                        bitrate,
+                        framerate: frameRate,
+                    },
+                });
+                if (info.supported) {
+                    return true;
+                }
+            } catch {
+                // Try next candidate.
+            }
+        }
+    }
+
+    if (typeof VideoDecoder !== 'undefined' && typeof VideoDecoder.isConfigSupported === 'function' && codecCandidates.length > 0) {
+        for (const codec of codecCandidates) {
+            hadAnyCheck = true;
+            try {
+                const support = await VideoDecoder.isConfigSupported({
+                    codec,
+                    codedWidth: width,
+                    codedHeight: height,
+                    hardwareAcceleration: 'prefer-hardware',
+                });
+                if (support.supported) {
+                    return true;
+                }
+            } catch {
+                // Try next candidate.
+            }
+        }
+    }
+
+    if (!hadAnyCheck) return null;
+    return false;
+}
+
+export type BrowserVideoCodecAvailability = {
+    auto: true;
+    av1: boolean;
+    h265: boolean;
+    vp9: boolean;
+    h264: boolean;
+};
+
+function toEvenDimension(value: number): number {
+    return Math.max(2, Math.round(value) & ~1);
+}
+
+function isLikelyIOSBrowser(): boolean {
+    if (typeof navigator === 'undefined') return false;
+    const ua = navigator.userAgent || '';
+    const platform = navigator.platform || '';
+    const maxTouchPoints = (navigator as Navigator & { maxTouchPoints?: number }).maxTouchPoints || 0;
+    const isIOSDevice = /iPad|iPhone|iPod/.test(ua);
+    const isTouchMac = platform === 'MacIntel' && maxTouchPoints > 1;
+    return isIOSDevice || isTouchMac;
 }
 
 async function getVideoMetadata(fileBlob: Blob): Promise<VideoMeta> {
     return new Promise((resolve, reject) => {
         const video = document.createElement('video');
-        video.preload = 'auto';
+        video.preload = 'metadata';
         video.muted = true;
+        video.playsInline = true;
         let settled = false;
-        const finalize = () => {
-            if (settled) return;
-            settled = true;
+        let timeoutId: number | null = null;
 
-            let frameRate = 30;
-            try {
-                const withCapture = video as HTMLVideoElement & {
-                    captureStream?: () => MediaStream;
-                    mozCaptureStream?: () => MediaStream;
-                };
-                const stream = withCapture.captureStream?.() ?? withCapture.mozCaptureStream?.();
-                const track = stream?.getVideoTracks()[0];
-                const candidate = track?.getSettings().frameRate;
-                if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 1) {
-                    frameRate = candidate;
-                }
-                stream?.getTracks().forEach((t) => t.stop());
-            } catch {
-                // Some browsers do not expose captureStream settings for local files.
+        const cleanup = () => {
+            if (timeoutId !== null) {
+                window.clearTimeout(timeoutId);
+                timeoutId = null;
             }
+            video.onloadeddata = null;
+            video.onloadedmetadata = null;
+            video.ondurationchange = null;
+            video.oncanplay = null;
+            video.onerror = null;
+            if (video.src) {
+                URL.revokeObjectURL(video.src);
+                video.removeAttribute('src');
+                video.load();
+            }
+        };
+
+        const tryFinalize = () => {
+            if (settled) return;
+
+            const duration = Number(video.duration);
+            const width = Number(video.videoWidth);
+            const height = Number(video.videoHeight);
+
+            if (!Number.isFinite(duration) || duration <= 0 || width <= 0 || height <= 0) {
+                return;
+            }
+
+            settled = true;
+            cleanup();
 
             resolve({
-                duration: video.duration,
-                width: video.videoWidth,
-                height: video.videoHeight,
-                frameRate,
+                duration,
+                width,
+                height,
+                frameRate: 30,
             });
-            URL.revokeObjectURL(video.src);
         };
 
-        video.onloadeddata = finalize;
-        video.onloadedmetadata = () => {
-            if (video.readyState >= 2) {
-                finalize();
-            }
+        video.onloadeddata = tryFinalize;
+        video.onloadedmetadata = tryFinalize;
+        video.ondurationchange = tryFinalize;
+        video.oncanplay = tryFinalize;
+
+        video.onerror = () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(new Error('Failed to load video metadata'));
         };
-        video.onerror = () => reject(new Error('Failed to load video metadata'));
+
+        timeoutId = window.setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            const duration = Number(video.duration);
+            const width = Number(video.videoWidth);
+            const height = Number(video.videoHeight);
+            cleanup();
+            if (Number.isFinite(duration) && duration > 0 && width > 0 && height > 0) {
+                resolve({
+                    duration,
+                    width,
+                    height,
+                    frameRate: 30,
+                });
+                return;
+            }
+            reject(new Error('Timed out while reading complete video metadata'));
+        }, 25000);
+
         video.src = URL.createObjectURL(fileBlob);
     });
 }
@@ -417,12 +706,28 @@ function getCodecEncodingDefaults(codec: VideoCodecPreference): {
     minBitrate: number;
     maxBitrate: number;
 } {
+    if (codec === 'auto') {
+        return {
+            keyFrameIntervalSeconds: 2,
+            qualityFactor: 0.045,
+            minBitrate: 550_000,
+            maxBitrate: 14_000_000,
+        };
+    }
     if (codec === 'av1') {
         return {
             keyFrameIntervalSeconds: 2,
             qualityFactor: 0.036,
             minBitrate: 450_000,
             maxBitrate: 10_000_000,
+        };
+    }
+    if (codec === 'h265') {
+        return {
+            keyFrameIntervalSeconds: 2,
+            qualityFactor: 0.041,
+            minBitrate: 550_000,
+            maxBitrate: 16_000_000,
         };
     }
     if (codec === 'h264') {
@@ -441,12 +746,15 @@ function getCodecEncodingDefaults(codec: VideoCodecPreference): {
     };
 }
 
-function normalizeSourceCodec(codec: unknown): 'avc' | 'vp9' | 'av1' | 'other' {
+function normalizeSourceCodec(codec: unknown): 'avc' | 'hevc' | 'vp9' | 'av1' | 'other' {
     if (typeof codec !== 'string') {
         return 'other';
     }
     if (codec === 'avc' || codec.startsWith('avc') || codec.startsWith('h264')) {
         return 'avc';
+    }
+    if (codec === 'hevc' || codec.startsWith('hevc') || codec.startsWith('h265') || codec.startsWith('hev1') || codec.startsWith('hvc1')) {
+        return 'hevc';
     }
     if (codec === 'vp9' || codec.startsWith('vp9')) {
         return 'vp9';
@@ -458,8 +766,8 @@ function normalizeSourceCodec(codec: unknown): 'avc' | 'vp9' | 'av1' | 'other' {
 }
 
 function getCodecRatePolicy(
-    sourceCodec: 'avc' | 'vp9' | 'av1' | 'other',
-    targetCodec: VideoCodecPreference,
+    sourceCodec: 'avc' | 'hevc' | 'vp9' | 'av1' | 'other',
+    targetCodec: TranscodeCodecPreference,
     forceShrinkMode: boolean,
     preserveQualityMode: boolean
 ): { equivalentFactor: number; qualityFloorFactor: number } {
@@ -468,42 +776,83 @@ function getCodecRatePolicy(
         ? {
             'avc->vp9': 1.0,
             'avc->av1': 0.95,
+            'avc->h265': 0.88,
             'avc->h264': 1.0,
+            'hevc->av1': 1.12,
+            'hevc->vp9': 1.2,
+            'hevc->h265': 1.0,
+            'hevc->h264': 1.28,
             'vp9->av1': 0.96,
+            'vp9->h265': 0.96,
             'vp9->vp9': 1.0,
             'vp9->h264': 1.15,
             'av1->av1': 1.0,
+            'av1->h265': 1.05,
             'av1->vp9': 1.2,
             'av1->h264': 1.35,
         }
         : {
             'avc->vp9': 0.9,
             'avc->av1': 0.82,
+            'avc->h265': 0.8,
             'avc->h264': 1.0,
+            'hevc->av1': 1.0,
+            'hevc->vp9': 1.1,
+            'hevc->h265': 1.0,
+            'hevc->h264': 1.2,
             'vp9->av1': 0.9,
+            'vp9->h265': 0.9,
             'vp9->vp9': 1.0,
             'vp9->h264': 1.15,
             'av1->av1': 1.0,
+            'av1->h265': 0.92,
             'av1->vp9': 1.2,
             'av1->h264': 1.35,
         };
 
     const fallbackEquivalent = preserveQualityMode
-        ? (targetCodec === 'h264' ? 1.08 : 1.0)
+        ? (targetCodec === 'h264' ? 1.08 : targetCodec === 'h265' ? 0.95 : 1.0)
         : (targetCodec === 'av1'
             ? 0.9
+            : targetCodec === 'h265'
+                ? 0.88
             : targetCodec === 'vp9'
                 ? 0.95
                 : 1.05);
 
     const equivalentFactor = equivalentByPair[key] ?? fallbackEquivalent;
     const qualityFloorFactor = preserveQualityMode
-        ? (targetCodec === 'av1' ? 0.92 : targetCodec === 'vp9' ? 0.97 : 1.0)
+        ? (targetCodec === 'av1' ? 0.92 : targetCodec === 'h265' ? 0.95 : targetCodec === 'vp9' ? 0.97 : 1.0)
         : forceShrinkMode
-            ? (targetCodec === 'av1' ? 0.72 : targetCodec === 'vp9' ? 0.8 : 0.92)
-            : (targetCodec === 'av1' ? 0.84 : targetCodec === 'vp9' ? 0.9 : 0.98);
+            ? (targetCodec === 'av1' ? 0.72 : targetCodec === 'h265' ? 0.76 : targetCodec === 'vp9' ? 0.8 : 0.92)
+            : (targetCodec === 'av1' ? 0.84 : targetCodec === 'h265' ? 0.88 : targetCodec === 'vp9' ? 0.9 : 0.98);
 
     return { equivalentFactor, qualityFloorFactor };
+}
+
+function getVideoNoProgressTimeoutMs(
+    sourceBytes: number,
+    durationSeconds: number,
+    outputPixels: number,
+    needsResize: boolean
+): number {
+    const sourceSizeMb = sourceBytes / 1000 / 1000;
+    const outputMegaPixels = outputPixels / 1_000_000;
+
+    const baseMs = needsResize ? 45_000 : 35_000;
+    const sizeAllowanceMs = Math.min(90_000, Math.max(0, sourceSizeMb - 8) * 600);
+    const durationAllowanceMs = Math.min(90_000, Math.max(0, durationSeconds - 20) * 900);
+    const resolutionAllowanceMs = Math.min(45_000, Math.max(0, outputMegaPixels - 2) * 7_500);
+
+    return Math.round(Math.min(240_000, baseMs + sizeAllowanceMs + durationAllowanceMs + resolutionAllowanceMs));
+}
+
+function isLikelyDecodeFailure(message: string): boolean {
+    const lower = message.toLowerCase();
+    return lower.includes('decoder failure')
+        || lower.includes('decode failure')
+        || lower.includes('failed to decode')
+        || (lower.includes('decoder') && lower.includes('failed'));
 }
 
 async function compressVideo(
@@ -512,15 +861,48 @@ async function compressVideo(
     onProgress?: (progress: number) => void,
     options: VideoCompressionOptions = {}
 ): Promise<VideoCompressionResult> {
+    let lastReportedProgress = -1;
+    const reportProgress = (progress: number) => {
+        if (!onProgress) return;
+        const normalized = Math.max(0, Math.min(100, Math.round(progress)));
+        if (normalized <= lastReportedProgress) return;
+        lastReportedProgress = normalized;
+        onProgress(normalized);
+    };
+    let lastStage = '';
+    const reportStage = (stage: string) => {
+        if (!options.onStage || stage === lastStage) return;
+        lastReportedProgress = -1;
+        lastStage = stage;
+        options.onStage(stage);
+    };
+
     const throwIfAborted = () => {
         if (options.abortSignal?.aborted) {
-            throw new Error('Video Compression Aborted');
+            throw new VideoCompressionError('VIDEO_COMPRESSION_ABORTED', 'Video compression canceled.');
         }
     };
 
     throwIfAborted();
-    const { duration, width, height, frameRate } = await getVideoMetadata(fileBlob);
-    const preferredCodec = options.preferredCodec ?? 'vp9';
+    reportStage('Reading video metadata');
+    let duration: number;
+    let width: number;
+    let height: number;
+    let frameRate: number;
+    try {
+        const metadata = await getVideoMetadata(fileBlob);
+        duration = metadata.duration;
+        width = metadata.width;
+        height = metadata.height;
+        frameRate = metadata.frameRate;
+    } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to read video metadata.';
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_METADATA_FAILED',
+            `${message} Try another browser or upload without compression.`
+        );
+    }
+    const requestedCodec = options.preferredCodec ?? 'auto';
     const targetSizeMB = compressionMode === 'high' ? 99 : 49;
     // Use decimal MB to match user-facing size limits (50MB / 100MB) more closely.
     const maxBytes = targetSizeMB * 1000 * 1000;
@@ -530,23 +912,31 @@ async function compressVideo(
     let outHeight = height;
     if (options.maxDimension && options.maxDimension > 0 && (width > options.maxDimension || height > options.maxDimension)) {
         const scale = options.maxDimension / Math.max(width, height);
-        outWidth = Math.max(2, Math.round(width * scale) & ~1);
-        outHeight = Math.max(2, Math.round(height * scale) & ~1);
+        outWidth = toEvenDimension(width * scale);
+        outHeight = toEvenDimension(height * scale);
     }
 
-    const sourceFrameRate = Number.isFinite(frameRate) && frameRate > 1 ? frameRate : 30;
-    const outputFrameRate = Math.min(120, Math.max(24, Math.round(sourceFrameRate)));
-
     const needsResize = outWidth !== width || outHeight !== height;
+    const resizeConfig = needsResize
+        ? { width: outWidth, height: outHeight, fit: 'fill' as const }
+        : undefined;
+
+    const sourceFrameRate = Number.isFinite(frameRate) && frameRate > 1 ? frameRate : 30;
+    const outputFrameRate = needsResize
+        ? Math.min(30, Math.max(24, Math.round(sourceFrameRate)))
+        : Math.min(120, Math.max(24, Math.round(sourceFrameRate)));
+
     const audioTransformRequested = options.keepAudio === false;
-    const codecTransformRequested = preferredCodec !== 'vp9';
+    const codecTransformRequested = requestedCodec !== 'auto' && requestedCodec !== 'vp9';
     const transformRequested = needsResize || audioTransformRequested || codecTransformRequested;
+    const requiresTranscode = transformRequested || fileBlob.size > maxBytes || !!options.forceTranscodeUnderLimit;
     const preserveQualityUnderLimit = fileBlob.size <= maxBytes
         && !needsResize
         && !options.forceTranscodeUnderLimit;
 
-    if (!transformRequested && fileBlob.size <= maxBytes && !options.forceTranscodeUnderLimit) {
-        if (onProgress) onProgress(100);
+    if (!requiresTranscode) {
+        reportStage('Using original video');
+        reportProgress(100);
         return {
             blob: fileBlob,
             sourceWidth: width,
@@ -557,13 +947,21 @@ async function compressVideo(
     }
 
     const pixels = outWidth * outHeight;
-    const codecDefaults = getCodecEncodingDefaults(preferredCodec);
+    const getBitrateScalesForCodec = (codec: TranscodeCodecPreference): number[] => {
+        if (codec === 'av1') return [1, 0.9, 0.8, 0.72, 0.64, 0.56, 0.5];
+        if (codec === 'h265') return [1, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5];
+        if (codec === 'h264') return [1, 0.9, 0.82, 0.74, 0.66];
+        return [1, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5];
+    };
     const sourcePixels = Math.max(1, width * height);
     const resizeFactor = pixels / sourcePixels;
     const frameRateFactor = outputFrameRate / Math.max(sourceFrameRate, 1);
     const sourceTotalBitrate = Math.max(250_000, Math.floor((fileBlob.size * 8) / Math.max(duration, 1)));
     const assumedAudioBitrate = options.keepAudio === false ? 0 : 128_000;
+    const noProgressTimeoutMs = getVideoNoProgressTimeoutMs(fileBlob.size, duration, pixels, needsResize);
+    const noProgressTimeoutSeconds = Math.round(noProgressTimeoutMs / 1000);
 
+    reportStage('Loading video encoder');
     const mb = await import('mediabunny') as unknown as MediabunnyModule;
     const {
         Input,
@@ -577,10 +975,111 @@ async function compressVideo(
         canEncodeVideo,
     } = mb;
 
-    let sourceCodec: 'avc' | 'vp9' | 'av1' | 'other' = 'other';
+    let effectiveCodec: TranscodeCodecPreference = requestedCodec === 'auto' ? 'av1' : requestedCodec;
+
+    if (requestedCodec === 'auto') {
+        const codecOrder: TranscodeCodecPreference[] = ['av1', 'h265', 'vp9', 'h264'];
+        const probeModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
+            'prefer-hardware',
+            'no-preference',
+            'prefer-software',
+        ];
+        const toEncoderCodec = (codec: TranscodeCodecPreference): 'avc' | 'hevc' | 'vp9' | 'av1' => {
+            if (codec === 'h264') return 'avc';
+            if (codec === 'h265') return 'hevc';
+            return codec;
+        };
+
+        if (canEncodeVideo) {
+            const probeBitrate = Math.max(450_000, bitrateFromBudget);
+            let chosenCodec: TranscodeCodecPreference | null = null;
+            for (const candidate of codecOrder) {
+                const encoderCodec = toEncoderCodec(candidate);
+                let supported = false;
+                for (const hardwareAcceleration of probeModes) {
+                    try {
+                        const canEncode = await canEncodeVideo(encoderCodec, {
+                            width: outWidth,
+                            height: outHeight,
+                            bitrate: probeBitrate,
+                            frameRate: outputFrameRate,
+                            hardwareAcceleration,
+                        });
+                        if (canEncode) {
+                            supported = true;
+                            break;
+                        }
+                    } catch {
+                        // Try next acceleration mode.
+                    }
+                }
+                if (supported) {
+                    chosenCodec = candidate;
+                    break;
+                }
+            }
+
+            if (chosenCodec) {
+                effectiveCodec = chosenCodec;
+                if (chosenCodec !== codecOrder[0]) {
+                    OBR.notification.show(
+                        `Auto codec selected ${chosenCodec.toUpperCase()} for this browser and resolution.`,
+                        'INFO'
+                    );
+                }
+            } else {
+                effectiveCodec = 'vp9';
+            }
+        } else {
+            const availability = await getBrowserVideoCodecAvailability();
+            if (availability.av1) effectiveCodec = 'av1';
+            else if (availability.h265) effectiveCodec = 'h265';
+            else if (availability.vp9) effectiveCodec = 'vp9';
+            else effectiveCodec = 'h264';
+        }
+    }
+
+    if (requiresTranscode && isLikelyIOSBrowser()) {
+        const iosTranscodeErrorMessage = 'This iOS browser cannot transcode video in this context. Try no compression, a lower Max video dimension, or a browser/device with hardware video encoding support.';
+        if (canEncodeVideo) {
+            const probeCodec = effectiveCodec === 'h264'
+                ? 'avc'
+                : effectiveCodec === 'h265'
+                    ? 'hevc'
+                    : effectiveCodec;
+            const iosProbeModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = ['prefer-hardware', 'no-preference', 'prefer-software'];
+            let iosTranscodeSupported = false;
+
+            for (const hardwareAcceleration of iosProbeModes) {
+                try {
+                    const supported = await canEncodeVideo(probeCodec, {
+                        width: outWidth,
+                        height: outHeight,
+                        bitrate: Math.max(450_000, bitrateFromBudget),
+                        frameRate: outputFrameRate,
+                        hardwareAcceleration,
+                    });
+                    if (supported) {
+                        iosTranscodeSupported = true;
+                        break;
+                    }
+                } catch {
+                    // Ignore probe failures and keep checking other modes.
+                }
+            }
+
+            if (!iosTranscodeSupported) {
+                throw new VideoCompressionError('VIDEO_COMPRESSION_UNSUPPORTED_ENCODER', iosTranscodeErrorMessage);
+            }
+        }
+    }
+
+    let sourceCodec: 'avc' | 'hevc' | 'vp9' | 'av1' | 'other' = 'other';
     let sourceVideoBitrate = 0;
     let sourceAudioBitrate = 0;
+    const skipDetailedPacketStats = fileBlob.size > 60_000_000;
 
+    reportStage('Analyzing source video');
     try {
         const analysisInput = new Input({
             source: new BlobSource(fileBlob),
@@ -591,9 +1090,11 @@ async function compressVideo(
         if (sourceVideoTrack) {
             sourceCodec = normalizeSourceCodec(sourceVideoTrack.codec);
             const videoStats = sourceVideoTrack.computePacketStats
-                ? fileBlob.size <= 20_000_000
-                    ? await sourceVideoTrack.computePacketStats()
-                    : await sourceVideoTrack.computePacketStats(180)
+                ? skipDetailedPacketStats
+                    ? undefined
+                    : fileBlob.size <= 20_000_000
+                        ? await sourceVideoTrack.computePacketStats()
+                        : await sourceVideoTrack.computePacketStats(180)
                 : undefined;
             if (videoStats && Number.isFinite(videoStats.averageBitrate) && videoStats.averageBitrate > 0) {
                 sourceVideoBitrate = Math.floor(videoStats.averageBitrate);
@@ -603,9 +1104,11 @@ async function compressVideo(
         if (options.keepAudio !== false) {
             const sourceAudioTrack = await analysisInput.getPrimaryAudioTrack?.();
             const audioStats = sourceAudioTrack?.computePacketStats
-                ? fileBlob.size <= 20_000_000
-                    ? await sourceAudioTrack.computePacketStats()
-                    : await sourceAudioTrack.computePacketStats(180)
+                ? skipDetailedPacketStats
+                    ? undefined
+                    : fileBlob.size <= 20_000_000
+                        ? await sourceAudioTrack.computePacketStats()
+                        : await sourceAudioTrack.computePacketStats(180)
                 : undefined;
             if (audioStats && Number.isFinite(audioStats.averageBitrate) && audioStats.averageBitrate > 0) {
                 sourceAudioBitrate = Math.floor(audioStats.averageBitrate);
@@ -622,7 +1125,7 @@ async function compressVideo(
 
     const { equivalentFactor, qualityFloorFactor } = getCodecRatePolicy(
         sourceCodec,
-        preferredCodec,
+        effectiveCodec,
         !!options.forceTranscodeUnderLimit,
         preserveQualityUnderLimit
     );
@@ -630,40 +1133,28 @@ async function compressVideo(
     const sourceEquivalentBitrate = Math.floor(sourceVideoBitrate * equivalentFactor * resizeFactor * frameRateFactor);
     const qualityFloorBitrate = Math.floor(sourceVideoBitrate * qualityFloorFactor * resizeFactor * frameRateFactor);
 
-    const qualityBitrate = Math.floor(pixels * outputFrameRate * codecDefaults.qualityFactor);
-    const seededBitrateBase = preserveQualityUnderLimit
-        ? Math.min(bitrateFromBudget, sourceEquivalentBitrate)
-        : Math.min(
-            bitrateFromBudget,
-            qualityBitrate,
-            sourceEquivalentBitrate
-        );
-    const boundedQualityFloorBitrate = Math.max(
-        codecDefaults.minBitrate,
-        Math.min(codecDefaults.maxBitrate, qualityFloorBitrate)
-    );
-    const boundedSeedBitrate = Math.max(
-        codecDefaults.minBitrate,
-        Math.min(codecDefaults.maxBitrate, seededBitrateBase)
-    );
-    const seededBitrate = Math.max(
-        boundedQualityFloorBitrate,
-        boundedSeedBitrate
-    );
-
-    const transcodeOnce = async (bitrate: number): Promise<Blob> => {
+    const transcodeOnce = async (
+        codecPreference: TranscodeCodecPreference,
+        bitrate: number,
+        codecDefaultsForPass: ReturnType<typeof getCodecEncodingDefaults>,
+        stageLabel: string
+    ): Promise<Blob> => {
         throwIfAborted();
+        reportStage(stageLabel);
+        reportProgress(0);
 
-        const codec = preferredCodec === 'h264' ? 'avc' : preferredCodec;
-        const outputFormat = preferredCodec === 'h264'
+        const codec = codecPreference === 'h264'
+            ? 'avc'
+            : codecPreference === 'h265'
+                ? 'hevc'
+                : codecPreference;
+        const outputFormat = codecPreference === 'h264' || codecPreference === 'h265'
             ? new Mp4OutputFormat()
             : new WebMOutputFormat();
 
-        const accelerationModes: Array<'no-preference' | 'prefer-software' | 'prefer-hardware'> = [
-            'no-preference',
-            'prefer-software',
-            'prefer-hardware',
-        ];
+        const accelerationModes: Array<'no-preference' | 'prefer-software' | 'prefer-hardware'> = needsResize
+            ? ['prefer-hardware', 'no-preference', 'prefer-software']
+            : ['prefer-hardware', 'no-preference', 'prefer-software'];
 
         let lastError: Error | null = null;
 
@@ -705,10 +1196,10 @@ async function compressVideo(
                         codec,
                         frameRate: outputFrameRate,
                         bitrate,
-                        keyFrameInterval: codecDefaults.keyFrameIntervalSeconds,
+                        keyFrameInterval: codecDefaultsForPass.keyFrameIntervalSeconds,
                         hardwareAcceleration,
                         forceTranscode: true,
-                        ...(needsResize ? { width: outWidth, height: outHeight, fit: 'fill' as const } : {}),
+                        ...(resizeConfig ?? {}),
                     },
                     audio: options.keepAudio === false ? { discard: true } : undefined,
                 });
@@ -718,15 +1209,32 @@ async function compressVideo(
             }
 
             if (!conversion.isValid) {
-                lastError = new Error('Unable to initialize MediaBunny conversion for this video in the current browser.');
+                lastError = new VideoCompressionError(
+                    'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
+                    'Unable to initialize video conversion in this browser.'
+                );
                 continue;
             }
 
+            let noProgressDetected = false;
+            let lastProgressAt = Date.now();
+            let lastProgressValue = 0;
+            let stallIntervalId: number | null = null;
             conversion.onProgress = (progress: number) => {
-                if (onProgress) {
-                    onProgress(Math.min(99, Math.round(progress * 100)));
+                if (progress > lastProgressValue + 0.0005) {
+                    lastProgressValue = progress;
+                    lastProgressAt = Date.now();
                 }
+                const scopedProgress = Math.max(0, Math.min(1, progress)) * 100;
+                reportProgress(scopedProgress);
             };
+
+            stallIntervalId = window.setInterval(() => {
+                if ((Date.now() - lastProgressAt) > noProgressTimeoutMs) {
+                    noProgressDetected = true;
+                    void conversion.cancel();
+                }
+            }, 2000);
 
             const onAbort = () => {
                 void conversion.cancel();
@@ -737,11 +1245,21 @@ async function compressVideo(
                 await conversion.execute();
             } catch (error) {
                 if (options.abortSignal?.aborted) {
-                    throw new Error('Video Compression Aborted');
+                    throw new VideoCompressionError('VIDEO_COMPRESSION_ABORTED', 'Video compression canceled.');
+                }
+                if (noProgressDetected) {
+                    lastError = new VideoCompressionError(
+                        'VIDEO_COMPRESSION_NO_PROGRESS',
+                        `Video compression made no progress for ${noProgressTimeoutSeconds}s and was stopped. Try a lower Max video dimension, H.264, or another browser/device.`
+                    );
+                    continue;
                 }
                 lastError = error instanceof Error ? error : new Error(String(error));
                 continue;
             } finally {
+                if (stallIntervalId !== null) {
+                    window.clearInterval(stallIntervalId);
+                }
                 options.abortSignal?.removeEventListener('abort', onAbort);
             }
 
@@ -752,7 +1270,7 @@ async function compressVideo(
             }
 
             return new Blob([outputBuffer], {
-                type: preferredCodec === 'h264' ? 'video/mp4' : 'video/webm',
+                type: codecPreference === 'h264' || codecPreference === 'h265' ? 'video/mp4' : 'video/webm',
             });
         }
 
@@ -768,47 +1286,125 @@ async function compressVideo(
             }
         }
 
-        throw new Error(
-            `This browser build cannot encode ${preferredCodec.toUpperCase()} at ${outWidth}x${outHeight}. ` +
-            `Try a lower max video dimension, switch codec, or use a Chromium build with WebCodecs encoding enabled on Linux.` +
+        if (lastError && isLikelyDecodeFailure(lastError.message)) {
+            throw new VideoCompressionError(
+                'VIDEO_COMPRESSION_DECODE_FAILED',
+                `This browser failed while decoding/processing source frames (source: ${width}x${height}, target: ${outWidth}x${outHeight}). ` +
+                `Try another Browser or reducing source resolution before upload (most effective).` +
+                availableCodecs
+            );
+        }
+
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
+            `This browser build cannot encode ${codecPreference.toUpperCase()} at ${outWidth}x${outHeight}. ` +
+            `Try a lower max video dimension, switch codec (or Auto mode), or use a browser version that supports this codec.` +
             availableCodecs +
             (lastError ? ` ${lastError.message}` : '')
         );
     };
 
-    const bitrateScales = preferredCodec === 'av1'
-        ? [1, 0.9, 0.8, 0.72, 0.64, 0.56, 0.5]
-        : preferredCodec === 'h264'
-            ? [1, 0.9, 0.82, 0.74, 0.66]
-            : [1, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5];
+    const bitrateScales = getBitrateScalesForCodec(effectiveCodec);
+    reportStage('Preparing video compression');
+    let output: Blob | null = null;
+    let bestOverBudgetOutput: Blob | null = null;
+    let lastCodecError: Error | null = null;
+    const codecDefaults = getCodecEncodingDefaults(effectiveCodec);
+    const qualityBitrate = Math.floor(pixels * outputFrameRate * codecDefaults.qualityFactor);
+    const seededBitrateBase = preserveQualityUnderLimit
+        ? Math.min(bitrateFromBudget, sourceEquivalentBitrate)
+        : Math.min(
+            bitrateFromBudget,
+            qualityBitrate,
+            sourceEquivalentBitrate
+        );
+    const boundedQualityFloorBitrate = Math.max(
+        codecDefaults.minBitrate,
+        Math.min(codecDefaults.maxBitrate, qualityFloorBitrate)
+    );
+    const boundedSeedBitrate = Math.max(
+        codecDefaults.minBitrate,
+        Math.min(codecDefaults.maxBitrate, seededBitrateBase)
+    );
+    const seededBitrate = Math.max(
+        boundedQualityFloorBitrate,
+        boundedSeedBitrate
+    );
 
-    let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
-    let output = await transcodeOnce(attemptedBitrate);
-    for (let i = 1; i < bitrateScales.length; i++) {
-        const aboveBudget = output.size > maxBytes;
-        if (!aboveBudget) {
-            break;
-        }
-
-        const currentSizeMb = (output.size / 1000 / 1000).toFixed(1);
-        OBR.notification.show(
-            `Output is still ${currentSizeMb}MB, running an additional compression pass.`,
-            "INFO"
+    try {
+        let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
+        let currentPass = 1;
+        const codecLabel = effectiveCodec.toUpperCase();
+        let candidateOutput = await transcodeOnce(
+            effectiveCodec,
+            attemptedBitrate,
+            codecDefaults,
+            `Encoding video (${codecLabel}, pass ${currentPass})`
         );
 
-        const minimumPassBitrate = codecDefaults.minBitrate;
-        const candidateBitrate = Math.max(minimumPassBitrate, Math.floor(seededBitrate * bitrateScales[i]));
-        if (candidateBitrate >= attemptedBitrate) {
-            break;
+        for (let i = 1; i < bitrateScales.length; i++) {
+            if (candidateOutput.size <= maxBytes) {
+                break;
+            }
+
+            const currentSizeMb = (candidateOutput.size / 1000 / 1000).toFixed(1);
+            OBR.notification.show(
+                `Output is still ${currentSizeMb}MB, running an additional compression pass.`,
+                "INFO"
+            );
+
+            const minimumPassBitrate = codecDefaults.minBitrate;
+            const candidateBitrate = Math.max(
+                minimumPassBitrate,
+                Math.floor(seededBitrate * bitrateScales[i])
+            );
+            if (candidateBitrate >= attemptedBitrate) {
+                break;
+            }
+
+            attemptedBitrate = candidateBitrate;
+            currentPass += 1;
+            candidateOutput = await transcodeOnce(
+                effectiveCodec,
+                candidateBitrate,
+                codecDefaults,
+                `Encoding video (${codecLabel}, pass ${currentPass})`
+            );
         }
 
-        attemptedBitrate = candidateBitrate;
-        output = await transcodeOnce(candidateBitrate);
+        if (candidateOutput.size <= maxBytes) {
+            output = candidateOutput;
+        } else {
+            bestOverBudgetOutput = candidateOutput;
+        }
+    } catch (error) {
+        lastCodecError = error instanceof Error ? error : new Error(String(error));
+    }
+
+    if (!output) {
+        if (bestOverBudgetOutput) {
+            const finalSize = (bestOverBudgetOutput.size / 1000 / 1000).toFixed(1);
+            throw new VideoCompressionError(
+                'VIDEO_COMPRESSION_SIZE_LIMIT',
+                `Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try a lower Max video dimension, remove audio, or use H.264.`
+            );
+        }
+        if (lastCodecError instanceof VideoCompressionError) {
+            throw lastCodecError;
+        }
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
+            lastCodecError?.message ||
+            `This browser build cannot encode ${effectiveCodec.toUpperCase()} at ${outWidth}x${outHeight}. Try a lower Max video dimension or another codec.`
+        );
     }
 
     if (output.size > maxBytes) {
         const finalSize = (output.size / 1000 / 1000).toFixed(1);
-        throw new Error(`Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try Standard mode, a lower max video dimension, or H.264.`);
+        throw new VideoCompressionError(
+            'VIDEO_COMPRESSION_SIZE_LIMIT',
+            `Unable to compress video below ${targetSizeMB}MB (current: ${finalSize}MB). Try a lower Max video dimension, remove audio, or use H.264.`
+        );
     }
 
     if (
@@ -820,7 +1416,8 @@ async function compressVideo(
         output = fileBlob;
     }
 
-    if (onProgress) onProgress(100);
+    reportStage('Finalizing video');
+    reportProgress(100);
     return {
         blob: output,
         sourceWidth: width,
@@ -828,6 +1425,70 @@ async function compressVideo(
         outputWidth: outWidth,
         outputHeight: outHeight,
     };
+}
+
+export async function preflightVideoCompression(
+    fileBlob: Blob,
+    options: VideoCompressionOptions = {}
+): Promise<VideoCompressionPreflightResult> {
+    if (!fileBlob.type.startsWith('video/')) {
+        return { supported: true };
+    }
+
+    try {
+        const metadata = await getVideoMetadata(fileBlob);
+        const targetDimension = options.maxDimension && options.maxDimension > 0
+            ? options.maxDimension
+            : Math.max(metadata.width, metadata.height);
+
+        let outWidth = metadata.width;
+        let outHeight = metadata.height;
+        if (targetDimension > 0 && Math.max(metadata.width, metadata.height) > targetDimension) {
+            const scale = targetDimension / Math.max(metadata.width, metadata.height);
+            outWidth = toEvenDimension(metadata.width * scale);
+            outHeight = toEvenDimension(metadata.height * scale);
+        }
+
+        const mb = await import('mediabunny') as unknown as MediabunnyModule;
+        const analysisInput = new mb.Input({
+            source: new mb.BlobSource(fileBlob),
+            formats: mb.ALL_FORMATS,
+        });
+        const sourceVideoTrack = await analysisInput.getPrimaryVideoTrack?.();
+        const codecCandidates = getDecoderCodecCandidates(sourceVideoTrack?.codec, fileBlob.type);
+
+        const estimatedBitrate = Math.max(
+            250_000,
+            Math.floor((fileBlob.size * 8) / Math.max(metadata.duration, 1))
+        );
+
+        const decodeSupported = await isDecoderSupportedForSource(
+            codecCandidates,
+            fileBlob.type || 'video/mp4',
+            outWidth,
+            outHeight,
+            Number.isFinite(metadata.frameRate) && metadata.frameRate > 1 ? metadata.frameRate : 30,
+            estimatedBitrate
+        );
+
+        if (decodeSupported === false) {
+            return {
+                supported: false,
+                reason: `Decoder capability check failed for ${outWidth}x${outHeight} input in this browser.`,
+            };
+        }
+
+        if (decodeSupported === null) {
+            return {
+                supported: true,
+                inconclusive: true,
+            };
+        }
+
+        return { supported: true };
+    } catch {
+        return { supported: true, inconclusive: true };
+    }
 }
 
 function isRawMediaFile(file: File): boolean {
@@ -843,9 +1504,9 @@ async function uploadRawMediaScene(
     file: File,
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
-    videoOptions?: VideoCompressionOptions
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
 ): Promise<void> {
-    OBR.notification.show('Importing scene..', 'INFO');
     const isVideo =
         file.type.startsWith('video/') ||
         /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(file.name.toLowerCase());
@@ -857,9 +1518,12 @@ async function uploadRawMediaScene(
         if (compressionMode !== 'none') {
             const sizeInMb = file.size / (1024 * 1024);
             if (sizeInMb > 500) {
-                throw new Error(`Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`);
+                throw new VideoCompressionError(
+                    'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                    `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                );
             }
-            const compressed = await compressVideo(file, compressionMode, onProgress, videoOptions);
+            const compressed = await compressVideo(file, compressionMode, onProgress, { ...videoOptions, onStage });
             finalBlob = compressed.blob;
             fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
         }
@@ -869,7 +1533,7 @@ async function uploadRawMediaScene(
             maxSizeInMB: compressionMode === 'high' ? 49 : 24,
             maxMegapixels: compressionMode === 'standard' ? 67 : 144,
         };
-        finalBlob = await optimizeImage(file, optimizationOptions, onProgress);
+        finalBlob = await optimizeImage(file, optimizationOptions, onProgress, onStage);
         fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
     }
 
@@ -892,10 +1556,11 @@ export async function uploadSceneFromVTT(
     file: File,
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
-    videoOptions?: VideoCompressionOptions
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
 ): Promise<void> {
     if (isRawMediaFile(file)) {
-        return uploadRawMediaScene(file, compressionMode, onProgress, videoOptions);
+        return uploadRawMediaScene(file, compressionMode, onProgress, videoOptions, onStage);
     }
 
     const content = await readFileAsText(file);
@@ -915,8 +1580,6 @@ export async function uploadSceneFromVTT(
     if (!data.image) {
         throw new Error("No map image found in UVTT file. A map image is required to create a new scene.");
     }
-
-    OBR.notification.show("Importing scene..", "INFO");
 
     // Convert base64 to Blob/File
     const imageData = atob(data.image);
@@ -938,7 +1601,7 @@ export async function uploadSceneFromVTT(
     };
 
     // UVTT data embeds map images, not videos.
-    const finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress);
+    const finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress, onStage);
     const fileExtension = getImageExtensionFromMimeType(finalBlob.type, imageType === 'image/webp' ? 'webp' : 'png');
     const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
 
@@ -979,9 +1642,9 @@ export async function uploadFoundryScene(
     name: string,
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
-    videoOptions?: VideoCompressionOptions
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
 ): Promise<void> {
-    OBR.notification.show("Importing scene..", "INFO");
     const vttMapDataSource = convertFoundryToVTTData(foundryData);
 
     const optimizationOptions: OptimizationOptions = {
@@ -1000,9 +1663,12 @@ export async function uploadFoundryScene(
         const sizeInMb = imageBlob.size / (1024 * 1024);
         if (compressionMode !== 'none') {
             if (sizeInMb > 500) {
-                throw new Error(`Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`);
+                throw new VideoCompressionError(
+                    'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                    `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                );
             }
-            const compressed = await compressVideo(imageBlob, compressionMode, onProgress, videoOptions);
+            const compressed = await compressVideo(imageBlob, compressionMode, onProgress, { ...videoOptions, onStage });
             finalBlob = compressed.blob;
             if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
                 effectiveDpi = vttMapDataSource.resolution.pixels_per_grid * (compressed.outputWidth / compressed.sourceWidth);
@@ -1010,7 +1676,7 @@ export async function uploadFoundryScene(
             fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
         }
     } else {
-        finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress);
+        finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress, onStage);
         fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
     }
     const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
@@ -1084,25 +1750,48 @@ export async function addItemsFromData(processedData: VTTMapData, context: boole
                 }
 
                 // Keep walls aligned to the selected map even when the map has been resized.
-                const sourceWidth = processedData.resolution?.map_size?.x;
-                const sourceHeight = processedData.resolution?.map_size?.y;
-                const selectedWithSize = selectedItem as {
+                const sourceMapWidth = processedData.resolution?.map_size?.x;
+                const sourceMapHeight = processedData.resolution?.map_size?.y;
+                const sourcePixelsPerGrid = processedData.resolution?.pixels_per_grid;
+                const selectedWithImage = selectedItem as {
+                    image?: {
+                        width?: unknown;
+                        height?: unknown;
+                    };
+                    grid?: {
+                        dpi?: unknown;
+                    };
                     width?: unknown;
                     height?: unknown;
                 };
-                const selectedWidth = typeof selectedWithSize.width === 'number' ? selectedWithSize.width : undefined;
-                const selectedHeight = typeof selectedWithSize.height === 'number' ? selectedWithSize.height : undefined;
+                const selectedWidth = typeof selectedWithImage.image?.width === 'number'
+                    ? selectedWithImage.image.width
+                    : typeof selectedWithImage.width === 'number'
+                        ? selectedWithImage.width
+                        : undefined;
+                const selectedHeight = typeof selectedWithImage.image?.height === 'number'
+                    ? selectedWithImage.image.height
+                    : typeof selectedWithImage.height === 'number'
+                        ? selectedWithImage.height
+                        : undefined;
+                const selectedImageDpi = typeof selectedWithImage.grid?.dpi === 'number'
+                    ? selectedWithImage.grid.dpi
+                    : dpi;
 
                 if (
-                    typeof sourceWidth === 'number' && sourceWidth > 0
-                    && typeof sourceHeight === 'number' && sourceHeight > 0
+                    typeof sourceMapWidth === 'number' && sourceMapWidth > 0
+                    && typeof sourceMapHeight === 'number' && sourceMapHeight > 0
+                    && typeof sourcePixelsPerGrid === 'number' && sourcePixelsPerGrid > 0
                     && typeof selectedWidth === 'number' && selectedWidth > 0
                     && typeof selectedHeight === 'number' && selectedHeight > 0
+                    && typeof selectedImageDpi === 'number' && selectedImageDpi > 0
                 ) {
-                    const renderedWidth = selectedWidth * scale.x;
-                    const renderedHeight = selectedHeight * scale.y;
-                    const scaleFromWidth = renderedWidth / (sourceWidth * dpi);
-                    const scaleFromHeight = renderedHeight / (sourceHeight * dpi);
+                    const renderedWidth = (selectedWidth * dpi / selectedImageDpi) * scale.x;
+                    const renderedHeight = (selectedHeight * dpi / selectedImageDpi) * scale.y;
+                    const sourceSceneWidth = sourceMapWidth * dpi;
+                    const sourceSceneHeight = sourceMapHeight * dpi;
+                    const scaleFromWidth = renderedWidth / sourceSceneWidth;
+                    const scaleFromHeight = renderedHeight / sourceSceneHeight;
 
                     if (Number.isFinite(scaleFromWidth) && scaleFromWidth > 0) {
                         scale.x = scaleFromWidth;
@@ -1139,10 +1828,8 @@ export async function addItemsFromVTT(file: File, context: boolean): Promise<voi
 
     try {
         if (isFoundryVTTData(fileData)) {
-            console.log("Detected FoundryVTT format");
             processedData = convertFoundryToVTTData(fileData);
         } else if (isUniversalVTTData(fileData)) {
-            console.log("Detected UniversalVTT format");
             const { image, ...vttData } = fileData;
             void image;
             processedData = vttData as VTTMapData;

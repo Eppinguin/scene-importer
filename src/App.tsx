@@ -8,8 +8,12 @@ import {
   extractImageFromZip,
   convertFoundryToVTTData,
   type CompressionMode,
+  type VideoCompressionErrorCode,
   type VideoCodecPreference,
   type VideoCompressionOptions,
+  preflightVideoCompression,
+  type BrowserVideoCodecAvailability,
+  getBrowserVideoCodecAvailability,
   isFoundryVTTData,
   hasMapImage,
 } from "./importVTT";
@@ -73,6 +77,65 @@ const sceneHasWallData = (sceneData: SceneData): boolean => {
   );
 };
 
+type VideoReadabilityProbe = {
+  readable: boolean;
+  width: number;
+  height: number;
+};
+
+const probeBrowserVideoReadability = async (
+  blob: Blob,
+): Promise<VideoReadabilityProbe> => {
+  if (typeof document === "undefined") {
+    return { readable: false, width: 0, height: 0 };
+  }
+
+  return new Promise<VideoReadabilityProbe>((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+    video.playsInline = true;
+
+    let settled = false;
+    let timeoutId: number | null = null;
+    const objectUrl = URL.createObjectURL(blob);
+
+    const finish = (result: VideoReadabilityProbe) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      video.removeAttribute("src");
+      video.load();
+      URL.revokeObjectURL(objectUrl);
+      resolve(result);
+    };
+
+    const onLoaded = () => {
+      const width = Number(video.videoWidth);
+      const height = Number(video.videoHeight);
+      if (width > 0 && height > 0) {
+        finish({ readable: true, width, height });
+      }
+    };
+
+    video.onloadedmetadata = onLoaded;
+    video.onloadeddata = onLoaded;
+
+    video.onerror = () => finish({ readable: false, width: 0, height: 0 });
+
+    timeoutId = window.setTimeout(
+      () => finish({ readable: false, width: 0, height: 0 }),
+      7000,
+    );
+    video.src = objectUrl;
+  });
+};
+
 function App() {
   const isContextMenuMode =
     new URLSearchParams(window.location.search).get("context") === "true";
@@ -98,12 +161,19 @@ function App() {
   const [showAdvancedVideoOptions, setShowAdvancedVideoOptions] =
     useState(false);
   const [preferredVideoCodec, setPreferredVideoCodec] =
-    useState<VideoCodecPreference>("vp9");
+    useState<VideoCodecPreference>("auto");
+  const [browserCodecAvailability, setBrowserCodecAvailability] =
+    useState<BrowserVideoCodecAvailability | null>(null);
   const [removeVideoAudio, setRemoveVideoAudio] = useState(false);
   const [forceVideoTranscode, setForceVideoTranscode] = useState(false);
   const [maxVideoDimension, setMaxVideoDimension] = useState<string>("");
+  const [isVideoCompressionSupported, setIsVideoCompressionSupported] =
+    useState(true);
+  const [videoCompressionSupportMessage, setVideoCompressionSupportMessage] =
+    useState<string | null>(null);
 
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [compressionStage, setCompressionStage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [isGM, setIsGM] = useState(false);
@@ -122,6 +192,8 @@ function App() {
       /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(selectedFile.name.toLowerCase()));
   const selectedInputIsVideo =
     availableScenes.length > 0 ? selectedSceneIsVideo : selectedFileIsVideo;
+  const videoCompressionBlocked =
+    selectedInputIsVideo && !isVideoCompressionSupported;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
 
   useEffect(
@@ -139,6 +211,144 @@ function App() {
       }),
     [],
   );
+
+  useEffect(() => {
+    let isMounted = true;
+
+    void getBrowserVideoCodecAvailability()
+      .then((availability) => {
+        if (!isMounted) return;
+        setBrowserCodecAvailability(availability);
+      })
+      .catch((error) => {
+        console.warn("Failed to determine browser codec availability", error);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!browserCodecAvailability || preferredVideoCodec === "auto") return;
+    if (!browserCodecAvailability[preferredVideoCodec]) {
+      setPreferredVideoCodec("auto");
+    }
+  }, [browserCodecAvailability, preferredVideoCodec]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const setSupported = () => {
+      if (!isMounted) return;
+      setIsVideoCompressionSupported(true);
+      setVideoCompressionSupportMessage(null);
+    };
+
+    const setUnsupported = (message: string) => {
+      if (!isMounted) return;
+      setIsVideoCompressionSupported(false);
+      setVideoCompressionSupportMessage(message);
+    };
+
+    const checkSupport = async () => {
+      if (!selectedInputIsVideo) {
+        setSupported();
+        return;
+      }
+
+      if (availableScenes.length > 0) {
+        const scene = availableScenes[selectedSceneIndex];
+        if (!scene || !scene.isVideo || !zipObject || !isFoundryVTTData(scene.data)) {
+          setSupported();
+          return;
+        }
+
+        const imgPath = scene.data.img || scene.data.background?.src;
+        if (!imgPath) {
+          setSupported();
+          return;
+        }
+
+        try {
+          const mediaBlob = await extractImageFromZip(zipObject, imgPath);
+          const probe = await probeBrowserVideoReadability(mediaBlob);
+          if (!isMounted) return;
+
+          if (!probe.readable) {
+            setUnsupported(
+              "Compression for this video is not supported by this browser. No Compression has been selected automatically.",
+            );
+          } else {
+            const preflight = await preflightVideoCompression(
+              mediaBlob,
+            );
+            if (!isMounted) return;
+            if (!preflight.supported) {
+              setUnsupported(
+                preflight.reason
+                  ? `Compression for this file is not supported by this browser (${preflight.reason}). No Compression has been selected automatically.`
+                  : "Compression for this file is not supported by this browser. No Compression has been selected automatically.",
+              );
+            } else {
+              setSupported();
+            }
+          }
+        } catch {
+          // If we cannot access the media blob here, do not block compression preemptively.
+          setSupported();
+        }
+        return;
+      }
+
+      if (!selectedFileIsVideo || !selectedFile) {
+        setSupported();
+        return;
+      }
+
+      const probe = await probeBrowserVideoReadability(selectedFile);
+      if (!isMounted) return;
+
+      if (!probe.readable) {
+        setUnsupported(
+          "Compression for this video is not supported by this browser. No Compression has been selected automatically.",
+        );
+      } else {
+        const preflight = await preflightVideoCompression(
+          selectedFile,
+        );
+        if (!isMounted) return;
+        if (!preflight.supported) {
+          setUnsupported(
+            preflight.reason
+              ? `Compression for this file is not supported by this browser (${preflight.reason}). No Compression has been selected automatically.`
+              : "Compression for this file is not supported by this browser. No Compression has been selected automatically.",
+          );
+        } else {
+          setSupported();
+        }
+      }
+    };
+
+    void checkSupport();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [
+    availableScenes,
+    selectedSceneIndex,
+    selectedFile,
+    selectedFileIsVideo,
+    selectedInputIsVideo,
+    zipObject,
+  ]);
+
+  useEffect(() => {
+    if (videoCompressionBlocked && compressionMode !== "none") {
+      setCompressionMode("none");
+    }
+  }, [videoCompressionBlocked, compressionMode]);
 
   // Clean up object URLs to prevent memory leaks
   useEffect(() => {
@@ -771,7 +981,20 @@ function App() {
   const handleCreateNewScene = async () => {
     if (!selectedFile && availableScenes.length === 0) return;
 
+    const waitForProgressFrame = async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          window.setTimeout(resolve, 0);
+        });
+      });
+    };
+
     setIsLoading(true);
+    setUploadProgress(0);
+    setCompressionStage(
+      selectedInputIsVideo ? "Preparing video encoder" : "Preparing image",
+    );
+    await waitForProgressFrame();
     try {
       const fileToUpload = selectedFile;
       const abortController = new AbortController();
@@ -803,9 +1026,11 @@ function App() {
           compressionMode,
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
+          (stage) => setCompressionStage(stage),
         );
         // Compression done — clear progress bar, show uploading state
         setUploadProgress(null);
+        setCompressionStage(null);
         setIsLoading(true);
       } else if (fileToUpload) {
         await uploadSceneFromVTT(
@@ -813,10 +1038,12 @@ function App() {
           compressionMode,
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
+          (stage) => setCompressionStage(stage),
         );
       }
       // Compression done — clear progress bar, show uploading state
       setUploadProgress(null);
+      setCompressionStage(null);
       setIsLoading(true);
 
       OBR.notification.show("Scene created successfully!", "SUCCESS");
@@ -834,11 +1061,43 @@ function App() {
         }
         return "Unknown error";
       };
+      const getErrorCode = (err: unknown): VideoCompressionErrorCode | null => {
+        if (!err || typeof err !== "object") return null;
+        const value = (err as { code?: unknown }).code;
+        if (typeof value !== "string") return null;
+        return value as VideoCompressionErrorCode;
+      };
+      const toNotificationMessage = (text: string, max = 240): string =>
+        text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 
       const message = getErrorMessage(error);
+      const errorCode = getErrorCode(error);
       const lowerMessage = message.toLowerCase();
-      if (lowerMessage.includes("aborted")) {
+      if (
+        errorCode === "VIDEO_COMPRESSION_ABORTED" ||
+        lowerMessage.includes("aborted")
+      ) {
         OBR.notification.show("Compression canceled.", "INFO");
+      } else if (
+        errorCode === "VIDEO_COMPRESSION_NO_PROGRESS" ||
+        errorCode === "VIDEO_COMPRESSION_METADATA_FAILED" ||
+        errorCode === "VIDEO_COMPRESSION_DECODE_FAILED" ||
+        errorCode === "VIDEO_COMPRESSION_UNSUPPORTED_ENCODER" ||
+        errorCode === "VIDEO_COMPRESSION_SIZE_LIMIT" ||
+        errorCode === "VIDEO_COMPRESSION_SOURCE_TOO_LARGE"
+      ) {
+        OBR.notification.show(toNotificationMessage(message), "WARNING");
+      } else if (
+        lowerMessage.includes("timed out") ||
+        lowerMessage.includes("stalled") ||
+        lowerMessage.includes("hardware-accelerated")
+      ) {
+        OBR.notification.show(
+          toNotificationMessage(
+            "This browser could not finish video compression in time. Try a browser/device with hardware-accelerated video encoding, or lower Max video dimension.",
+          ),
+          "WARNING",
+        );
       } else if (
         lowerMessage.includes("too large") ||
         lowerMessage.includes("size") ||
@@ -849,13 +1108,21 @@ function App() {
           compressionMode === "high"
             ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max video dimension in Advanced options."
             : "Try reducing Max video dimension in Advanced options or using H.264 codec.";
-        OBR.notification.show(`${message}. ${hint}`, "WARNING");
+        const suffix = message.endsWith(".") ? "" : ".";
+        OBR.notification.show(
+          toNotificationMessage(`${message}${suffix} ${hint}`),
+          "WARNING",
+        );
       } else {
-        OBR.notification.show(`Failed to create scene: ${message}`, "ERROR");
+        OBR.notification.show(
+          toNotificationMessage(`Failed to create scene: ${message}`),
+          "ERROR",
+        );
       }
     } finally {
       compressionAbortRef.current = null;
       setUploadProgress(null);
+      setCompressionStage(null);
       setIsLoading(false);
     }
   };
@@ -1103,18 +1370,24 @@ function App() {
                     }
                     disabled={isLoading}>
                     <MenuItem value="none">No Compression</MenuItem>
-                    <MenuItem value="standard">
-                      {selectedSceneIsVideo
+                    <MenuItem value="standard" disabled={videoCompressionBlocked}>
+                      {selectedInputIsVideo
                         ? "Nestling (Max 50MB)"
                         : "Nestling / Fledgeling (Max 25MB)"}
                     </MenuItem>
-                    <MenuItem value="high">
-                      {selectedSceneIsVideo
+                    <MenuItem value="high" disabled={videoCompressionBlocked}>
+                      {selectedInputIsVideo
                         ? "Fledgeling / Bestling (Max 100MB)"
                         : "Bestling Tier (Max 50MB)"}
                     </MenuItem>
                   </Select>
                 </FormControl>
+
+                {videoCompressionBlocked && videoCompressionSupportMessage && (
+                  <Typography variant="caption" className="help-text" color="warning.main">
+                    {videoCompressionSupportMessage}
+                  </Typography>
+                )}
 
                 <Box className="compression-info">
                   {compressionMode === "none" && (
@@ -1126,7 +1399,7 @@ function App() {
 
                   {compressionMode === "standard" && (
                     <Typography variant="body2">
-                      {selectedSceneIsVideo
+                      {selectedInputIsVideo
                         ? "Compresses the video to a maximum of 50MB to fit Nestling account limits."
                         : "Compresses the image to a maximum of 25MB to fit Nestling and Fledgeling account limits."}
                     </Typography>
@@ -1134,7 +1407,7 @@ function App() {
 
                   {compressionMode === "high" && (
                     <Typography variant="body2">
-                      {selectedSceneIsVideo
+                      {selectedInputIsVideo
                         ? "Compresses the video to a maximum of 100MB to fit Fledgeling and Bestling account limits."
                         : "Compresses the image to a maximum of 50MB to fit Bestling account limits."}
                     </Typography>
@@ -1145,7 +1418,7 @@ function App() {
                   onClick={() =>
                     setShowAdvancedVideoOptions(!showAdvancedVideoOptions)
                   }
-                  disabled={isLoading}
+                  disabled={isLoading || videoCompressionBlocked}
                   variant="text"
                   size="small"
                   sx={{ alignSelf: "flex-start", px: 0.5 }}>
@@ -1169,18 +1442,57 @@ function App() {
                             e.target.value as VideoCodecPreference,
                           )
                         }
-                        disabled={isLoading}>
-                        <MenuItem value="vp9">
-                          VP9/WebM (default, balanced quality)
+                        disabled={isLoading || videoCompressionBlocked}>
+                        <MenuItem value="auto">
+                          Auto (AV1 - H.265 - VP9 - H.264)
                         </MenuItem>
-                        <MenuItem value="av1">
-                          AV1 (maximum compression)
+                        <MenuItem
+                          value="vp9"
+                          disabled={
+                            !!browserCodecAvailability &&
+                            !browserCodecAvailability.vp9
+                          }>
+                          {browserCodecAvailability &&
+                          !browserCodecAvailability.vp9
+                            ? "VP9/WebM (not available in current browser)"
+                            : "VP9/WebM"}
                         </MenuItem>
-                        <MenuItem value="h264">
-                          H.264 (maximum compatibility)
+                        <MenuItem
+                          value="av1"
+                          disabled={!!browserCodecAvailability && !browserCodecAvailability.av1}>
+                          {browserCodecAvailability && !browserCodecAvailability.av1
+                            ? "AV1 (not available in current browser)"
+                            : "AV1 (maximum compression)"}
+                        </MenuItem>
+                        <MenuItem
+                          value="h265"
+                          disabled={!!browserCodecAvailability && !browserCodecAvailability.h265}>
+                          {browserCodecAvailability && !browserCodecAvailability.h265
+                            ? "H.265/HEVC (not available in current browser)"
+                            : "H.265/HEVC (high efficiency)"}
+                        </MenuItem>
+                        <MenuItem
+                          value="h264"
+                          disabled={!!browserCodecAvailability && !browserCodecAvailability.h264}>
+                          {browserCodecAvailability && !browserCodecAvailability.h264
+                            ? "H.264 (not available in current browser)"
+                            : "H.264 (maximum compatibility)"}
                         </MenuItem>
                       </Select>
                     </FormControl>
+
+                    {browserCodecAvailability && (
+                      <Typography variant="caption" className="help-text">
+                        Browser codec availability: AV1
+                        {browserCodecAvailability.av1 ? " yes" : " no"},
+                        H.265
+                        {browserCodecAvailability.h265 ? " yes" : " no"},
+                        VP9
+                        {browserCodecAvailability.vp9 ? " yes" : " no"},
+                        H.264
+                        {browserCodecAvailability.h264 ? " yes" : " no"}
+                      </Typography>
+                    )}
 
                     <FormControlLabel
                       control={
@@ -1190,7 +1502,7 @@ function App() {
                           onChange={(e) =>
                             setRemoveVideoAudio(e.target.checked)
                           }
-                          disabled={isLoading}
+                          disabled={isLoading || videoCompressionBlocked}
                         />
                       }
                       label="Remove audio track"
@@ -1204,7 +1516,7 @@ function App() {
                           onChange={(e) =>
                             setForceVideoTranscode(e.target.checked)
                           }
-                          disabled={isLoading}
+                          disabled={isLoading || videoCompressionBlocked}
                         />
                       }
                       label="Transcode anyway when already under size limit"
@@ -1217,7 +1529,7 @@ function App() {
                       value={maxVideoDimension}
                       onChange={(e) => setMaxVideoDimension(e.target.value)}
                       placeholder="e.g. 1920"
-                      disabled={isLoading}
+                      disabled={isLoading || videoCompressionBlocked}
                       size="small"
                       fullWidth
                     />
@@ -1237,12 +1549,13 @@ function App() {
               <Typography
                 className="compression-progress-label"
                 variant="caption">
-                Compressing {selectedInputIsVideo ? "video" : "image"}…{" "}
-                {uploadProgress}%
+                {selectedInputIsVideo
+                  ? `${compressionStage ?? "Compressing video"} (${uploadProgress}%)`
+                  : (compressionStage ?? "Compressing image…")}
               </Typography>
               <LinearProgress
-                variant="determinate"
-                value={uploadProgress}
+                variant={selectedInputIsVideo ? "determinate" : "indeterminate"}
+                value={selectedInputIsVideo ? uploadProgress : undefined}
                 sx={{ height: 6, borderRadius: 999 }}
               />
               <Button
@@ -1251,6 +1564,7 @@ function App() {
                 onClick={() => {
                   compressionAbortRef.current?.abort();
                   setUploadProgress(null);
+                  setCompressionStage(null);
                 }}>
                 Cancel Compression
               </Button>
