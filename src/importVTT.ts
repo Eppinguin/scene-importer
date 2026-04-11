@@ -402,8 +402,6 @@ interface MediabunnyModule {
     ALL_FORMATS: unknown;
 }
 
-const loggedVideoSupportDiagnostics = new Set<string>();
-const loggedVideoSupportSweepDiagnostics = new Set<string>();
 let cachedBrowserVideoCodecAvailability: Promise<BrowserVideoCodecAvailability> | null = null;
 
 export async function getBrowserVideoCodecAvailability(): Promise<BrowserVideoCodecAvailability> {
@@ -857,185 +855,6 @@ function isLikelyDecodeFailure(message: string): boolean {
         || (lower.includes('decoder') && lower.includes('failed'));
 }
 
-async function logVideoEncodingSupportDiagnostics(
-    mb: MediabunnyModule,
-    probe: {
-        width: number;
-        height: number;
-        bitrate: number;
-        frameRate: number;
-    }
-): Promise<void> {
-    const canEncodeVideoFn = mb.canEncodeVideo;
-    const getEncodableVideoCodecsFn = mb.getEncodableVideoCodecs;
-
-    const diagnostics: {
-        userAgent: string;
-        platform: string;
-        maxTouchPoints: number;
-        hasVideoEncoder: boolean;
-        hasAudioEncoder: boolean;
-        hasMediaCapabilitiesEncodingInfo: boolean;
-        probe: {
-            width: number;
-            height: number;
-            bitrate: number;
-            frameRate: number;
-        };
-        encodableVideoCodecs: string[];
-        canEncodeByCodecAndAcceleration: Record<string, Record<string, boolean | string>>;
-    } = {
-        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
-        platform: typeof navigator !== 'undefined' ? navigator.platform : 'unknown',
-        maxTouchPoints: typeof navigator !== 'undefined'
-            ? (navigator as Navigator & { maxTouchPoints?: number }).maxTouchPoints ?? 0
-            : 0,
-        hasVideoEncoder: typeof VideoEncoder !== 'undefined',
-        hasAudioEncoder: typeof AudioEncoder !== 'undefined',
-        hasMediaCapabilitiesEncodingInfo:
-            typeof navigator !== 'undefined'
-            && !!navigator.mediaCapabilities
-            && typeof navigator.mediaCapabilities.encodingInfo === 'function',
-        probe,
-        encodableVideoCodecs: [] as string[],
-        canEncodeByCodecAndAcceleration: {} as Record<string, Record<string, boolean | string>>,
-    };
-
-    if (getEncodableVideoCodecsFn) {
-        try {
-            const encodable = await getEncodableVideoCodecsFn();
-            diagnostics.encodableVideoCodecs = encodable;
-        } catch (error) {
-            diagnostics.encodableVideoCodecs = [
-                `error: ${error instanceof Error ? error.message : String(error)}`,
-            ];
-        }
-    }
-
-    const codecsToProbe: Array<'avc' | 'hevc' | 'vp9' | 'av1'> = ['avc', 'hevc', 'vp9', 'av1'];
-    const accelerationModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
-        'prefer-hardware',
-        'no-preference',
-        'prefer-software',
-    ];
-
-    for (const codec of codecsToProbe) {
-        const modeResults: Record<string, boolean | string> = {};
-        for (const hardwareAcceleration of accelerationModes) {
-            if (!canEncodeVideoFn) {
-                modeResults[hardwareAcceleration] = 'canEncodeVideo unavailable';
-                continue;
-            }
-
-            try {
-                const supported = await canEncodeVideoFn(codec, {
-                    width: probe.width,
-                    height: probe.height,
-                    bitrate: probe.bitrate,
-                    frameRate: probe.frameRate,
-                    hardwareAcceleration,
-                });
-                modeResults[hardwareAcceleration] = supported;
-            } catch (error) {
-                modeResults[hardwareAcceleration] =
-                    `error: ${error instanceof Error ? error.message : String(error)}`;
-            }
-        }
-        diagnostics.canEncodeByCodecAndAcceleration[codec] = modeResults;
-    }
-
-    const title =
-        `[Scene Importer] Browser video support diagnostics ` +
-        `(${probe.width}x${probe.height} @ ${probe.frameRate}fps, ${Math.round(probe.bitrate / 1000)}kbps)`;
-
-    if (typeof console.groupCollapsed === 'function') {
-        console.groupCollapsed(title);
-        console.log(diagnostics);
-        console.groupEnd();
-        return;
-    }
-
-    console.log(title, diagnostics);
-}
-
-async function logVideoEncodingSupportSweepTable(
-    mb: MediabunnyModule,
-    frameRate: number
-): Promise<void> {
-    const canEncodeVideoFn = mb.canEncodeVideo;
-    if (!canEncodeVideoFn) {
-        console.warn('[Scene Importer] Browser video support sweep skipped: canEncodeVideo unavailable.');
-        return;
-    }
-
-    const codecsToProbe: Array<'avc' | 'hevc' | 'vp9' | 'av1'> = ['avc', 'hevc', 'vp9', 'av1'];
-    const accelerationModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
-        'prefer-hardware',
-        'no-preference',
-        'prefer-software',
-    ];
-    const dimensions = [1000, 1500, 2000, 3000, 4000, 5000];
-    const bitrates = [2_000_000, 8_000_000, 14_000_000];
-
-    type SweepRow = {
-        codec: string;
-        acceleration: string;
-        [probeKey: string]: string;
-    };
-
-    const rows: SweepRow[] = [];
-
-    for (const codec of codecsToProbe) {
-        for (const hardwareAcceleration of accelerationModes) {
-            const row: SweepRow = {
-                codec,
-                acceleration: hardwareAcceleration,
-            };
-
-            for (const dimension of dimensions) {
-                for (const bitrate of bitrates) {
-                    const key = `${dimension}x${dimension}@${Math.round(bitrate / 1000)}k`;
-                    try {
-                        const supported = await canEncodeVideoFn(codec, {
-                            width: dimension,
-                            height: dimension,
-                            bitrate,
-                            frameRate,
-                            hardwareAcceleration,
-                        });
-                        row[key] = supported ? 'yes' : 'no';
-                    } catch (error) {
-                        row[key] = `error: ${error instanceof Error ? error.message : String(error)}`;
-                    }
-                }
-            }
-
-            rows.push(row);
-        }
-    }
-
-    const title =
-        `[Scene Importer] Browser video support sweep table ` +
-        `(frameRate=${frameRate}, square probes, bitrates=2000k/8000k/14000k)`;
-
-    if (typeof console.groupCollapsed === 'function') {
-        console.groupCollapsed(title);
-        if (typeof console.table === 'function') {
-            console.table(rows);
-        } else {
-            console.log(rows);
-        }
-        console.groupEnd();
-        return;
-    }
-
-    if (typeof console.table === 'function') {
-        console.table(rows);
-    } else {
-        console.log(title, rows);
-    }
-}
-
 async function compressVideo(
     fileBlob: Blob,
     compressionMode: CompressionMode,
@@ -1216,31 +1035,6 @@ async function compressVideo(
             else if (availability.h265) effectiveCodec = 'h265';
             else if (availability.vp9) effectiveCodec = 'vp9';
             else effectiveCodec = 'h264';
-        }
-    }
-
-    const diagnosticsKey = `${outWidth}x${outHeight}:${outputFrameRate}:${Math.round(Math.max(450_000, bitrateFromBudget) / 1000)}`;
-    if (!loggedVideoSupportDiagnostics.has(diagnosticsKey)) {
-        loggedVideoSupportDiagnostics.add(diagnosticsKey);
-        try {
-            await logVideoEncodingSupportDiagnostics(mb, {
-                width: outWidth,
-                height: outHeight,
-                bitrate: Math.max(450_000, bitrateFromBudget),
-                frameRate: outputFrameRate,
-            });
-        } catch (error) {
-            console.warn('[Scene Importer] Failed to log browser video support diagnostics.', error);
-        }
-    }
-
-    const sweepDiagnosticsKey = `fps:${outputFrameRate}`;
-    if (!loggedVideoSupportSweepDiagnostics.has(sweepDiagnosticsKey)) {
-        loggedVideoSupportSweepDiagnostics.add(sweepDiagnosticsKey);
-        try {
-            await logVideoEncodingSupportSweepTable(mb, outputFrameRate);
-        } catch (error) {
-            console.warn('[Scene Importer] Failed to log browser video support sweep table.', error);
         }
     }
 
@@ -1730,7 +1524,6 @@ async function uploadRawMediaScene(
     videoOptions?: VideoCompressionOptions,
     onStage?: (stage: string) => void
 ): Promise<void> {
-    OBR.notification.show('Importing scene..', 'INFO');
     const isVideo =
         file.type.startsWith('video/') ||
         /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(file.name.toLowerCase());
@@ -1805,8 +1598,6 @@ export async function uploadSceneFromVTT(
         throw new Error("No map image found in UVTT file. A map image is required to create a new scene.");
     }
 
-    OBR.notification.show("Importing scene..", "INFO");
-
     // Convert base64 to Blob/File
     const imageData = atob(data.image);
     const arrayBuffer = new ArrayBuffer(imageData.length);
@@ -1871,7 +1662,6 @@ export async function uploadFoundryScene(
     videoOptions?: VideoCompressionOptions,
     onStage?: (stage: string) => void
 ): Promise<void> {
-    OBR.notification.show("Importing scene..", "INFO");
     const vttMapDataSource = convertFoundryToVTTData(foundryData);
 
     const optimizationOptions: OptimizationOptions = {
@@ -2032,10 +1822,8 @@ export async function addItemsFromVTT(file: File, context: boolean): Promise<voi
 
     try {
         if (isFoundryVTTData(fileData)) {
-            console.log("Detected FoundryVTT format");
             processedData = convertFoundryToVTTData(fileData);
         } else if (isUniversalVTTData(fileData)) {
-            console.log("Detected UniversalVTT format");
             const { image, ...vttData } = fileData;
             void image;
             processedData = vttData as VTTMapData;
