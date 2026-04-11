@@ -11,6 +11,7 @@ import {
   type VideoCompressionErrorCode,
   type VideoCodecPreference,
   type VideoCompressionOptions,
+  preflightVideoCompression,
   type BrowserVideoCodecAvailability,
   getBrowserVideoCodecAvailability,
   isFoundryVTTData,
@@ -76,10 +77,20 @@ const sceneHasWallData = (sceneData: SceneData): boolean => {
   );
 };
 
-const canBrowserReadVideoBlob = async (blob: Blob): Promise<boolean> => {
-  if (typeof document === "undefined") return false;
+type VideoReadabilityProbe = {
+  readable: boolean;
+  width: number;
+  height: number;
+};
 
-  return new Promise<boolean>((resolve) => {
+const probeBrowserVideoReadability = async (
+  blob: Blob,
+): Promise<VideoReadabilityProbe> => {
+  if (typeof document === "undefined") {
+    return { readable: false, width: 0, height: 0 };
+  }
+
+  return new Promise<VideoReadabilityProbe>((resolve) => {
     const video = document.createElement("video");
     video.preload = "metadata";
     video.muted = true;
@@ -89,7 +100,7 @@ const canBrowserReadVideoBlob = async (blob: Blob): Promise<boolean> => {
     let timeoutId: number | null = null;
     const objectUrl = URL.createObjectURL(blob);
 
-    const finish = (supported: boolean) => {
+    const finish = (result: VideoReadabilityProbe) => {
       if (settled) return;
       settled = true;
       if (timeoutId !== null) {
@@ -101,18 +112,26 @@ const canBrowserReadVideoBlob = async (blob: Blob): Promise<boolean> => {
       video.removeAttribute("src");
       video.load();
       URL.revokeObjectURL(objectUrl);
-      resolve(supported);
+      resolve(result);
     };
 
-    video.onloadedmetadata = () => {
+    const onLoaded = () => {
       const width = Number(video.videoWidth);
       const height = Number(video.videoHeight);
-      finish(width > 0 && height > 0);
+      if (width > 0 && height > 0) {
+        finish({ readable: true, width, height });
+      }
     };
 
-    video.onerror = () => finish(false);
+    video.onloadedmetadata = onLoaded;
+    video.onloadeddata = onLoaded;
 
-    timeoutId = window.setTimeout(() => finish(false), 6000);
+    video.onerror = () => finish({ readable: false, width: 0, height: 0 });
+
+    timeoutId = window.setTimeout(
+      () => finish({ readable: false, width: 0, height: 0 }),
+      7000,
+    );
     video.src = objectUrl;
   });
 };
@@ -226,12 +245,10 @@ function App() {
       setVideoCompressionSupportMessage(null);
     };
 
-    const setUnsupported = () => {
+    const setUnsupported = (message: string) => {
       if (!isMounted) return;
       setIsVideoCompressionSupported(false);
-      setVideoCompressionSupportMessage(
-        "Compression for this video is not supported by this browser. No Compression has been selected automatically.",
-      );
+      setVideoCompressionSupportMessage(message);
     };
 
     const checkSupport = async () => {
@@ -255,12 +272,27 @@ function App() {
 
         try {
           const mediaBlob = await extractImageFromZip(zipObject, imgPath);
-          const canRead = await canBrowserReadVideoBlob(mediaBlob);
+          const probe = await probeBrowserVideoReadability(mediaBlob);
           if (!isMounted) return;
-          if (canRead) {
-            setSupported();
+
+          if (!probe.readable) {
+            setUnsupported(
+              "Compression for this video is not supported by this browser. No Compression has been selected automatically.",
+            );
           } else {
-            setUnsupported();
+            const preflight = await preflightVideoCompression(
+              mediaBlob,
+            );
+            if (!isMounted) return;
+            if (!preflight.supported) {
+              setUnsupported(
+                preflight.reason
+                  ? `Compression for this file is not supported by this browser (${preflight.reason}). No Compression has been selected automatically.`
+                  : "Compression for this file is not supported by this browser. No Compression has been selected automatically.",
+              );
+            } else {
+              setSupported();
+            }
           }
         } catch {
           // If we cannot access the media blob here, do not block compression preemptively.
@@ -274,12 +306,27 @@ function App() {
         return;
       }
 
-      const canRead = await canBrowserReadVideoBlob(selectedFile);
+      const probe = await probeBrowserVideoReadability(selectedFile);
       if (!isMounted) return;
-      if (canRead) {
-        setSupported();
+
+      if (!probe.readable) {
+        setUnsupported(
+          "Compression for this video is not supported by this browser. No Compression has been selected automatically.",
+        );
       } else {
-        setUnsupported();
+        const preflight = await preflightVideoCompression(
+          selectedFile,
+        );
+        if (!isMounted) return;
+        if (!preflight.supported) {
+          setUnsupported(
+            preflight.reason
+              ? `Compression for this file is not supported by this browser (${preflight.reason}). No Compression has been selected automatically.`
+              : "Compression for this file is not supported by this browser. No Compression has been selected automatically.",
+          );
+        } else {
+          setSupported();
+        }
       }
     };
 

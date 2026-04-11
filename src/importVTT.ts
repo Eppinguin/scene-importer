@@ -489,6 +489,114 @@ export interface VideoCompressionOptions {
     onStage?: (stage: string) => void;
 }
 
+export interface VideoCompressionPreflightResult {
+    supported: boolean;
+    reason?: string;
+    inconclusive?: boolean;
+}
+
+function getDecoderCodecCandidates(
+    codec: unknown,
+    mimeType: string
+): string[] {
+    const normalized = normalizeSourceCodec(codec);
+    const candidates = new Set<string>();
+
+    if (typeof codec === 'string' && codec.trim().length > 0) {
+        candidates.add(codec.trim());
+    }
+
+    if (normalized === 'avc') {
+        candidates.add('avc1.42E01E');
+        candidates.add('avc1.640028');
+    } else if (normalized === 'hevc') {
+        candidates.add('hvc1.1.6.L120.B0');
+        candidates.add('hev1.1.6.L120.B0');
+    } else if (normalized === 'vp9') {
+        candidates.add('vp09.00.10.08');
+        candidates.add('vp9');
+    } else if (normalized === 'av1') {
+        candidates.add('av01.0.08M.08');
+        candidates.add('av1');
+    }
+
+    const lowerMime = mimeType.toLowerCase();
+    if (candidates.size === 0 && lowerMime.includes('webm')) {
+        candidates.add('vp09.00.10.08');
+        candidates.add('vp8');
+        candidates.add('av01.0.08M.08');
+    }
+
+    if (candidates.size === 0 && lowerMime.includes('mp4')) {
+        candidates.add('avc1.42E01E');
+        candidates.add('hvc1.1.6.L120.B0');
+    }
+
+    return Array.from(candidates);
+}
+
+async function isDecoderSupportedForSource(
+    codecCandidates: string[],
+    mimeType: string,
+    width: number,
+    height: number,
+    frameRate: number,
+    bitrate: number
+): Promise<boolean | null> {
+    let hadAnyCheck = false;
+
+    const mediaCapabilities = typeof navigator !== 'undefined'
+        && !!navigator.mediaCapabilities
+        && typeof navigator.mediaCapabilities.decodingInfo === 'function'
+        ? navigator.mediaCapabilities
+        : null;
+
+    if (mediaCapabilities && codecCandidates.length > 0) {
+        for (const codec of codecCandidates) {
+            hadAnyCheck = true;
+            try {
+                const info = await mediaCapabilities.decodingInfo({
+                    type: 'file',
+                    video: {
+                        contentType: `${mimeType}; codecs="${codec}"`,
+                        width,
+                        height,
+                        bitrate,
+                        framerate: frameRate,
+                    },
+                });
+                if (info.supported) {
+                    return true;
+                }
+            } catch {
+                // Try next candidate.
+            }
+        }
+    }
+
+    if (typeof VideoDecoder !== 'undefined' && typeof VideoDecoder.isConfigSupported === 'function' && codecCandidates.length > 0) {
+        for (const codec of codecCandidates) {
+            hadAnyCheck = true;
+            try {
+                const support = await VideoDecoder.isConfigSupported({
+                    codec,
+                    codedWidth: width,
+                    codedHeight: height,
+                    hardwareAcceleration: 'prefer-hardware',
+                });
+                if (support.supported) {
+                    return true;
+                }
+            } catch {
+                // Try next candidate.
+            }
+        }
+    }
+
+    if (!hadAnyCheck) return null;
+    return false;
+}
+
 export type BrowserVideoCodecAvailability = {
     auto: true;
     av1: boolean;
@@ -1540,6 +1648,70 @@ async function compressVideo(
         outputWidth: outWidth,
         outputHeight: outHeight,
     };
+}
+
+export async function preflightVideoCompression(
+    fileBlob: Blob,
+    options: VideoCompressionOptions = {}
+): Promise<VideoCompressionPreflightResult> {
+    if (!fileBlob.type.startsWith('video/')) {
+        return { supported: true };
+    }
+
+    try {
+        const metadata = await getVideoMetadata(fileBlob);
+        const targetDimension = options.maxDimension && options.maxDimension > 0
+            ? options.maxDimension
+            : Math.max(metadata.width, metadata.height);
+
+        let outWidth = metadata.width;
+        let outHeight = metadata.height;
+        if (targetDimension > 0 && Math.max(metadata.width, metadata.height) > targetDimension) {
+            const scale = targetDimension / Math.max(metadata.width, metadata.height);
+            outWidth = toEvenDimension(metadata.width * scale);
+            outHeight = toEvenDimension(metadata.height * scale);
+        }
+
+        const mb = await import('mediabunny') as unknown as MediabunnyModule;
+        const analysisInput = new mb.Input({
+            source: new mb.BlobSource(fileBlob),
+            formats: mb.ALL_FORMATS,
+        });
+        const sourceVideoTrack = await analysisInput.getPrimaryVideoTrack?.();
+        const codecCandidates = getDecoderCodecCandidates(sourceVideoTrack?.codec, fileBlob.type);
+
+        const estimatedBitrate = Math.max(
+            250_000,
+            Math.floor((fileBlob.size * 8) / Math.max(metadata.duration, 1))
+        );
+
+        const decodeSupported = await isDecoderSupportedForSource(
+            codecCandidates,
+            fileBlob.type || 'video/mp4',
+            outWidth,
+            outHeight,
+            Number.isFinite(metadata.frameRate) && metadata.frameRate > 1 ? metadata.frameRate : 30,
+            estimatedBitrate
+        );
+
+        if (decodeSupported === false) {
+            return {
+                supported: false,
+                reason: `Decoder capability check failed for ${outWidth}x${outHeight} input in this browser.`,
+            };
+        }
+
+        if (decodeSupported === null) {
+            return {
+                supported: true,
+                inconclusive: true,
+            };
+        }
+
+        return { supported: true };
+    } catch {
+        return { supported: true, inconclusive: true };
+    }
 }
 
 function isRawMediaFile(file: File): boolean {
