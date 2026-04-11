@@ -1388,8 +1388,9 @@ async function compressVideo(
         if (lastError && isLikelyDecodeFailure(lastError.message)) {
             throw new VideoCompressionError(
                 'VIDEO_COMPRESSION_DECODE_FAILED',
-                `This browser failed to decode/process the source video at ${outWidth}x${outHeight}. ` +
-                `Try lowering Max video dimension, converting the source video to H.264 (MP4), or using another browser/device.` +
+                `This browser failed while decoding/processing source frames (source: ${width}x${height}, target: ${outWidth}x${outHeight}). ` +
+                `Even when output is downscaled, the browser still has to decode full-size source frames first. ` +
+                `Try reducing source resolution before upload (most effective). Converting to H.264 (MP4) can help, but codec-only conversion may still fail if source frames remain very large.` +
                 availableCodecs
             );
         }
@@ -1713,6 +1714,7 @@ export async function uploadFoundryScene(
     let fileExtension = isVideo ? (imageBlob.type.includes('mp4') ? 'mp4' : 'webm') : 'png';
 
     let effectiveDpi = vttMapDataSource.resolution.pixels_per_grid;
+    let mediaScale: Vector2 = { x: 1, y: 1 };
 
     if (isVideo) {
         const sizeInMb = imageBlob.size / (1024 * 1024);
@@ -1725,8 +1727,17 @@ export async function uploadFoundryScene(
             }
             const compressed = await compressVideo(imageBlob, compressionMode, onProgress, { ...videoOptions, onStage });
             finalBlob = compressed.blob;
-            if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
-                effectiveDpi = vttMapDataSource.resolution.pixels_per_grid * (compressed.outputWidth / compressed.sourceWidth);
+            if (
+                compressed.outputWidth > 0
+                && compressed.sourceWidth > 0
+                && compressed.outputHeight > 0
+                && compressed.sourceHeight > 0
+            ) {
+                mediaScale = {
+                    x: compressed.outputWidth / compressed.sourceWidth,
+                    y: compressed.outputHeight / compressed.sourceHeight,
+                };
+                effectiveDpi = vttMapDataSource.resolution.pixels_per_grid * mediaScale.x;
             }
             fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
         }
@@ -1742,7 +1753,7 @@ export async function uploadFoundryScene(
         .build();
 
     const defaultPosition: Vector2 = { x: 0, y: 0 };
-    const defaultScale: Vector2 = { x: 1, y: 1 };
+    const defaultScale: Vector2 = mediaScale;
 
     const wallItems = await createWallItems(vttMapDataSource, defaultPosition, defaultScale, 150);
     let doorItems: Item[] = [];
@@ -1805,25 +1816,43 @@ export async function addItemsFromData(processedData: VTTMapData, context: boole
                 }
 
                 // Keep walls aligned to the selected map even when the map has been resized.
-                const sourceWidth = processedData.resolution?.map_size?.x;
-                const sourceHeight = processedData.resolution?.map_size?.y;
-                const selectedWithSize = selectedItem as {
-                    width?: unknown;
-                    height?: unknown;
+                const sourceMapWidth = processedData.resolution?.map_size?.x;
+                const sourceMapHeight = processedData.resolution?.map_size?.y;
+                const sourcePixelsPerGrid = processedData.resolution?.pixels_per_grid;
+                const selectedWithImage = selectedItem as {
+                    image?: {
+                        width?: unknown;
+                        height?: unknown;
+                    };
+                    grid?: {
+                        dpi?: unknown;
+                    };
                 };
-                const selectedWidth = typeof selectedWithSize.width === 'number' ? selectedWithSize.width : undefined;
-                const selectedHeight = typeof selectedWithSize.height === 'number' ? selectedWithSize.height : undefined;
+                const selectedWidth = typeof selectedWithImage.image?.width === 'number'
+                    ? selectedWithImage.image.width
+                    : undefined;
+                const selectedHeight = typeof selectedWithImage.image?.height === 'number'
+                    ? selectedWithImage.image.height
+                    : undefined;
+                const selectedImageDpi = typeof selectedWithImage.grid?.dpi === 'number'
+                    ? selectedWithImage.grid.dpi
+                    : undefined;
 
                 if (
-                    typeof sourceWidth === 'number' && sourceWidth > 0
-                    && typeof sourceHeight === 'number' && sourceHeight > 0
+                    typeof sourceMapWidth === 'number' && sourceMapWidth > 0
+                    && typeof sourceMapHeight === 'number' && sourceMapHeight > 0
+                    && typeof sourcePixelsPerGrid === 'number' && sourcePixelsPerGrid > 0
                     && typeof selectedWidth === 'number' && selectedWidth > 0
                     && typeof selectedHeight === 'number' && selectedHeight > 0
+                    && typeof selectedImageDpi === 'number' && selectedImageDpi > 0
                 ) {
-                    const renderedWidth = selectedWidth * scale.x;
-                    const renderedHeight = selectedHeight * scale.y;
-                    const scaleFromWidth = renderedWidth / (sourceWidth * dpi);
-                    const scaleFromHeight = renderedHeight / (sourceHeight * dpi);
+                    // Convert image pixel dimensions to rendered scene pixels using the image DPI.
+                    const renderedWidth = (selectedWidth * dpi / selectedImageDpi) * scale.x;
+                    const renderedHeight = (selectedHeight * dpi / selectedImageDpi) * scale.y;
+                    const sourceSceneWidth = sourceMapWidth * dpi;
+                    const sourceSceneHeight = sourceMapHeight * dpi;
+                    const scaleFromWidth = renderedWidth / sourceSceneWidth;
+                    const scaleFromHeight = renderedHeight / sourceSceneHeight;
 
                     if (Number.isFinite(scaleFromWidth) && scaleFromWidth > 0) {
                         scale.x = scaleFromWidth;

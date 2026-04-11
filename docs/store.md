@@ -72,7 +72,9 @@ Select the option that includes your current Owlbear Rodeo subscription tier:
 | **No Compression** | Uploads the original file without modification. The upload will fail if the file exceeds your account's size limit.                                                |
 | **Your Tier Name** | Compresses the file to fit your selected tier's limit. Images are converted to WebP and quality is incrementally reduced until the file is under the maximum size. |
 
-_Advanced video compression settings (such as format selection, audio removal, and resolution limits) are also available directly in the importer window._
+_Advanced video compression settings (such as automatic codec fallback based on browser capabilities, format selection like AV1/H.265/VP9/H.264, audio removal, and resolution limits) are available directly in the importer window._
+
+> **💡 Hint:** Video conversion depends on built-in browser capabilities, which can vary wildly. For the most reliable compression experience and widest codec support, we recommend using a **Chromium-based browser** (like Chrome, Edge, or Brave). Browsers like Safari have strict source decoding and memory limits that might cause processing to fail on larger files.
 
 ## Acknowledgments
 
