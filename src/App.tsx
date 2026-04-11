@@ -11,6 +11,8 @@ import {
   type VideoCompressionErrorCode,
   type VideoCodecPreference,
   type VideoCompressionOptions,
+  type BrowserVideoCodecAvailability,
+  getBrowserVideoCodecAvailability,
   isFoundryVTTData,
   hasMapImage,
 } from "./importVTT";
@@ -99,7 +101,9 @@ function App() {
   const [showAdvancedVideoOptions, setShowAdvancedVideoOptions] =
     useState(false);
   const [preferredVideoCodec, setPreferredVideoCodec] =
-    useState<VideoCodecPreference>("vp9");
+    useState<VideoCodecPreference>("auto");
+  const [browserCodecAvailability, setBrowserCodecAvailability] =
+    useState<BrowserVideoCodecAvailability | null>(null);
   const [removeVideoAudio, setRemoveVideoAudio] = useState(false);
   const [forceVideoTranscode, setForceVideoTranscode] = useState(false);
   const [maxVideoDimension, setMaxVideoDimension] = useState<string>("");
@@ -141,6 +145,30 @@ function App() {
       }),
     [],
   );
+
+  useEffect(() => {
+    let isMounted = true;
+
+    void getBrowserVideoCodecAvailability()
+      .then((availability) => {
+        if (!isMounted) return;
+        setBrowserCodecAvailability(availability);
+      })
+      .catch((error) => {
+        console.warn("Failed to determine browser codec availability", error);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!browserCodecAvailability || preferredVideoCodec === "auto") return;
+    if (!browserCodecAvailability[preferredVideoCodec]) {
+      setPreferredVideoCodec("auto");
+    }
+  }, [browserCodecAvailability, preferredVideoCodec]);
 
   // Clean up object URLs to prevent memory leaks
   useEffect(() => {
@@ -1229,17 +1257,56 @@ function App() {
                           )
                         }
                         disabled={isLoading}>
-                        <MenuItem value="vp9">
-                          VP9/WebM (default, balanced quality)
+                        <MenuItem value="auto">
+                          Auto (AV1 - H.265 - VP9 - H.264)
                         </MenuItem>
-                        <MenuItem value="av1">
-                          AV1 (maximum compression)
+                        <MenuItem
+                          value="vp9"
+                          disabled={
+                            !!browserCodecAvailability &&
+                            !browserCodecAvailability.vp9
+                          }>
+                          {browserCodecAvailability &&
+                          !browserCodecAvailability.vp9
+                            ? "VP9/WebM (not available in current browser)"
+                            : "VP9/WebM"}
                         </MenuItem>
-                        <MenuItem value="h264">
-                          H.264 (maximum compatibility)
+                        <MenuItem
+                          value="av1"
+                          disabled={!!browserCodecAvailability && !browserCodecAvailability.av1}>
+                          {browserCodecAvailability && !browserCodecAvailability.av1
+                            ? "AV1 (not available in current browser)"
+                            : "AV1 (maximum compression)"}
+                        </MenuItem>
+                        <MenuItem
+                          value="h265"
+                          disabled={!!browserCodecAvailability && !browserCodecAvailability.h265}>
+                          {browserCodecAvailability && !browserCodecAvailability.h265
+                            ? "H.265/HEVC (not available in current browser)"
+                            : "H.265/HEVC (high efficiency)"}
+                        </MenuItem>
+                        <MenuItem
+                          value="h264"
+                          disabled={!!browserCodecAvailability && !browserCodecAvailability.h264}>
+                          {browserCodecAvailability && !browserCodecAvailability.h264
+                            ? "H.264 (not available in current browser)"
+                            : "H.264 (maximum compatibility)"}
                         </MenuItem>
                       </Select>
                     </FormControl>
+
+                    {browserCodecAvailability && (
+                      <Typography variant="caption" className="help-text">
+                        Browser codec availability: AV1
+                        {browserCodecAvailability.av1 ? " yes" : " no"},
+                        H.265
+                        {browserCodecAvailability.h265 ? " yes" : " no"},
+                        VP9
+                        {browserCodecAvailability.vp9 ? " yes" : " no"},
+                        H.264
+                        {browserCodecAvailability.h264 ? " yes" : " no"}
+                      </Typography>
+                    )}
 
                     <FormControlLabel
                       control={

@@ -115,7 +115,8 @@ function getImageTypeFromBase64(base64Data: string): 'image/png' | 'image/webp' 
 
 // Compression options for image optimization
 export type CompressionMode = 'none' | 'standard' | 'high';
-export type VideoCodecPreference = 'av1' | 'vp9' | 'h264';
+export type VideoCodecPreference = 'auto' | 'av1' | 'h265' | 'vp9' | 'h264';
+type TranscodeCodecPreference = Exclude<VideoCodecPreference, 'auto'>;
 export type VideoCompressionErrorCode =
     | 'VIDEO_COMPRESSION_ABORTED'
     | 'VIDEO_COMPRESSION_METADATA_FAILED'
@@ -370,7 +371,7 @@ interface MediabunnyModule {
     Output: new (options: { format: unknown; target: unknown }) => { target: { buffer: ArrayBuffer | null } };
     BlobSource: new (blob: Blob) => unknown;
     BufferTarget: new () => { buffer: ArrayBuffer | null };
-    canEncodeVideo?: (codec: 'avc' | 'vp9' | 'av1', config: {
+    canEncodeVideo?: (codec: 'avc' | 'hevc' | 'vp9' | 'av1', config: {
         width: number;
         height: number;
         bitrate: number;
@@ -383,7 +384,7 @@ interface MediabunnyModule {
             input: unknown;
             output: unknown;
             video: {
-                codec: 'avc' | 'vp9' | 'av1';
+                codec: 'avc' | 'hevc' | 'vp9' | 'av1';
                 frameRate: number;
                 bitrate: number;
                 keyFrameInterval: number;
@@ -403,6 +404,81 @@ interface MediabunnyModule {
 
 const loggedVideoSupportDiagnostics = new Set<string>();
 const loggedVideoSupportSweepDiagnostics = new Set<string>();
+let cachedBrowserVideoCodecAvailability: Promise<BrowserVideoCodecAvailability> | null = null;
+
+export async function getBrowserVideoCodecAvailability(): Promise<BrowserVideoCodecAvailability> {
+    if (cachedBrowserVideoCodecAvailability) {
+        return cachedBrowserVideoCodecAvailability;
+    }
+
+    cachedBrowserVideoCodecAvailability = (async () => {
+        const defaultAvailability: BrowserVideoCodecAvailability = {
+            auto: true,
+            av1: false,
+            h265: false,
+            vp9: false,
+            h264: false,
+        };
+
+        try {
+            const mb = await import('mediabunny') as unknown as MediabunnyModule;
+            const canEncodeVideo = mb.canEncodeVideo;
+            const getEncodableVideoCodecs = mb.getEncodableVideoCodecs;
+            const baselineProbe = {
+                width: 1280,
+                height: 720,
+                bitrate: 2_000_000,
+                frameRate: 30,
+            };
+            const accelerationModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
+                'prefer-hardware',
+                'no-preference',
+                'prefer-software',
+            ];
+
+            const results = { ...defaultAvailability };
+
+            const tryProbe = async (codec: 'av1' | 'hevc' | 'vp9' | 'avc'): Promise<boolean> => {
+                if (!canEncodeVideo) return false;
+                for (const hardwareAcceleration of accelerationModes) {
+                    try {
+                        const supported = await canEncodeVideo(codec, {
+                            ...baselineProbe,
+                            hardwareAcceleration,
+                        });
+                        if (supported) return true;
+                    } catch {
+                        // Ignore per-mode probe errors.
+                    }
+                }
+                return false;
+            };
+
+            if (getEncodableVideoCodecs) {
+                try {
+                    const encodable = new Set(await getEncodableVideoCodecs());
+                    results.av1 = encodable.has('av1');
+                    results.h265 = encodable.has('hevc');
+                    results.vp9 = encodable.has('vp9');
+                    results.h264 = encodable.has('avc');
+                } catch {
+                    // Fall back to explicit probes below.
+                }
+            }
+
+            if (!results.av1) results.av1 = await tryProbe('av1');
+            if (!results.h265) results.h265 = await tryProbe('hevc');
+            if (!results.vp9) results.vp9 = await tryProbe('vp9');
+            if (!results.h264) results.h264 = await tryProbe('avc');
+
+            return results;
+        } catch {
+            return defaultAvailability;
+        }
+    })();
+
+    return cachedBrowserVideoCodecAvailability;
+}
 
 export interface VideoCompressionOptions {
     keepAudio?: boolean;
@@ -412,6 +488,14 @@ export interface VideoCompressionOptions {
     abortSignal?: AbortSignal;
     onStage?: (stage: string) => void;
 }
+
+export type BrowserVideoCodecAvailability = {
+    auto: true;
+    av1: boolean;
+    h265: boolean;
+    vp9: boolean;
+    h264: boolean;
+};
 
 function toEvenDimension(value: number): number {
     return Math.max(2, Math.round(value) & ~1);
@@ -516,12 +600,28 @@ function getCodecEncodingDefaults(codec: VideoCodecPreference): {
     minBitrate: number;
     maxBitrate: number;
 } {
+    if (codec === 'auto') {
+        return {
+            keyFrameIntervalSeconds: 2,
+            qualityFactor: 0.045,
+            minBitrate: 550_000,
+            maxBitrate: 14_000_000,
+        };
+    }
     if (codec === 'av1') {
         return {
             keyFrameIntervalSeconds: 2,
             qualityFactor: 0.036,
             minBitrate: 450_000,
             maxBitrate: 10_000_000,
+        };
+    }
+    if (codec === 'h265') {
+        return {
+            keyFrameIntervalSeconds: 2,
+            qualityFactor: 0.041,
+            minBitrate: 550_000,
+            maxBitrate: 16_000_000,
         };
     }
     if (codec === 'h264') {
@@ -540,12 +640,15 @@ function getCodecEncodingDefaults(codec: VideoCodecPreference): {
     };
 }
 
-function normalizeSourceCodec(codec: unknown): 'avc' | 'vp9' | 'av1' | 'other' {
+function normalizeSourceCodec(codec: unknown): 'avc' | 'hevc' | 'vp9' | 'av1' | 'other' {
     if (typeof codec !== 'string') {
         return 'other';
     }
     if (codec === 'avc' || codec.startsWith('avc') || codec.startsWith('h264')) {
         return 'avc';
+    }
+    if (codec === 'hevc' || codec.startsWith('hevc') || codec.startsWith('h265') || codec.startsWith('hev1') || codec.startsWith('hvc1')) {
+        return 'hevc';
     }
     if (codec === 'vp9' || codec.startsWith('vp9')) {
         return 'vp9';
@@ -557,8 +660,8 @@ function normalizeSourceCodec(codec: unknown): 'avc' | 'vp9' | 'av1' | 'other' {
 }
 
 function getCodecRatePolicy(
-    sourceCodec: 'avc' | 'vp9' | 'av1' | 'other',
-    targetCodec: VideoCodecPreference,
+    sourceCodec: 'avc' | 'hevc' | 'vp9' | 'av1' | 'other',
+    targetCodec: TranscodeCodecPreference,
     forceShrinkMode: boolean,
     preserveQualityMode: boolean
 ): { equivalentFactor: number; qualityFloorFactor: number } {
@@ -567,40 +670,56 @@ function getCodecRatePolicy(
         ? {
             'avc->vp9': 1.0,
             'avc->av1': 0.95,
+            'avc->h265': 0.88,
             'avc->h264': 1.0,
+            'hevc->av1': 1.12,
+            'hevc->vp9': 1.2,
+            'hevc->h265': 1.0,
+            'hevc->h264': 1.28,
             'vp9->av1': 0.96,
+            'vp9->h265': 0.96,
             'vp9->vp9': 1.0,
             'vp9->h264': 1.15,
             'av1->av1': 1.0,
+            'av1->h265': 1.05,
             'av1->vp9': 1.2,
             'av1->h264': 1.35,
         }
         : {
             'avc->vp9': 0.9,
             'avc->av1': 0.82,
+            'avc->h265': 0.8,
             'avc->h264': 1.0,
+            'hevc->av1': 1.0,
+            'hevc->vp9': 1.1,
+            'hevc->h265': 1.0,
+            'hevc->h264': 1.2,
             'vp9->av1': 0.9,
+            'vp9->h265': 0.9,
             'vp9->vp9': 1.0,
             'vp9->h264': 1.15,
             'av1->av1': 1.0,
+            'av1->h265': 0.92,
             'av1->vp9': 1.2,
             'av1->h264': 1.35,
         };
 
     const fallbackEquivalent = preserveQualityMode
-        ? (targetCodec === 'h264' ? 1.08 : 1.0)
+        ? (targetCodec === 'h264' ? 1.08 : targetCodec === 'h265' ? 0.95 : 1.0)
         : (targetCodec === 'av1'
             ? 0.9
+            : targetCodec === 'h265'
+                ? 0.88
             : targetCodec === 'vp9'
                 ? 0.95
                 : 1.05);
 
     const equivalentFactor = equivalentByPair[key] ?? fallbackEquivalent;
     const qualityFloorFactor = preserveQualityMode
-        ? (targetCodec === 'av1' ? 0.92 : targetCodec === 'vp9' ? 0.97 : 1.0)
+        ? (targetCodec === 'av1' ? 0.92 : targetCodec === 'h265' ? 0.95 : targetCodec === 'vp9' ? 0.97 : 1.0)
         : forceShrinkMode
-            ? (targetCodec === 'av1' ? 0.72 : targetCodec === 'vp9' ? 0.8 : 0.92)
-            : (targetCodec === 'av1' ? 0.84 : targetCodec === 'vp9' ? 0.9 : 0.98);
+            ? (targetCodec === 'av1' ? 0.72 : targetCodec === 'h265' ? 0.76 : targetCodec === 'vp9' ? 0.8 : 0.92)
+            : (targetCodec === 'av1' ? 0.84 : targetCodec === 'h265' ? 0.88 : targetCodec === 'vp9' ? 0.9 : 0.98);
 
     return { equivalentFactor, qualityFloorFactor };
 }
@@ -685,7 +804,7 @@ async function logVideoEncodingSupportDiagnostics(
         }
     }
 
-    const codecsToProbe: Array<'avc' | 'vp9' | 'av1'> = ['avc', 'vp9', 'av1'];
+    const codecsToProbe: Array<'avc' | 'hevc' | 'vp9' | 'av1'> = ['avc', 'hevc', 'vp9', 'av1'];
     const accelerationModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
         'prefer-hardware',
         'no-preference',
@@ -741,13 +860,13 @@ async function logVideoEncodingSupportSweepTable(
         return;
     }
 
-    const codecsToProbe: Array<'avc' | 'vp9' | 'av1'> = ['avc', 'vp9', 'av1'];
+    const codecsToProbe: Array<'avc' | 'hevc' | 'vp9' | 'av1'> = ['avc', 'hevc', 'vp9', 'av1'];
     const accelerationModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
         'prefer-hardware',
         'no-preference',
         'prefer-software',
     ];
-    const dimensions = [640, 1000, 1500, 2000, 3000, 4000, 5000];
+    const dimensions = [1000, 1500, 2000, 3000, 4000, 5000];
     const bitrates = [2_000_000, 8_000_000, 14_000_000];
 
     type SweepRow = {
@@ -855,7 +974,7 @@ async function compressVideo(
             `${message} Try another browser or upload without compression.`
         );
     }
-    const preferredCodec = options.preferredCodec ?? 'vp9';
+    const requestedCodec = options.preferredCodec ?? 'auto';
     const targetSizeMB = compressionMode === 'high' ? 99 : 49;
     // Use decimal MB to match user-facing size limits (50MB / 100MB) more closely.
     const maxBytes = targetSizeMB * 1000 * 1000;
@@ -880,7 +999,7 @@ async function compressVideo(
         : Math.min(120, Math.max(24, Math.round(sourceFrameRate)));
 
     const audioTransformRequested = options.keepAudio === false;
-    const codecTransformRequested = preferredCodec !== 'vp9';
+    const codecTransformRequested = requestedCodec !== 'auto' && requestedCodec !== 'vp9';
     const transformRequested = needsResize || audioTransformRequested || codecTransformRequested;
     const requiresTranscode = transformRequested || fileBlob.size > maxBytes || !!options.forceTranscodeUnderLimit;
     const preserveQualityUnderLimit = fileBlob.size <= maxBytes
@@ -900,8 +1019,9 @@ async function compressVideo(
     }
 
     const pixels = outWidth * outHeight;
-    const getBitrateScalesForCodec = (codec: VideoCodecPreference): number[] => {
+    const getBitrateScalesForCodec = (codec: TranscodeCodecPreference): number[] => {
         if (codec === 'av1') return [1, 0.9, 0.8, 0.72, 0.64, 0.56, 0.5];
+        if (codec === 'h265') return [1, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5];
         if (codec === 'h264') return [1, 0.9, 0.82, 0.74, 0.66];
         return [1, 0.9, 0.82, 0.74, 0.66, 0.58, 0.5];
     };
@@ -926,6 +1046,70 @@ async function compressVideo(
         ALL_FORMATS,
         canEncodeVideo,
     } = mb;
+
+    let effectiveCodec: TranscodeCodecPreference = requestedCodec === 'auto' ? 'av1' : requestedCodec;
+
+    if (requestedCodec === 'auto') {
+        const codecOrder: TranscodeCodecPreference[] = ['av1', 'h265', 'vp9', 'h264'];
+        const probeModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = [
+            'prefer-hardware',
+            'no-preference',
+            'prefer-software',
+        ];
+        const toEncoderCodec = (codec: TranscodeCodecPreference): 'avc' | 'hevc' | 'vp9' | 'av1' => {
+            if (codec === 'h264') return 'avc';
+            if (codec === 'h265') return 'hevc';
+            return codec;
+        };
+
+        if (canEncodeVideo) {
+            const probeBitrate = Math.max(450_000, bitrateFromBudget);
+            let chosenCodec: TranscodeCodecPreference | null = null;
+            for (const candidate of codecOrder) {
+                const encoderCodec = toEncoderCodec(candidate);
+                let supported = false;
+                for (const hardwareAcceleration of probeModes) {
+                    try {
+                        const canEncode = await canEncodeVideo(encoderCodec, {
+                            width: outWidth,
+                            height: outHeight,
+                            bitrate: probeBitrate,
+                            frameRate: outputFrameRate,
+                            hardwareAcceleration,
+                        });
+                        if (canEncode) {
+                            supported = true;
+                            break;
+                        }
+                    } catch {
+                        // Try next acceleration mode.
+                    }
+                }
+                if (supported) {
+                    chosenCodec = candidate;
+                    break;
+                }
+            }
+
+            if (chosenCodec) {
+                effectiveCodec = chosenCodec;
+                if (chosenCodec !== codecOrder[0]) {
+                    OBR.notification.show(
+                        `Auto codec selected ${chosenCodec.toUpperCase()} for this browser and resolution.`,
+                        'INFO'
+                    );
+                }
+            } else {
+                effectiveCodec = 'vp9';
+            }
+        } else {
+            const availability = await getBrowserVideoCodecAvailability();
+            if (availability.av1) effectiveCodec = 'av1';
+            else if (availability.h265) effectiveCodec = 'h265';
+            else if (availability.vp9) effectiveCodec = 'vp9';
+            else effectiveCodec = 'h264';
+        }
+    }
 
     const diagnosticsKey = `${outWidth}x${outHeight}:${outputFrameRate}:${Math.round(Math.max(450_000, bitrateFromBudget) / 1000)}`;
     if (!loggedVideoSupportDiagnostics.has(diagnosticsKey)) {
@@ -955,7 +1139,11 @@ async function compressVideo(
     if (requiresTranscode && isLikelyIOSBrowser()) {
         const iosTranscodeErrorMessage = 'This iOS browser cannot transcode video in this context. Try no compression, a lower Max video dimension, or a browser/device with hardware video encoding support.';
         if (canEncodeVideo) {
-            const probeCodec = preferredCodec === 'h264' ? 'avc' : preferredCodec;
+            const probeCodec = effectiveCodec === 'h264'
+                ? 'avc'
+                : effectiveCodec === 'h265'
+                    ? 'hevc'
+                    : effectiveCodec;
             const iosProbeModes: Array<'prefer-hardware' | 'no-preference' | 'prefer-software'> = ['prefer-hardware', 'no-preference', 'prefer-software'];
             let iosTranscodeSupported = false;
 
@@ -983,7 +1171,7 @@ async function compressVideo(
         }
     }
 
-    let sourceCodec: 'avc' | 'vp9' | 'av1' | 'other' = 'other';
+    let sourceCodec: 'avc' | 'hevc' | 'vp9' | 'av1' | 'other' = 'other';
     let sourceVideoBitrate = 0;
     let sourceAudioBitrate = 0;
     const skipDetailedPacketStats = fileBlob.size > 60_000_000;
@@ -1034,7 +1222,7 @@ async function compressVideo(
 
     const { equivalentFactor, qualityFloorFactor } = getCodecRatePolicy(
         sourceCodec,
-        preferredCodec,
+        effectiveCodec,
         !!options.forceTranscodeUnderLimit,
         preserveQualityUnderLimit
     );
@@ -1043,7 +1231,7 @@ async function compressVideo(
     const qualityFloorBitrate = Math.floor(sourceVideoBitrate * qualityFloorFactor * resizeFactor * frameRateFactor);
 
     const transcodeOnce = async (
-        codecPreference: VideoCodecPreference,
+        codecPreference: TranscodeCodecPreference,
         bitrate: number,
         codecDefaultsForPass: ReturnType<typeof getCodecEncodingDefaults>,
         stageLabel: string,
@@ -1054,8 +1242,12 @@ async function compressVideo(
         reportStage(stageLabel);
         reportProgress(progressStart);
 
-        const codec = codecPreference === 'h264' ? 'avc' : codecPreference;
-        const outputFormat = codecPreference === 'h264'
+        const codec = codecPreference === 'h264'
+            ? 'avc'
+            : codecPreference === 'h265'
+                ? 'hevc'
+                : codecPreference;
+        const outputFormat = codecPreference === 'h264' || codecPreference === 'h265'
             ? new Mp4OutputFormat()
             : new WebMOutputFormat();
 
@@ -1177,7 +1369,7 @@ async function compressVideo(
             }
 
             return new Blob([outputBuffer], {
-                type: codecPreference === 'h264' ? 'video/mp4' : 'video/webm',
+                type: codecPreference === 'h264' || codecPreference === 'h265' ? 'video/mp4' : 'video/webm',
             });
         }
 
@@ -1205,13 +1397,13 @@ async function compressVideo(
         throw new VideoCompressionError(
             'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
             `This browser build cannot encode ${codecPreference.toUpperCase()} at ${outWidth}x${outHeight}. ` +
-            `Try a lower max video dimension, switch codec, or use a Chromium build with WebCodecs encoding enabled.` +
+            `Try a lower max video dimension, switch codec (or Auto mode), or use a browser version that supports this codec.` +
             availableCodecs +
             (lastError ? ` ${lastError.message}` : '')
         );
     };
 
-    const bitrateScales = getBitrateScalesForCodec(preferredCodec);
+    const bitrateScales = getBitrateScalesForCodec(effectiveCodec);
     const totalPlannedPasses = bitrateScales.length;
     let attemptedPasses = 0;
     const getPassProgressWindow = (): { start: number; span: number } => {
@@ -1226,7 +1418,7 @@ async function compressVideo(
     let output: Blob | null = null;
     let bestOverBudgetOutput: Blob | null = null;
     let lastCodecError: Error | null = null;
-    const codecDefaults = getCodecEncodingDefaults(preferredCodec);
+    const codecDefaults = getCodecEncodingDefaults(effectiveCodec);
     const qualityBitrate = Math.floor(pixels * outputFrameRate * codecDefaults.qualityFactor);
     const seededBitrateBase = preserveQualityUnderLimit
         ? Math.min(bitrateFromBudget, sourceEquivalentBitrate)
@@ -1252,9 +1444,9 @@ async function compressVideo(
         let attemptedBitrate = Math.floor(seededBitrate * bitrateScales[0]);
         let currentPass = 1;
         let passWindow = getPassProgressWindow();
-        const codecLabel = preferredCodec.toUpperCase();
+        const codecLabel = effectiveCodec.toUpperCase();
         let candidateOutput = await transcodeOnce(
-            preferredCodec,
+            effectiveCodec,
             attemptedBitrate,
             codecDefaults,
             `Encoding video (${codecLabel}, pass ${currentPass})`,
@@ -1286,7 +1478,7 @@ async function compressVideo(
             currentPass += 1;
             passWindow = getPassProgressWindow();
             candidateOutput = await transcodeOnce(
-                preferredCodec,
+                effectiveCodec,
                 candidateBitrate,
                 codecDefaults,
                 `Encoding video (${codecLabel}, pass ${currentPass})`,
@@ -1318,7 +1510,7 @@ async function compressVideo(
         throw new VideoCompressionError(
             'VIDEO_COMPRESSION_UNSUPPORTED_ENCODER',
             lastCodecError?.message ||
-            `This browser build cannot encode ${preferredCodec.toUpperCase()} at ${outWidth}x${outHeight}. Try a lower Max video dimension or another codec.`
+            `This browser build cannot encode ${effectiveCodec.toUpperCase()} at ${outWidth}x${outHeight}. Try a lower Max video dimension or another codec.`
         );
     }
 
