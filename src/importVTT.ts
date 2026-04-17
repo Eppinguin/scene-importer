@@ -1989,6 +1989,135 @@ export async function addMapsToCurrentScene(
     };
 }
 
+export async function addWallsToCurrentSceneWithLayout(
+    sources: MapImportSource[],
+    options: MultiMapImportOptions = {}
+): Promise<MapWorkflowResult> {
+    if (!sources.length) {
+        throw new Error('Please select at least one map to add walls from.');
+    }
+
+    if (!await OBR.scene.isReady()) {
+        throw new Error('Scene is not ready. Please wait for the scene to finish loading.');
+    }
+
+    const targetDpi = await OBR.scene.grid.getDpi();
+    const scale = clampPositiveNumber(options.scale, 1);
+    const spacing = Math.max(0, Math.round(options.spacing ?? 80));
+    const layout = options.layout ?? 'GRID';
+
+    const displayWidths: number[] = [];
+    const displayHeights: number[] = [];
+
+    for (const source of sources) {
+        const wallResolution = source.wallData?.resolution;
+        const sourceDpi = clampPositiveNumber(
+            wallResolution?.pixels_per_grid ?? source.dpi,
+            100
+        );
+
+        try {
+            if (source.mediaBlob.type.startsWith('video/')) {
+                const metadata = await getVideoMetadata(source.mediaBlob);
+                displayWidths.push((metadata.width * targetDpi / sourceDpi) * scale);
+                displayHeights.push((metadata.height * targetDpi / sourceDpi) * scale);
+            } else {
+                const dimensions = await getImageDimensions(source.mediaBlob);
+                displayWidths.push((dimensions.width * targetDpi / sourceDpi) * scale);
+                displayHeights.push((dimensions.height * targetDpi / sourceDpi) * scale);
+            }
+        } catch {
+            if (
+                wallResolution &&
+                Number.isFinite(wallResolution.map_size?.x) &&
+                Number.isFinite(wallResolution.map_size?.y) &&
+                (wallResolution.map_size?.x ?? 0) > 0 &&
+                (wallResolution.map_size?.y ?? 0) > 0
+            ) {
+                const mapWidth = wallResolution.map_size.x;
+                const mapHeight = wallResolution.map_size.y;
+                const appearsToBePixelDimensions = mapWidth > 1000 || mapHeight > 1000;
+                const width = appearsToBePixelDimensions
+                    ? (mapWidth * targetDpi / sourceDpi) * scale
+                    : (mapWidth * targetDpi) * scale;
+                const height = appearsToBePixelDimensions
+                    ? (mapHeight * targetDpi / sourceDpi) * scale
+                    : (mapHeight * targetDpi) * scale;
+                displayWidths.push(width);
+                displayHeights.push(height);
+                continue;
+            }
+
+            const fallbackDimension = (1000 * targetDpi / sourceDpi) * scale;
+            displayWidths.push(fallbackDimension);
+            displayHeights.push(fallbackDimension);
+        }
+    }
+
+    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing);
+
+    let placementOffset: Vector2 = { x: 0, y: 0 };
+    const existingMaps = await OBR.scene.items.getItems((item) => item.layer === 'MAP');
+    if (existingMaps.length > 0) {
+        const bounds = await OBR.scene.items.getItemBounds(existingMaps.map((item) => item.id));
+        const placementMode = options.placement ?? 'RIGHT';
+        if (placementMode === 'BELOW') {
+            placementOffset = {
+                x: bounds.min.x,
+                y: bounds.max.y + spacing,
+            };
+        } else if (placementMode === 'ORIGIN') {
+            placementOffset = { x: 0, y: 0 };
+        } else {
+            placementOffset = {
+                x: bounds.max.x + spacing,
+                y: bounds.min.y,
+            };
+        }
+    }
+
+    const unmatchedSelectionNames: string[] = [];
+    const fogItems: Item[] = [];
+    let wallsAppliedToMapCount = 0;
+
+    for (let i = 0; i < sources.length; i++) {
+        const source = sources[i];
+        const wallData = source.wallData;
+        if (!wallData) {
+            unmatchedSelectionNames.push(source.name);
+            continue;
+        }
+
+        const position = {
+            x: positions[i].x + placementOffset.x,
+            y: positions[i].y + placementOffset.y,
+        };
+        const sourceScale = { x: scale, y: scale };
+
+        wallsAppliedToMapCount += 1;
+        const walls = await createWallItems(wallData, position, sourceScale, targetDpi);
+        fogItems.push(...walls);
+
+        if (wallData.portals && wallData.portals.length > 0) {
+            const doors = await createDoorItems(wallData, position, sourceScale, targetDpi);
+            fogItems.push(...doors);
+        }
+    }
+
+    if (fogItems.length > 0) {
+        await addItemsInBatches(fogItems, BATCH_SIZE);
+        await OBR.scene.fog.setFilled(true);
+    }
+
+    options.onProgress?.(100);
+
+    return {
+        importedMapCount: sources.length,
+        wallsAppliedToMapCount,
+        unmatchedSelectionNames,
+    };
+}
+
 export async function createSceneWithMultipleMaps(
     sources: MapImportSource[],
     options: MultiMapImportOptions = {}

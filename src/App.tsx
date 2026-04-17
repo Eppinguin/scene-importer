@@ -8,6 +8,7 @@ import {
   uploadFoundryScene,
   extractImageFromZip,
   addMapsToCurrentScene,
+  addWallsToCurrentSceneWithLayout,
   createSceneWithMultipleMaps,
   MapSelectionPendingError,
   type MapWorkflowResult,
@@ -63,7 +64,6 @@ type SceneInfo = {
   isVideo?: boolean;
 };
 
-type WorkflowMode = "single-scene" | "add-maps" | "multi-map-scene";
 type PendingMapSelectionAction = "add-current" | "multi-scene";
 type CompanionWallData = FoundryVTTData | VTTMapData;
 type MapWorkflowRunOptions = {
@@ -115,6 +115,17 @@ const sceneHasWallData = (sceneData: SceneData): boolean => {
     (Array.isArray(vttData.portals) && vttData.portals.length > 0)
   );
 };
+
+function isRawMediaFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return (
+    file.type.startsWith("image/") ||
+    file.type.startsWith("video/") ||
+    /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(
+      lowerName,
+    )
+  );
+}
 
 type VideoReadabilityProbe = {
   readable: boolean;
@@ -200,15 +211,13 @@ function App() {
   const [selectedSceneIndices, setSelectedSceneIndices] = useState<number[]>(
     [],
   );
-  const [workflowMode, setWorkflowMode] = useState<WorkflowMode>(
-    isContextMenuMode ? "add-maps" : "single-scene",
-  );
   const [layoutMode, setLayoutMode] = useState<MapLayoutMode>("GRID");
   const [mapPlacementMode, setMapPlacementMode] = useState<MapPlacementMode>("RIGHT");
   const [layoutSpacing, setLayoutSpacing] = useState("80");
   const [layoutScalePercent, setLayoutScalePercent] = useState("100");
   const [includeWallsWithMaps, setIncludeWallsWithMaps] = useState(true);
   const [lockImportedMaps, setLockImportedMaps] = useState(true);
+  const [showMapLayoutOptions, setShowMapLayoutOptions] = useState(false);
   const [showAdvancedLayoutOptions, setShowAdvancedLayoutOptions] = useState(false);
   const [multiSceneName, setMultiSceneName] = useState("Multi Map Scene");
   const [pendingMapSelection, setPendingMapSelection] = useState<{
@@ -216,6 +225,8 @@ function App() {
     action: PendingMapSelectionAction;
   } | null>(null);
   const [mapSelectionToken, setMapSelectionToken] = useState<string | null>(null);
+  const [lastMapWorkflowAction, setLastMapWorkflowAction] =
+    useState<PendingMapSelectionAction | null>(null);
 
   const [hoveredSceneThumb, setHoveredSceneThumb] = useState<{
     url: string;
@@ -301,22 +312,29 @@ function App() {
       previewHideTimeoutRef.current = null;
     }, 140);
   };
-  const selectedSceneIndexesForMode =
-    isContextMenuMode || workflowMode === "single-scene"
+  const selectedSceneIndexes =
+    isContextMenuMode
       ? [selectedSceneIndex]
       : selectedSceneIndices.length > 0
         ? selectedSceneIndices
         : [selectedSceneIndex];
-  const selectedScenesForMode = selectedSceneIndexesForMode
+  const selectedScenes = selectedSceneIndexes
     .map((idx) => availableScenes[idx])
     .filter((scene): scene is SceneInfo => !!scene);
+  const hasRawMediaSources =
+    selectedRawFiles.length > 0 || (!!selectedFile && isRawMediaFile(selectedFile));
+  const hasArchiveMapSources =
+    availableScenes.length > 0 &&
+    selectedScenes.some((scene) => !!(scene.data.img || scene.data.background?.src));
+  const hasCompanionWallData = !!selectedWallData;
+  const hasMapWorkflowSources = hasArchiveMapSources || hasRawMediaSources;
   const selectedSceneHasWallData =
     availableScenes.length === 0 ||
-    selectedScenesForMode.some((scene) => sceneHasWallData(scene.data));
+    selectedScenes.some((scene) => sceneHasWallData(scene.data));
   const selectedSceneHasMap =
     availableScenes.length === 0 ||
-    selectedScenesForMode.some((scene) => !!(scene.data.img || scene.data.background?.src));
-  const selectedSceneIsVideo = selectedScenesForMode.some((scene) => !!scene.isVideo);
+    selectedScenes.some((scene) => !!(scene.data.img || scene.data.background?.src));
+  const selectedSceneIsVideo = selectedScenes.some((scene) => !!scene.isVideo);
   const selectedFileIsVideo =
     !!selectedFile &&
     (selectedFile.type.startsWith("video/") ||
@@ -334,12 +352,35 @@ function App() {
         : selectedFileIsVideo;
   const selectedSourceCount =
     availableScenes.length > 0
-      ? selectedScenesForMode.length
+      ? selectedScenes.length
       : selectedRawFiles.length > 0
         ? selectedRawFiles.length
         : selectedFile
           ? 1
           : 0;
+  const hasWallImportSources =
+    (availableScenes.length > 0 && selectedSceneHasWallData) ||
+    !!selectedWallData ||
+    (!!selectedFile && !isRawMediaFile(selectedFile));
+  const canImportToCurrentScene = hasMapWorkflowSources || hasWallImportSources;
+  const canCreateNewScene =
+    !isContextMenuMode &&
+    selectedSourceCount > 0 &&
+    (hasImage || (!!selectedFile && selectedWallData));
+  const shouldUseMultiMapSceneCreation =
+    !isContextMenuMode && hasMapWorkflowSources && selectedSourceCount > 1;
+  const useMultiSceneSelectionLabel =
+    !isContextMenuMode && selectedSceneIndices.length > 1;
+  const shouldPreferWallImportForCurrent =
+    (hasCompanionWallData && !hasRawMediaSources) ||
+    !hasMapWorkflowSources;
+  const shouldShowMapLayoutOptions =
+    !isContextMenuMode &&
+    hasMapWorkflowSources &&
+    (showMapLayoutOptions ||
+      selectedSourceCount > 1 ||
+      pendingMapSelection !== null ||
+      mapSelectionToken !== null);
   const videoCompressionBlocked =
     selectedInputIsVideo && !isVideoCompressionSupported;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
@@ -436,7 +477,7 @@ function App() {
       }
 
       if (availableScenes.length > 0) {
-        const scene = selectedScenesForMode.find((candidate) => candidate.isVideo);
+        const scene = selectedScenes.find((candidate) => candidate.isVideo);
         if (!scene || !scene.isVideo || !zipObject || !isFoundryVTTData(scene.data)) {
           setSupported();
           return;
@@ -522,7 +563,7 @@ function App() {
     };
   }, [
     availableScenes,
-    selectedScenesForMode,
+    selectedScenes,
     selectedFile,
     selectedRawFiles,
     selectedFileIsVideo,
@@ -619,13 +660,13 @@ function App() {
   }, [availableScenes, selectedSceneIndex, selectedSceneIndices]);
 
   useEffect(() => {
-    if (workflowMode !== "single-scene" || selectedSceneIndices.length === 0) {
+    if (selectedSceneIndices.length === 0) {
       return;
     }
     if (!selectedSceneIndices.includes(selectedSceneIndex)) {
       setSelectedSceneIndex(selectedSceneIndices[0]);
     }
-  }, [workflowMode, selectedSceneIndices, selectedSceneIndex]);
+  }, [selectedSceneIndices, selectedSceneIndex]);
 
   useEffect(() => {
     if (selectedRawFiles.length > 0) {
@@ -634,9 +675,20 @@ function App() {
     }
 
     if (availableScenes.length > 0) {
-      setHasImage(selectedScenesForMode.some((scene) => !!(scene.data.img || scene.data.background?.src)));
+      setHasImage(selectedScenes.some((scene) => !!(scene.data.img || scene.data.background?.src)));
     }
-  }, [availableScenes, selectedScenesForMode, selectedRawFiles, hasImage]);
+  }, [availableScenes, selectedScenes, selectedRawFiles, hasImage]);
+
+  useEffect(() => {
+    if (!hasMapWorkflowSources) {
+      if (showMapLayoutOptions) setShowMapLayoutOptions(false);
+      if (showAdvancedLayoutOptions) setShowAdvancedLayoutOptions(false);
+    }
+  }, [
+    hasMapWorkflowSources,
+    showMapLayoutOptions,
+    showAdvancedLayoutOptions,
+  ]);
 
   // Set theme CSS variables when theme changes
   useEffect(() => {
@@ -1029,17 +1081,6 @@ function App() {
     resetMapWorkflowState();
   };
 
-  const isRawMediaFile = (file: File): boolean => {
-    const lowerName = file.name.toLowerCase();
-    return (
-      file.type.startsWith("image/") ||
-      file.type.startsWith("video/") ||
-      /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(
-        lowerName,
-      )
-    );
-  };
-
   const isJsonDataFile = (file: File): boolean => {
     const lowerName = file.name.toLowerCase();
     return (
@@ -1264,7 +1305,6 @@ function App() {
 
       const isSingleSceneMediaWithWallsSelection =
         !isContextMenuMode &&
-        workflowMode === "single-scene" &&
         files.length === 2 &&
         mediaFiles.length === 1 &&
         jsonFiles.length === 1 &&
@@ -1300,7 +1340,7 @@ function App() {
 
       if (!files.every((file) => isRawMediaFile(file))) {
         await OBR.notification.show(
-          "Select image/video files only, or in Create New Scene mode select exactly one image/video file plus one wall data JSON file.",
+          "Select image/video files only, or select exactly one image/video file plus one wall data JSON file.",
           "WARNING",
         );
         if (fileInputRef.current) {
@@ -1318,9 +1358,6 @@ function App() {
       setZipObject(null);
       setIsFoundryFormat(false);
       setHasImage(true);
-      if (!isContextMenuMode && workflowMode === "single-scene") {
-        setWorkflowMode("multi-map-scene");
-      }
       return;
     }
 
@@ -1466,8 +1503,11 @@ function App() {
     return `scene-importer:${hashMapSourceSignature(signature)}`;
   };
 
-  const buildMapSelectionSettingsFingerprint = (): string => {
+  const buildMapSelectionSettingsFingerprint = (
+    action: PendingMapSelectionAction,
+  ): string => {
     return JSON.stringify({
+      action,
       compressionMode,
       preferredVideoCodec,
       removeVideoAudio,
@@ -1484,7 +1524,7 @@ function App() {
         throw new Error("Scene archive is not loaded.");
       }
 
-      for (const scene of selectedScenesForMode) {
+      for (const scene of selectedScenes) {
         if (!isFoundryVTTData(scene.data)) continue;
         const imgPath = scene.data.img || scene.data.background?.src;
         if (!imgPath) continue;
@@ -1510,10 +1550,19 @@ function App() {
           : [];
 
     for (const file of mediaFiles) {
+      const companionData =
+        selectedWallData && mediaFiles.length === 1 && file === selectedFile
+          ? selectedWallData
+          : undefined;
       sources.push({
         name: file.name,
         mediaBlob: file,
         dpi: 100,
+        wallData: companionData
+          ? isFoundryVTTData(companionData)
+            ? convertFoundryToVTTData(companionData)
+            : companionData
+          : undefined,
       });
     }
 
@@ -1526,6 +1575,7 @@ function App() {
     }
     setPendingMapSelection(null);
     setMapSelectionToken(null);
+    setLastMapWorkflowAction(null);
   };
 
   const handleAddMapsToCurrentScene = async (
@@ -1550,7 +1600,7 @@ function App() {
 
       const computedSelectionToken = buildMapSelectionToken(
         sources,
-        buildMapSelectionSettingsFingerprint(),
+        buildMapSelectionSettingsFingerprint("add-current"),
       );
       if (runOptions.resetSelectionCache) {
         clearMapSelectionState(computedSelectionToken);
@@ -1587,6 +1637,7 @@ function App() {
 
       setMapSelectionToken(activeSelectionToken);
       setPendingMapSelection(null);
+      setLastMapWorkflowAction("add-current");
       await OBR.notification.show("Maps added to current scene.", "SUCCESS");
       if (isContextMenuMode) {
         await OBR.modal.close("com.eppinguin.scene-importer/modal");
@@ -1595,6 +1646,7 @@ function App() {
       if (error instanceof MapSelectionPendingError) {
         setMapSelectionToken(error.token);
         setPendingMapSelection({ token: error.token, action: "add-current" });
+        setLastMapWorkflowAction("add-current");
         await OBR.notification.show(
           "No maps were selected. Click Continue Map Selection to reopen the picker without re-uploading.",
           "INFO",
@@ -1634,7 +1686,7 @@ function App() {
 
       const computedSelectionToken = buildMapSelectionToken(
         sources,
-        buildMapSelectionSettingsFingerprint(),
+        buildMapSelectionSettingsFingerprint("multi-scene"),
       );
       if (runOptions.resetSelectionCache) {
         clearMapSelectionState(computedSelectionToken);
@@ -1671,12 +1723,14 @@ function App() {
 
       setMapSelectionToken(activeSelectionToken);
       setPendingMapSelection(null);
+      setLastMapWorkflowAction("multi-scene");
       await OBR.notification.show("Multi-map scene created.", "SUCCESS");
       await OBR.modal.close("com.eppinguin.scene-importer/modal");
     } catch (error) {
       if (error instanceof MapSelectionPendingError) {
         setMapSelectionToken(error.token);
         setPendingMapSelection({ token: error.token, action: "multi-scene" });
+        setLastMapWorkflowAction("multi-scene");
         await OBR.notification.show(
           "No maps were selected. Click Continue Map Selection to reopen the picker without re-uploading.",
           "INFO",
@@ -1694,14 +1748,41 @@ function App() {
     }
   };
 
-  const runActiveMapWorkflow = (runOptions: MapWorkflowRunOptions = {}) => {
-    if (isContextMenuMode || workflowMode === "add-maps") {
+  const runMapWorkflowByAction = (
+    action: PendingMapSelectionAction,
+    runOptions: MapWorkflowRunOptions = {},
+  ) => {
+    if (action === "add-current") {
       void handleAddMapsToCurrentScene(runOptions);
       return;
     }
-    if (workflowMode === "multi-map-scene") {
-      void handleCreateMultiMapScene(runOptions);
+    void handleCreateMultiMapScene(runOptions);
+  };
+
+  const runMapWorkflowFromSelectionState = (
+    runOptions: MapWorkflowRunOptions = {},
+  ) => {
+    const action =
+      pendingMapSelection?.action ||
+      lastMapWorkflowAction ||
+      (shouldUseMultiMapSceneCreation ? "multi-scene" : "add-current");
+    runMapWorkflowByAction(action, runOptions);
+  };
+
+  const handleImportToCurrentScene = () => {
+    if (shouldPreferWallImportForCurrent && hasWallImportSources) {
+      void handleAddWallsToCurrentScene();
+      return;
     }
+    runMapWorkflowByAction("add-current");
+  };
+
+  const handleCreateSceneDestination = () => {
+    if (shouldUseMultiMapSceneCreation) {
+      runMapWorkflowByAction("multi-scene");
+      return;
+    }
+    void handleCreateNewScene();
   };
 
   const handleCreateNewScene = async () => {
@@ -1876,12 +1957,28 @@ function App() {
 
     setIsLoading(true);
     try {
-      const s = availableScenes[selectedSceneIndex];
-      if (s) {
-        const wallData = isFoundryVTTData(s.data)
-          ? convertFoundryToVTTData(s.data)
-          : (s.data as VTTMapData);
-        await addItemsFromData(wallData, isContextMenuMode);
+      if (!isContextMenuMode && hasMapWorkflowSources) {
+        const sources = await buildMapImportSources();
+        const result = await addWallsToCurrentSceneWithLayout(sources, {
+          layout: layoutMode,
+          spacing: getLayoutSpacing(),
+          scale: getLayoutScale(),
+          placement: "ORIGIN",
+        });          
+
+        await showMapWorkflowMismatchWarning(result);
+
+        if (result.wallsAppliedToMapCount === 0) {
+          await OBR.notification.show(
+            "No walls or doors were found for the selected maps.",
+            "INFO",
+          );
+        } else {
+          await OBR.notification.show(
+            `Imported walls/doors for ${result.wallsAppliedToMapCount} map(s).`,
+            "SUCCESS",
+          );
+        }
       } else if (selectedWallData) {
         await addItemsFromData(
           isFoundryVTTData(selectedWallData)
@@ -1889,6 +1986,14 @@ function App() {
             : selectedWallData,
           isContextMenuMode,
         );
+      } else if (availableScenes.length > 0) {
+        const s = availableScenes[selectedSceneIndex];
+        if (s) {
+          const wallData = isFoundryVTTData(s.data)
+            ? convertFoundryToVTTData(s.data)
+            : (s.data as VTTMapData);
+          await addItemsFromData(wallData, isContextMenuMode);
+        }
       } else if (selectedFile) {
         await addItemsFromVTT(selectedFile, isContextMenuMode);
       }
@@ -1924,28 +2029,6 @@ function App() {
           <Typography variant="h6" sx={{ fontWeight: 600 }}>
             Scene Importer
           </Typography>
-
-          {!isContextMenuMode && (
-            <Box className="options">
-              <FormControl fullWidth size="small">
-                <InputLabel id="workflow-mode-label">Mode</InputLabel>
-                <Select
-                  labelId="workflow-mode-label"
-                  label="Mode"
-                  value={workflowMode}
-                  onChange={(e) =>
-                    setWorkflowMode(e.target.value as WorkflowMode)
-                  }
-                  disabled={isLoading}>
-                  <MenuItem value="single-scene">Create New Scene</MenuItem>
-                  <MenuItem value="add-maps">Add Maps To Current Scene</MenuItem>
-                  <MenuItem value="multi-map-scene">
-                    Create Multi-Map Scene
-                  </MenuItem>
-                </Select>
-              </FormControl>
-            </Box>
-          )}
 
           <Stack className="file-upload" spacing={1}>
             <input
@@ -2052,10 +2135,15 @@ function App() {
             {availableScenes.length > 0 && (
               <Box className="scene-selection section-gap">
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  {isContextMenuMode || workflowMode === "single-scene"
+                  {isContextMenuMode || !useMultiSceneSelectionLabel
                     ? `Select Scene (${availableScenes.length} found)`
-                    : `Select Maps (${selectedScenesForMode.length}/${availableScenes.length})`}
+                    : `Select Maps (${selectedScenes.length}/${availableScenes.length})`}
                 </Typography>
+                {!isContextMenuMode && availableScenes.length > 1 && (
+                  <Typography variant="caption" className="help-text" sx={{ mb: 0.5 }}>
+                    Click to select one map. Hold Shift to select a range. Hold Cmd/Ctrl and click to toggle selection.
+                  </Typography>
+                )}
                 <div
                   className="scene-gallery"
                   onClickCapture={() => {
@@ -2069,21 +2157,55 @@ function App() {
                   {availableScenes.map((s, idx) => (
                     <div
                       key={idx}
-                      className={`scene-card ${(isContextMenuMode || workflowMode === "single-scene"
+                      className={`scene-card ${(isContextMenuMode
                         ? selectedSceneIndex === idx
                         : selectedSceneIndices.includes(idx))
                         ? "selected"
                         : ""}`}
-                      onClick={() => {
+                      onClick={(event) => {
                         if (suppressNextCardClickRef.current) {
                           suppressNextCardClickRef.current = false;
                           return;
                         }
 
-                        if (isContextMenuMode || workflowMode === "single-scene") {
-                          setSelectedSceneIndex(idx);
+                        const anchorIndex = Math.min(
+                          Math.max(selectedSceneIndex, 0),
+                          Math.max(availableScenes.length - 1, 0),
+                        );
+                        setSelectedSceneIndex(idx);
+                        setHasImage(!!(s.data.img || s.data.background?.src));
+
+                        if (isContextMenuMode) {
                           setSelectedSceneIndices([idx]);
-                          setHasImage(!!(s.data.img || s.data.background?.src));
+                          return;
+                        }
+
+                        const isRangeSelect = event.shiftKey;
+                        const isMultiSelectToggle =
+                          event.metaKey || event.ctrlKey;
+
+                        if (isRangeSelect) {
+                          const start = Math.min(anchorIndex, idx);
+                          const end = Math.max(anchorIndex, idx);
+                          const range = Array.from(
+                            { length: end - start + 1 },
+                            (_, offset) => start + offset,
+                          );
+
+                          if (isMultiSelectToggle) {
+                            setSelectedSceneIndices((previous) => {
+                              const merged = new Set([...previous, ...range]);
+                              return Array.from(merged).sort((a, b) => a - b);
+                            });
+                            return;
+                          }
+
+                          setSelectedSceneIndices(range);
+                          return;
+                        }
+
+                        if (!isMultiSelectToggle) {
+                          setSelectedSceneIndices([idx]);
                           return;
                         }
 
@@ -2233,7 +2355,24 @@ function App() {
               </Box>
             )}
 
-            {!isContextMenuMode && workflowMode !== "single-scene" && (
+            {!isContextMenuMode &&
+              hasMapWorkflowSources &&
+              selectedSourceCount <= 1 && (
+                <Button
+                  onClick={() =>
+                    setShowMapLayoutOptions((previous) => !previous)
+                  }
+                  disabled={isLoading}
+                  variant="text"
+                  size="small"
+                  sx={{ alignSelf: "flex-start", px: 0.5 }}>
+                  {showMapLayoutOptions
+                    ? "Hide map layout options"
+                    : "Show map layout options"}
+                </Button>
+              )}
+
+            {shouldShowMapLayoutOptions && (
               <Box className="options section-gap">
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
                   Map Layout Options
@@ -2244,7 +2383,7 @@ function App() {
                     {pendingMapSelection ? " - selection pending" : ""}
                   </Typography>
 
-                  {!isContextMenuMode && workflowMode === "multi-map-scene" && (
+                  {shouldUseMultiMapSceneCreation && (
                     <TextField
                       label="New Scene Name"
                       value={multiSceneName}
@@ -2285,10 +2424,10 @@ function App() {
 
                   {showAdvancedLayoutOptions && (
                     <Stack className="advanced-layout-options" spacing={1}>
-                      {(isContextMenuMode || workflowMode === "add-maps") && (
+                      {hasMapWorkflowSources && (
                         <FormControl fullWidth size="small">
                           <InputLabel id="placement-mode-label">
-                            Placement
+                           Map Placement
                           </InputLabel>
                           <Select
                             labelId="placement-mode-label"
@@ -2628,7 +2767,7 @@ function App() {
           )}
 
           {(pendingMapSelection || mapSelectionToken) &&
-            workflowMode !== "single-scene" &&
+            hasMapWorkflowSources &&
             uploadProgress === null && (
               <Box
                 sx={{
@@ -2644,7 +2783,7 @@ function App() {
                   size="small"
                   sx={{ minWidth: "auto", px: 1 }}
                   onClick={() =>
-                    runActiveMapWorkflow({ forceSelectionPrompt: true })
+                    runMapWorkflowFromSelectionState({ forceSelectionPrompt: true })
                   }
                   disabled={isLoading || !mapSelectionToken}>
                   Re-select
@@ -2654,7 +2793,7 @@ function App() {
                   size="small"
                   sx={{ minWidth: "auto", px: 1 }}
                   onClick={() =>
-                    runActiveMapWorkflow({ resetSelectionCache: true })
+                    runMapWorkflowFromSelectionState({ resetSelectionCache: true })
                   }
                   disabled={
                     isLoading ||
@@ -2679,94 +2818,58 @@ function App() {
             className="actions"
             direction={{ xs: "column", sm: "row" }}
             spacing={1}>
-            {!isContextMenuMode &&
-              workflowMode === "single-scene" &&
-              uploadProgress === null && (
+            {!isContextMenuMode && uploadProgress === null && (
               <Button
-                onClick={handleCreateNewScene}
+                onClick={handleImportToCurrentScene}
                 variant="contained"
                 disabled={
-                  (!selectedFile && availableScenes.length === 0) ||
                   isLoading ||
                   uploadProgress !== null ||
-                  (isFoundryFormat && availableScenes.length === 0) ||
-                  !hasImage
+                  !canImportToCurrentScene
                 }>
                 {uploadProgress !== null
                   ? `Compressing… ${uploadProgress}%`
                   : isLoading
                     ? "Uploading..."
-                    : isFoundryFormat && availableScenes.length === 0
-                      ? "Scene Creation Not Available (Foundry File)"
-                      : !hasImage
-                        ? "Scene Creation Not Available (No Image)"
-                        : "Create New Scene"}
+                    : pendingMapSelection?.action === "add-current"
+                      ? "Continue Import to Current Scene"
+                      : "Import to Current Scene"}
               </Button>
-              )}
+            )}
 
-            {!isContextMenuMode &&
-              workflowMode === "single-scene" &&
-              uploadProgress === null && (
+            {!isContextMenuMode && uploadProgress === null && (
               <Button
-                onClick={handleAddWallsToCurrentScene}
+                onClick={handleCreateSceneDestination}
                 variant="outlined"
                 disabled={
-                  (!selectedFile && availableScenes.length === 0) ||
                   isLoading ||
                   uploadProgress !== null ||
-                  (availableScenes.length > 0 && !selectedSceneHasWallData)
+                  !canCreateNewScene
                 }>
-                {isLoading
-                  ? "Uploading..."
-                  : availableScenes.length > 0 && !selectedSceneHasWallData
-                    ? "No Walls In Selected Scene"
-                    : "Add Walls to Current Scene"}
+                {!hasImage
+                  ? "Create New Scene (No Map Image)"
+                  : pendingMapSelection?.action === "multi-scene"
+                    ? "Continue Create New Scene"
+                    : "Create New Scene"}
               </Button>
-              )}
+            )}
 
             {!isContextMenuMode &&
-              workflowMode === "add-maps" &&
-              uploadProgress === null && (
+              uploadProgress === null &&
+              hasWallImportSources && (
                 <Button
-                  onClick={() => {
-                    void handleAddMapsToCurrentScene();
-                  }}
-                  variant="contained"
+                  onClick={handleAddWallsToCurrentScene}
+                  variant="text"
                   disabled={
                     isLoading ||
-                    selectedSourceCount === 0 ||
-                    (availableScenes.length > 0 && !selectedSceneHasMap)
+                    uploadProgress !== null ||
+                    (availableScenes.length > 0 && !selectedSceneHasWallData)
                   }>
                   {isLoading
                     ? "Uploading..."
-                    : availableScenes.length > 0 && !selectedSceneHasMap
-                      ? "No Map In Selected Scene"
-                      : pendingMapSelection?.action === "add-current"
-                        ? "Continue Map Selection"
-                        : "Add Maps to Current Scene"}
-                </Button>
-              )}
-
-            {!isContextMenuMode &&
-              workflowMode === "multi-map-scene" &&
-              uploadProgress === null && (
-                <Button
-                  onClick={() => {
-                    void handleCreateMultiMapScene();
-                  }}
-                  variant="contained"
-                  disabled={
-                    isLoading ||
-                    selectedSourceCount === 0 ||
-                    (availableScenes.length > 0 && !selectedSceneHasMap)
-                  }>
-                  {isLoading
-                    ? "Uploading..."
-                    : availableScenes.length > 0 && !selectedSceneHasMap
-                      ? "No Map In Selected Scene"
-                      : pendingMapSelection?.action === "multi-scene"
-                        ? "Continue Map Selection and Create Scene"
-                        : "Create Multi-Map Scene"}
+                    : availableScenes.length > 0 && !selectedSceneHasWallData
+                      ? "No Walls In Selected Scene"
+                      : "Import Walls Only"}
                 </Button>
               )}
 
