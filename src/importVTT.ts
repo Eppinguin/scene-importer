@@ -1,6 +1,9 @@
 import OBR, {
+    buildImage,
     buildImageUpload,
     buildSceneUpload,
+    type ImageContent,
+    type ImageGrid,
     type Item,
     type Vector2
 } from "@owlbear-rodeo/sdk";
@@ -117,6 +120,120 @@ function getImageTypeFromBase64(base64Data: string): 'image/png' | 'image/webp' 
 export type CompressionMode = 'none' | 'standard' | 'high';
 export type VideoCodecPreference = 'auto' | 'av1' | 'h265' | 'vp9' | 'h264';
 type TranscodeCodecPreference = Exclude<VideoCodecPreference, 'auto'>;
+export type MapLayoutMode = 'GRID' | 'ROW' | 'COLUMN' | 'STACK';
+export type MapPlacementMode = 'RIGHT' | 'BELOW' | 'ORIGIN';
+
+export interface MapImportSource {
+    name: string;
+    mediaBlob: Blob | File;
+    dpi?: number;
+    wallData?: VTTMapData;
+}
+
+export interface MultiMapImportOptions {
+    layout?: MapLayoutMode;
+    spacing?: number;
+    scale?: number;
+    placement?: MapPlacementMode;
+    includeWalls?: boolean;
+    lockMaps?: boolean;
+    compressionMode?: CompressionMode;
+    sceneName?: string;
+    videoOptions?: VideoCompressionOptions;
+    onProgress?: (progress: number) => void;
+    onStage?: (stage: string) => void;
+    selectionToken?: string;
+    forceSelectionPrompt?: boolean;
+}
+
+export interface MapWorkflowResult {
+    importedMapCount: number;
+    wallsAppliedToMapCount: number;
+    unmatchedSelectionNames: string[];
+}
+
+interface PreparedMapImportSource {
+    displayName: string;
+    uploadName: string;
+    selectionKey: string;
+    file: File;
+    dpi: number;
+    wallData?: VTTMapData;
+}
+
+interface ResolvedMapImportSource {
+    displayName: string;
+    metadataMatched: boolean;
+    wallData?: VTTMapData;
+    image: ImageContent;
+    grid: ImageGrid;
+    position: Vector2;
+}
+
+interface SelectedImageCandidate {
+    name: string;
+    image: ImageContent;
+    grid: ImageGrid;
+    description?: string;
+}
+
+interface CompletedMapSelectionState {
+    prepared: PreparedMapImportSource[];
+    selected: SelectedImageCandidate[];
+}
+
+const pendingMapSelections = new Map<string, PreparedMapImportSource[]>();
+const completedMapSelections = new Map<string, CompletedMapSelectionState>();
+const MAX_COMPLETED_MAP_SELECTIONS = 20;
+
+export function clearMapSelectionState(selectionToken?: string): void {
+    if (selectionToken) {
+        pendingMapSelections.delete(selectionToken);
+        completedMapSelections.delete(selectionToken);
+        return;
+    }
+
+    pendingMapSelections.clear();
+    completedMapSelections.clear();
+}
+
+function restorePendingMapSelection(
+    token: string,
+    prepared: PreparedMapImportSource[],
+): void {
+    pendingMapSelections.set(token, [...prepared]);
+    completedMapSelections.delete(token);
+}
+
+function rememberCompletedMapSelection(
+    token: string,
+    prepared: PreparedMapImportSource[],
+    selected: SelectedImageCandidate[]
+): void {
+    completedMapSelections.delete(token);
+    completedMapSelections.set(token, {
+        prepared: [...prepared],
+        selected: [...selected],
+    });
+
+    while (completedMapSelections.size > MAX_COMPLETED_MAP_SELECTIONS) {
+        const oldest = completedMapSelections.keys().next().value;
+        if (!oldest) {
+            break;
+        }
+        completedMapSelections.delete(oldest);
+    }
+}
+
+export class MapSelectionPendingError extends Error {
+    token: string;
+
+    constructor(token: string) {
+        super('Map assets uploaded. Continue once map selection is complete.');
+        this.name = 'MapSelectionPendingError';
+        this.token = token;
+    }
+}
 export type VideoCompressionErrorCode =
     | 'VIDEO_COMPRESSION_ABORTED'
     | 'VIDEO_COMPRESSION_METADATA_FAILED'
@@ -162,6 +279,53 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality?: num
             resolve(blob);
         }, mimeType, quality);
     });
+}
+
+async function getImageDimensions(imageBlob: Blob): Promise<{ width: number; height: number }> {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const width = Number(img.width);
+            const height = Number(img.height);
+            URL.revokeObjectURL(img.src);
+            if (width <= 0 || height <= 0) {
+                reject(new Error('Could not read image dimensions'));
+                return;
+            }
+            resolve({ width, height });
+        };
+        img.onerror = () => {
+            URL.revokeObjectURL(img.src);
+            reject(new Error('Failed to load image'));
+        };
+        img.src = URL.createObjectURL(imageBlob);
+    });
+}
+
+function getAdjustedDpiAfterResize(
+    sourceDpi: number,
+    sourceDimensions: { width: number; height: number } | null,
+    finalDimensions: { width: number; height: number } | null,
+): number {
+    const safeSourceDpi = clampPositiveNumber(sourceDpi, 100);
+    if (
+        !sourceDimensions ||
+        !finalDimensions ||
+        sourceDimensions.width <= 0 ||
+        sourceDimensions.height <= 0 ||
+        finalDimensions.width <= 0 ||
+        finalDimensions.height <= 0
+    ) {
+        return safeSourceDpi;
+    }
+
+    const widthRatio = finalDimensions.width / sourceDimensions.width;
+
+    if (!Number.isFinite(widthRatio) || widthRatio <= 0) {
+        return safeSourceDpi;
+    }
+
+    return safeSourceDpi * widthRatio;
 }
 
 // Helper function to optimize image data
@@ -1427,6 +1591,470 @@ async function compressVideo(
     };
 }
 
+function sanitizeMapName(name: string): string {
+    const noExtension = name.replace(/\.[^/.]+$/, '').trim();
+    const compact = noExtension.replace(/\s+/g, ' ').replace(/[^a-zA-Z0-9 _-]/g, '').trim();
+    return compact || 'Map';
+}
+
+function buildUploadName(prefix: string, index: number, name: string): string {
+    const sanitized = sanitizeMapName(name).slice(0, 40);
+    return `${prefix}-${String(index + 1).padStart(2, '0')}-${sanitized}`;
+}
+
+function clampPositiveNumber(value: number | undefined, fallback: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        return fallback;
+    }
+    return value;
+}
+
+function computeLayoutPositions(
+    widths: number[],
+    heights: number[],
+    layout: MapLayoutMode,
+    spacing: number
+): Vector2[] {
+    const positions: Vector2[] = [];
+
+    if (layout === 'STACK') {
+        for (let i = 0; i < widths.length; i++) {
+            positions.push({ x: 0, y: 0 });
+        }
+        return positions;
+    }
+
+    if (layout === 'ROW') {
+        let x = 0;
+        for (let i = 0; i < widths.length; i++) {
+            positions.push({ x, y: 0 });
+            x += widths[i] + spacing;
+        }
+        return positions;
+    }
+
+    if (layout === 'COLUMN') {
+        let y = 0;
+        for (let i = 0; i < widths.length; i++) {
+            positions.push({ x: 0, y });
+            y += heights[i] + spacing;
+        }
+        return positions;
+    }
+
+    const columns = Math.max(1, Math.ceil(Math.sqrt(widths.length)));
+    let rowMaxHeight = 0;
+    let x = 0;
+    let y = 0;
+
+    for (let i = 0; i < widths.length; i++) {
+        const column = i % columns;
+        if (column === 0) {
+            if (i > 0) {
+                y += rowMaxHeight + spacing;
+            }
+            x = 0;
+            rowMaxHeight = 0;
+        }
+
+        positions.push({ x, y });
+        x += widths[i] + spacing;
+        rowMaxHeight = Math.max(rowMaxHeight, heights[i]);
+    }
+
+    return positions;
+}
+
+async function waitForPickerOpenTransition(): Promise<void> {
+    if (typeof window === 'undefined') {
+        return;
+    }
+
+    await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+    });
+
+    await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 120);
+    });
+}
+
+async function prepareMapSources(
+    sources: MapImportSource[],
+    targetDpi: number,
+    options: MultiMapImportOptions
+): Promise<ResolvedMapImportSource[]> {
+    const {
+        compressionMode = 'standard',
+        onProgress,
+        onStage,
+        videoOptions,
+        selectionToken,
+        forceSelectionPrompt = false,
+    } = options;
+
+    const prefix = selectionToken ?? `scene-importer-${Date.now()}`;
+    let prepared: PreparedMapImportSource[] = [];
+    let selectedCandidates: SelectedImageCandidate[] | null = null;
+    let preOpenedSelection: Awaited<ReturnType<typeof OBR.assets.downloadImages>> | null = null;
+
+    if (selectionToken) {
+        const completedSelection = completedMapSelections.get(selectionToken);
+        if (completedSelection) {
+            prepared = completedSelection.prepared;
+            if (!forceSelectionPrompt) {
+                selectedCandidates = completedSelection.selected;
+            }
+        } else if (pendingMapSelections.has(selectionToken)) {
+            prepared = pendingMapSelections.get(selectionToken) || [];
+        }
+    }
+
+    if (prepared.length === 0) {
+        const total = Math.max(1, sources.length);
+
+        for (let i = 0; i < sources.length; i++) {
+            const source = sources[i];
+            const sourceDpi = clampPositiveNumber(source.dpi, 100);
+            const startProgress = (i / total) * 70;
+            const endProgress = ((i + 1) / total) * 70;
+            const reportProgress = (localProgress: number) => {
+                if (!onProgress) return;
+                const normalizedLocal = Math.max(0, Math.min(100, localProgress));
+                const value = Math.round(startProgress + ((endProgress - startProgress) * (normalizedLocal / 100)));
+                onProgress(value);
+            };
+
+            if (onStage) {
+                onStage(`Preparing ${source.name}`);
+            }
+
+            const isVideo =
+                source.mediaBlob.type.startsWith('video/') ||
+                /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(source.name.toLowerCase());
+
+            let finalBlob: Blob = source.mediaBlob;
+            let effectiveDpi = sourceDpi;
+
+            if (isVideo) {
+                if (compressionMode !== 'none') {
+                    const sizeInMb = source.mediaBlob.size / (1024 * 1024);
+                    if (sizeInMb > 500) {
+                        throw new VideoCompressionError(
+                            'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                            `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                        );
+                    }
+                    const compressed = await compressVideo(source.mediaBlob, compressionMode, reportProgress, {
+                        ...videoOptions,
+                        onStage,
+                    });
+                    finalBlob = compressed.blob;
+                    if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
+                        effectiveDpi = sourceDpi * (compressed.outputWidth / compressed.sourceWidth);
+                    }
+                } else {
+                    reportProgress(100);
+                }
+            } else {
+                const sourceDimensions = await getImageDimensions(source.mediaBlob);
+                finalBlob = await optimizeImage(
+                    source.mediaBlob,
+                    {
+                        compressionMode,
+                        maxSizeInMB: compressionMode === 'high' ? 49 : 24,
+                        maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+                    },
+                    reportProgress,
+                    onStage,
+                );
+                const dimensions = await getImageDimensions(finalBlob);
+                effectiveDpi = getAdjustedDpiAfterResize(sourceDpi, sourceDimensions, dimensions);
+            }
+
+            const extension = getImageExtensionFromMimeType(
+                finalBlob.type,
+                isVideo ? (finalBlob.type.includes('webm') ? 'webm' : 'mp4') : 'png'
+            );
+            const file = new File([finalBlob], `${sanitizeMapName(source.name)}.${extension}`, { type: finalBlob.type });
+
+            prepared.push({
+                displayName: sanitizeMapName(source.name),
+                uploadName: buildUploadName(prefix, i, source.name),
+                selectionKey: `${prefix}:map:${i + 1}`,
+                file,
+                dpi: clampPositiveNumber(effectiveDpi, sourceDpi),
+                wallData: source.wallData,
+            });
+        }
+
+        if (onProgress) {
+            onProgress(72);
+        }
+
+        const uploads = prepared.map((source) =>
+            buildImageUpload(source.file)
+                .name(source.uploadName)
+                .description(source.selectionKey)
+                .dpi(source.dpi)
+                .locked(true)
+                .build()
+        );
+
+        if (onStage) {
+            onStage('Opening map picker');
+        }
+        const mapPickerPromise = OBR.assets.downloadImages(true, undefined, 'MAP');
+        await waitForPickerOpenTransition();
+
+        if (onStage) {
+            onStage('Choose map storage location');
+        }
+        await OBR.assets.uploadImages(uploads, 'MAP');
+        pendingMapSelections.set(prefix, prepared);
+
+        if (onStage) {
+            onStage('Select uploaded maps');
+        }
+        preOpenedSelection = await mapPickerPromise;
+    }
+
+    if (!selectedCandidates) {
+        if (onStage) {
+            onStage('Select uploaded maps');
+        }
+
+        const selected = preOpenedSelection ?? await OBR.assets.downloadImages(true, undefined, 'MAP');
+        if (!selected.length) {
+            restorePendingMapSelection(prefix, prepared);
+            throw new MapSelectionPendingError(prefix);
+        }
+
+        selectedCandidates = selected.map((entry) => ({
+            name: entry.name,
+            image: entry.image,
+            grid: entry.grid,
+            description: entry.description,
+        }));
+
+        pendingMapSelections.delete(prefix);
+        rememberCompletedMapSelection(prefix, prepared, selectedCandidates);
+    }
+
+    const preparedBySelectionKey = new Map(prepared.map((entry, index) => [entry.selectionKey, index]));
+    const preparedByUploadName = new Map(prepared.map((entry, index) => [entry.uploadName, index]));
+
+    const scale = clampPositiveNumber(options.scale, 1);
+    const spacing = Math.max(0, Math.round(options.spacing ?? 80));
+    const layout = options.layout ?? 'GRID';
+
+    const displayWidths = selectedCandidates.map((entry) => {
+        const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
+        return (entry.image.width * targetDpi / sourceDpi) * scale;
+    });
+    const displayHeights = selectedCandidates.map((entry) => {
+        const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
+        return (entry.image.height * targetDpi / sourceDpi) * scale;
+    });
+    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing);
+
+    if (onProgress) {
+        onProgress(92);
+    }
+
+    return selectedCandidates.map((selectedImage, index) => {
+        const byKeyIndex = selectedImage.description
+            ? preparedBySelectionKey.get(selectedImage.description)
+            : undefined;
+        const byNameIndex = preparedByUploadName.get(selectedImage.name);
+        const sourceMeta =
+            typeof byKeyIndex === 'number'
+                ? prepared[byKeyIndex]
+                : typeof byNameIndex === 'number'
+                    ? prepared[byNameIndex]
+                    : undefined;
+
+        if (!sourceMeta) {
+            console.warn(`No metadata match found for selected map "${selectedImage.name}". Importing without wall data.`);
+        }
+
+        return {
+            displayName: selectedImage.name || sourceMeta?.displayName || `Map ${index + 1}`,
+            metadataMatched: !!sourceMeta,
+            wallData: sourceMeta?.wallData,
+            image: selectedImage.image,
+            grid: selectedImage.grid,
+            position: positions[index],
+        };
+    });
+}
+
+export async function addMapsToCurrentScene(
+    sources: MapImportSource[],
+    options: MultiMapImportOptions = {}
+): Promise<MapWorkflowResult> {
+    if (!sources.length) {
+        throw new Error('Please select at least one map to add.');
+    }
+
+    if (!await OBR.scene.isReady()) {
+        throw new Error('Scene is not ready. Please wait for the scene to finish loading.');
+    }
+
+    const targetDpi = await OBR.scene.grid.getDpi();
+    const scale = clampPositiveNumber(options.scale, 1);
+    const includeWalls = options.includeWalls ?? true;
+    const lockMaps = options.lockMaps ?? true;
+    const prepared = await prepareMapSources(sources, targetDpi, options);
+
+    const spacing = Math.max(0, Math.round(options.spacing ?? 80));
+    let placementOffset: Vector2 = { x: 0, y: 0 };
+    const existingMaps = await OBR.scene.items.getItems((item) => item.layer === 'MAP');
+    if (existingMaps.length > 0) {
+        const bounds = await OBR.scene.items.getItemBounds(existingMaps.map((item) => item.id));
+        const placementMode = options.placement ?? 'RIGHT';
+        if (placementMode === 'BELOW') {
+            placementOffset = {
+                x: bounds.min.x,
+                y: bounds.max.y + spacing,
+            };
+        } else if (placementMode === 'ORIGIN') {
+            placementOffset = { x: 0, y: 0 };
+        } else {
+            placementOffset = {
+                x: bounds.max.x + spacing,
+                y: bounds.min.y,
+            };
+        }
+    }
+
+    const positionedPrepared = prepared.map((entry) => ({
+        ...entry,
+        position: {
+            x: entry.position.x + placementOffset.x,
+            y: entry.position.y + placementOffset.y,
+        },
+    }));
+
+    const mapItems: Item[] = positionedPrepared.map((entry) =>
+        buildImage(entry.image, entry.grid)
+            .name(entry.displayName)
+            .layer('MAP')
+            .position(entry.position)
+            .scale({ x: scale, y: scale })
+            .locked(lockMaps)
+            .visible(true)
+            .build()
+    );
+
+    await addItemsInBatches(mapItems, BATCH_SIZE);
+
+    const unmatchedSelectionNames = positionedPrepared
+        .filter((entry) => !entry.metadataMatched)
+        .map((entry) => entry.displayName);
+
+    if (!includeWalls) {
+        options.onProgress?.(100);
+        return {
+            importedMapCount: positionedPrepared.length,
+            wallsAppliedToMapCount: 0,
+            unmatchedSelectionNames,
+        };
+    }
+
+    const fogItems: Item[] = [];
+    let wallsAppliedToMapCount = 0;
+    for (const entry of positionedPrepared) {
+        if (!entry.wallData) continue;
+        wallsAppliedToMapCount += 1;
+        const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+        fogItems.push(...walls);
+        if (entry.wallData.portals && entry.wallData.portals.length > 0) {
+            const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+            fogItems.push(...doors);
+        }
+    }
+
+    if (fogItems.length > 0) {
+        await addItemsInBatches(fogItems, BATCH_SIZE);
+        await OBR.scene.fog.setFilled(true);
+    }
+
+    options.onProgress?.(100);
+
+    return {
+        importedMapCount: positionedPrepared.length,
+        wallsAppliedToMapCount,
+        unmatchedSelectionNames,
+    };
+}
+
+export async function createSceneWithMultipleMaps(
+    sources: MapImportSource[],
+    options: MultiMapImportOptions = {}
+): Promise<MapWorkflowResult> {
+    if (!sources.length) {
+        throw new Error('Please select at least one map to create a scene.');
+    }
+
+    const targetDpi = 150;
+    const scale = clampPositiveNumber(options.scale, 1);
+    const includeWalls = options.includeWalls ?? true;
+    const lockMaps = options.lockMaps ?? true;
+    const prepared = await prepareMapSources(sources, targetDpi, options);
+
+    const sceneItems: Item[] = prepared.map((entry) =>
+        buildImage(entry.image, entry.grid)
+            .name(entry.displayName)
+            .layer('MAP')
+            .position(entry.position)
+            .scale({ x: scale, y: scale })
+            .locked(lockMaps)
+            .visible(true)
+            .build()
+    );
+
+    let addedWallOrDoorItems = false;
+    let wallsAppliedToMapCount = 0;
+    if (includeWalls) {
+        for (const entry of prepared) {
+            if (!entry.wallData) continue;
+            wallsAppliedToMapCount += 1;
+            const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+            if (walls.length > 0) {
+                addedWallOrDoorItems = true;
+                sceneItems.push(...walls);
+            }
+            if (entry.wallData.portals && entry.wallData.portals.length > 0) {
+                const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                if (doors.length > 0) {
+                    addedWallOrDoorItems = true;
+                    sceneItems.push(...doors);
+                }
+            }
+        }
+    }
+
+    const sceneUpload = buildSceneUpload()
+        .name(options.sceneName?.trim() || 'Multi Map Scene')
+        .gridType('SQUARE')
+        .items(sceneItems)
+        .fogFilled(addedWallOrDoorItems)
+        .build();
+
+    options.onStage?.('Uploading scene');
+    await OBR.assets.uploadScenes([sceneUpload]);
+    options.onProgress?.(100);
+
+    return {
+        importedMapCount: prepared.length,
+        wallsAppliedToMapCount: includeWalls ? wallsAppliedToMapCount : 0,
+        unmatchedSelectionNames: prepared
+            .filter((entry) => !entry.metadataMatched)
+            .map((entry) => entry.displayName),
+    };
+}
+
 export async function preflightVideoCompression(
     fileBlob: Blob,
     options: VideoCompressionOptions = {}
@@ -1592,6 +2220,8 @@ export async function uploadSceneFromVTT(
     // Determine the image type from the base64 data
     const imageType = getImageTypeFromBase64(data.image);
     const imageBlob = new Blob([arrayBuffer], { type: imageType });
+    const sourceDpi = clampPositiveNumber(data.resolution?.pixels_per_grid, 100);
+    const sourceDimensions = await getImageDimensions(imageBlob);
 
     // Configure optimization based on compression mode
     const optimizationOptions: OptimizationOptions = {
@@ -1602,12 +2232,14 @@ export async function uploadSceneFromVTT(
 
     // UVTT data embeds map images, not videos.
     const finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress, onStage);
+    const finalDimensions = await getImageDimensions(finalBlob);
+    const effectiveDpi = getAdjustedDpiAfterResize(sourceDpi, sourceDimensions, finalDimensions);
     const fileExtension = getImageExtensionFromMimeType(finalBlob.type, imageType === 'image/webp' ? 'webp' : 'png');
     const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
 
     // Create and upload just the map as a scene
     const imageUpload = buildImageUpload(imageFile)
-        .dpi(data.resolution.pixels_per_grid)
+        .dpi(effectiveDpi)
         .name(file.name.replace(/\.[^/.]+$/, ""))
         .build();
 
@@ -1676,7 +2308,10 @@ export async function uploadFoundryScene(
             fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
         }
     } else {
+        const sourceDimensions = await getImageDimensions(imageBlob);
         finalBlob = await optimizeImage(imageBlob, optimizationOptions, onProgress, onStage);
+        const finalDimensions = await getImageDimensions(finalBlob);
+        effectiveDpi = getAdjustedDpiAfterResize(vttMapDataSource.resolution.pixels_per_grid, sourceDimensions, finalDimensions);
         fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
     }
     const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
@@ -1707,6 +2342,97 @@ export async function uploadFoundryScene(
 
     const sceneToUpload = sceneBuilder.build();
     await OBR.assets.uploadScenes([sceneToUpload]);
+}
+
+export async function uploadMediaSceneWithWallData(
+    mediaFile: File,
+    wallData: FoundryVTTData | VTTMapData,
+    sceneName?: string,
+    compressionMode: CompressionMode = 'standard',
+    onProgress?: (progress: number) => void,
+    videoOptions?: VideoCompressionOptions,
+    onStage?: (stage: string) => void
+): Promise<void> {
+    if (!isRawMediaFile(mediaFile)) {
+        throw new Error('Wall-data scene creation requires an image or video file.');
+    }
+
+    const vttMapDataSource = isFoundryVTTData(wallData)
+        ? convertFoundryToVTTData(wallData)
+        : wallData;
+
+    const isVideo =
+        mediaFile.type.startsWith('video/') ||
+        /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(mediaFile.name.toLowerCase());
+
+    const sourceDpi = clampPositiveNumber(vttMapDataSource.resolution?.pixels_per_grid, 100);
+    const normalizedName = (sceneName?.trim() || mediaFile.name.replace(/\.[^/.]+$/, '') || 'Scene').trim();
+
+    const optimizationOptions: OptimizationOptions = {
+        compressionMode,
+        maxSizeInMB: compressionMode === 'high' ? 49 : 24,
+        maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+    };
+
+    let finalBlob: Blob = mediaFile;
+    let fileExtension = mediaFile.name.split('.').pop() || (isVideo ? 'mp4' : 'png');
+    let effectiveDpi = sourceDpi;
+
+    if (isVideo) {
+        if (compressionMode !== 'none') {
+            const sizeInMb = mediaFile.size / (1024 * 1024);
+            if (sizeInMb > 500) {
+                throw new VideoCompressionError(
+                    'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                    `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                );
+            }
+
+            const compressed = await compressVideo(mediaFile, compressionMode, onProgress, { ...videoOptions, onStage });
+            finalBlob = compressed.blob;
+            if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
+                effectiveDpi = sourceDpi * (compressed.outputWidth / compressed.sourceWidth);
+            }
+            fileExtension = finalBlob.type.includes('webm') ? 'webm' : 'mp4';
+        }
+    } else {
+        finalBlob = await optimizeImage(mediaFile, optimizationOptions, onProgress, onStage);
+        const sourceDimensions = await getImageDimensions(mediaFile);
+        const finalDimensions = await getImageDimensions(finalBlob);
+        effectiveDpi = getAdjustedDpiAfterResize(sourceDpi, sourceDimensions, finalDimensions);
+        fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
+    }
+
+    const imageFile = new File([finalBlob], `map.${fileExtension}`, { type: finalBlob.type });
+    const imageUpload = buildImageUpload(imageFile)
+        .dpi(effectiveDpi)
+        .name(normalizedName)
+        .build();
+
+    onStage?.('Generating walls and doors');
+
+    const defaultPosition: Vector2 = { x: 0, y: 0 };
+    const defaultScale: Vector2 = { x: 1, y: 1 };
+    const wallItems = await createWallItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    let doorItems: Item[] = [];
+    if (vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
+        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    }
+    const allItems = [...wallItems, ...doorItems];
+
+    let sceneBuilder = buildSceneUpload()
+        .name(normalizedName)
+        .baseMap(imageUpload)
+        .gridType('SQUARE');
+
+    if (allItems.length > 0) {
+        sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
+    }
+
+    onStage?.('Uploading scene');
+    const sceneToUpload = sceneBuilder.build();
+    await OBR.assets.uploadScenes([sceneToUpload]);
+    onProgress?.(100);
 }
 
 const BATCH_SIZE = 75;
