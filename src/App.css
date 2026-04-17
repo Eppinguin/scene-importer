@@ -236,7 +236,8 @@ html, body {
   padding: 8px;
   border-radius: 10px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
+  pointer-events: auto;
+  cursor: pointer;
   border: 1px solid rgba(var(--text-primary-rgb, 255, 255, 255), 0.2);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -253,6 +254,10 @@ html, body {
   max-height: min(74vh, calc(100vh - 40px));
   object-fit: contain;
   border-radius: 6px;
+}
+
+.scene-preview-float.hover-through {
+  pointer-events: none;
 }
 
 @media (min-width: 760px) {

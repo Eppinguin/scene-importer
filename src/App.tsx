@@ -71,6 +71,9 @@ type MapWorkflowRunOptions = {
   resetSelectionCache?: boolean;
 };
 
+const PREVIEW_HOVER_OPEN_DELAY_MS = 500;
+const PREVIEW_TOUCH_OPEN_DELAY_MS = 240;
+
 const showMapWorkflowMismatchWarning = async (
   result: MapWorkflowResult,
 ) => {
@@ -217,6 +220,7 @@ function App() {
     url: string;
     isVideo?: boolean;
   } | null>(null);
+  const [canHoverPreview, setCanHoverPreview] = useState(false);
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [manualDownloadUrl, setManualDownloadUrl] = useState<string | null>(
     null,
@@ -249,6 +253,52 @@ function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const compressionAbortRef = useRef<AbortController | null>(null);
   const heightRafRef = useRef<number | null>(null);
+  const previewOpenTimeoutRef = useRef<number | null>(null);
+  const previewHideTimeoutRef = useRef<number | null>(null);
+  const suppressNextCardClickRef = useRef(false);
+  const previewSourceIndexRef = useRef<number | null>(null);
+  const suppressedPreviewCardIndexRef = useRef<number | null>(null);
+
+  const clearPreviewOpenTimeout = () => {
+    if (previewOpenTimeoutRef.current !== null) {
+      window.clearTimeout(previewOpenTimeoutRef.current);
+      previewOpenTimeoutRef.current = null;
+    }
+  };
+
+  const clearPreviewHideTimeout = () => {
+    if (previewHideTimeoutRef.current !== null) {
+      window.clearTimeout(previewHideTimeoutRef.current);
+      previewHideTimeoutRef.current = null;
+    }
+  };
+
+  const schedulePreviewOpen = (
+    sourceIndex: number,
+    preview: { url: string; isVideo?: boolean },
+    delayMs: number,
+    onShow?: () => void,
+  ) => {
+    if (suppressedPreviewCardIndexRef.current === sourceIndex) return;
+    clearPreviewOpenTimeout();
+    clearPreviewHideTimeout();
+    previewOpenTimeoutRef.current = window.setTimeout(() => {
+      previewSourceIndexRef.current = sourceIndex;
+      setHoveredSceneThumb(preview);
+      previewOpenTimeoutRef.current = null;
+      onShow?.();
+    }, delayMs);
+  };
+
+  const hideHoverPreviewSoon = () => {
+    clearPreviewOpenTimeout();
+    clearPreviewHideTimeout();
+    previewHideTimeoutRef.current = window.setTimeout(() => {
+      setHoveredSceneThumb(null);
+      previewSourceIndexRef.current = null;
+      previewHideTimeoutRef.current = null;
+    }, 140);
+  };
   const selectedSceneIndexesForMode =
     isContextMenuMode || workflowMode === "single-scene"
       ? [selectedSceneIndex]
@@ -331,6 +381,36 @@ function App() {
       setPreferredVideoCodec("auto");
     }
   }, [browserCodecAvailability, preferredVideoCodec]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+
+    const mediaQuery = window.matchMedia("(hover: hover) and (pointer: fine)");
+    const updateCanHover = () => {
+      setCanHoverPreview(mediaQuery.matches);
+    };
+
+    updateCanHover();
+    mediaQuery.addEventListener("change", updateCanHover);
+
+    return () => {
+      mediaQuery.removeEventListener("change", updateCanHover);
+    };
+  }, []);
+
+  useEffect(
+    () => () => {
+      clearPreviewOpenTimeout();
+      clearPreviewHideTimeout();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    clearPreviewOpenTimeout();
+    clearPreviewHideTimeout();
+    setHoveredSceneThumb(null);
+  }, [canHoverPreview]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1845,9 +1925,6 @@ function App() {
 
           {!isContextMenuMode && (
             <Box className="options">
-              <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                Workflow
-              </Typography>
               <FormControl fullWidth size="small">
                 <InputLabel id="workflow-mode-label">Mode</InputLabel>
                 <Select
@@ -1979,6 +2056,13 @@ function App() {
                 </Typography>
                 <div
                   className="scene-gallery"
+                  onClickCapture={() => {
+                    if (!canHoverPreview || !hoveredSceneThumb) return;
+                    suppressedPreviewCardIndexRef.current = previewSourceIndexRef.current;
+                    clearPreviewOpenTimeout();
+                    clearPreviewHideTimeout();
+                    setHoveredSceneThumb(null);
+                  }}
                   onScroll={() => setHoveredSceneThumb(null)}>
                   {availableScenes.map((s, idx) => (
                     <div
@@ -1989,6 +2073,11 @@ function App() {
                         ? "selected"
                         : ""}`}
                       onClick={() => {
+                        if (suppressNextCardClickRef.current) {
+                          suppressNextCardClickRef.current = false;
+                          return;
+                        }
+
                         if (isContextMenuMode || workflowMode === "single-scene") {
                           setSelectedSceneIndex(idx);
                           setSelectedSceneIndices([idx]);
@@ -2005,14 +2094,68 @@ function App() {
                         });
                       }}
                       onMouseEnter={() => {
-                        if (s.thumbUrl) {
-                          setHoveredSceneThumb({
+                        if (!canHoverPreview || !s.thumbUrl) return;
+                        if (suppressedPreviewCardIndexRef.current === idx) return;
+                        const preview = {
+                          url: s.thumbUrl,
+                          isVideo: s.isVideo,
+                        };
+
+                        if (hoveredSceneThumb) {
+                          clearPreviewOpenTimeout();
+                          clearPreviewHideTimeout();
+                          previewSourceIndexRef.current = idx;
+                          setHoveredSceneThumb(preview);
+                          return;
+                        }
+
+                        schedulePreviewOpen(
+                          idx,
+                          preview,
+                          PREVIEW_HOVER_OPEN_DELAY_MS,
+                        );
+                      }}
+                      onMouseLeave={() => {
+                        if (!canHoverPreview) return;
+                        if (suppressedPreviewCardIndexRef.current === idx) {
+                          suppressedPreviewCardIndexRef.current = null;
+                        }
+                        hideHoverPreviewSoon();
+                      }}
+                      onPointerDown={(event) => {
+                        if (canHoverPreview || !s.thumbUrl) return;
+                        if (
+                          event.pointerType !== "touch" &&
+                          event.pointerType !== "pen"
+                        ) {
+                          return;
+                        }
+
+                        schedulePreviewOpen(
+                          idx,
+                          {
                             url: s.thumbUrl,
                             isVideo: s.isVideo,
-                          });
-                        }
+                          },
+                          PREVIEW_TOUCH_OPEN_DELAY_MS,
+                          () => {
+                            suppressNextCardClickRef.current = true;
+                          },
+                        );
                       }}
-                      onMouseLeave={() => setHoveredSceneThumb(null)}>
+                      onPointerUp={() => {
+                        if (canHoverPreview) return;
+                        clearPreviewOpenTimeout();
+                      }}
+                      onPointerCancel={() => {
+                        if (canHoverPreview) return;
+                        clearPreviewOpenTimeout();
+                      }}
+                      onPointerLeave={() => {
+                        if (canHoverPreview) return;
+                        clearPreviewOpenTimeout();
+                      }}
+                      >
                       <div className="scene-thumb-container">
                         {s.isVideo && (
                           <div className="video-badge">
@@ -2191,7 +2334,31 @@ function App() {
           </Stack>
 
           {hoveredSceneThumb && (
-            <div className="scene-preview-float">
+            <div
+              className={`scene-preview-float${canHoverPreview ? " hover-through" : ""}`}
+              role="button"
+              tabIndex={0}
+              onMouseEnter={() => {
+                clearPreviewHideTimeout();
+              }}
+              onMouseLeave={() => {
+                hideHoverPreviewSoon();
+              }}
+              onClick={() => {
+                suppressedPreviewCardIndexRef.current = previewSourceIndexRef.current;
+                clearPreviewOpenTimeout();
+                clearPreviewHideTimeout();
+                setHoveredSceneThumb(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" || event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  suppressedPreviewCardIndexRef.current = previewSourceIndexRef.current;
+                  clearPreviewOpenTimeout();
+                  clearPreviewHideTimeout();
+                  setHoveredSceneThumb(null);
+                }
+              }}>
               {hoveredSceneThumb.isVideo ? (
                 <video
                   src={hoveredSceneThumb.url}
