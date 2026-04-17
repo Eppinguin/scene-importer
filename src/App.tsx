@@ -73,6 +73,7 @@ type MapWorkflowRunOptions = {
 
 const PREVIEW_HOVER_OPEN_DELAY_MS = 500;
 const PREVIEW_TOUCH_OPEN_DELAY_MS = 240;
+const PREVIEW_TOUCH_RELEASE_THRESHOLD_MS = 120;
 
 const showMapWorkflowMismatchWarning = async (
   result: MapWorkflowResult,
@@ -258,6 +259,7 @@ function App() {
   const suppressNextCardClickRef = useRef(false);
   const previewSourceIndexRef = useRef<number | null>(null);
   const suppressedPreviewCardIndexRef = useRef<number | null>(null);
+  const touchPreviewPressStartedAtRef = useRef<number | null>(null);
 
   const clearPreviewOpenTimeout = () => {
     if (previewOpenTimeoutRef.current !== null) {
@@ -2131,6 +2133,8 @@ function App() {
                           return;
                         }
 
+                        touchPreviewPressStartedAtRef.current = Date.now();
+
                         schedulePreviewOpen(
                           idx,
                           {
@@ -2145,14 +2149,40 @@ function App() {
                       }}
                       onPointerUp={() => {
                         if (canHoverPreview) return;
+                        const pressStartedAt = touchPreviewPressStartedAtRef.current;
+                        touchPreviewPressStartedAtRef.current = null;
+
+                        if (!s.thumbUrl || pressStartedAt === null) {
+                          clearPreviewOpenTimeout();
+                          return;
+                        }
+
+                        const elapsedMs = Date.now() - pressStartedAt;
+                        if (
+                          !hoveredSceneThumb &&
+                          elapsedMs >= PREVIEW_TOUCH_RELEASE_THRESHOLD_MS
+                        ) {
+                          clearPreviewOpenTimeout();
+                          clearPreviewHideTimeout();
+                          previewSourceIndexRef.current = idx;
+                          setHoveredSceneThumb({
+                            url: s.thumbUrl,
+                            isVideo: s.isVideo,
+                          });
+                          suppressNextCardClickRef.current = true;
+                          return;
+                        }
+
                         clearPreviewOpenTimeout();
                       }}
                       onPointerCancel={() => {
                         if (canHoverPreview) return;
+                        touchPreviewPressStartedAtRef.current = null;
                         clearPreviewOpenTimeout();
                       }}
                       onPointerLeave={() => {
                         if (canHoverPreview) return;
+                        touchPreviewPressStartedAtRef.current = null;
                         clearPreviewOpenTimeout();
                       }}
                       >
