@@ -75,15 +75,12 @@ const PREVIEW_HOVER_OPEN_DELAY_MS = 500;
 const PREVIEW_TOUCH_OPEN_DELAY_MS = 240;
 const PREVIEW_TOUCH_RELEASE_THRESHOLD_MS = 120;
 
-const showMapWorkflowMismatchWarning = async (
-  result: MapWorkflowResult,
-) => {
+const showMapWorkflowMismatchWarning = async (result: MapWorkflowResult) => {
   if (result.unmatchedSelectionNames.length === 0) return;
 
   const unmatchedCount = result.unmatchedSelectionNames.length;
   const preview = result.unmatchedSelectionNames.slice(0, 3).join(", ");
-  const moreSuffix =
-    unmatchedCount > 3 ? ` (+${unmatchedCount - 3} more)` : "";
+  const moreSuffix = unmatchedCount > 3 ? ` (+${unmatchedCount - 3} more)` : "";
 
   await OBR.notification.show(
     `${unmatchedCount} selected map(s) did not match uploaded metadata, so walls/doors were skipped for those maps. ${preview}${moreSuffix}`,
@@ -121,9 +118,7 @@ function isRawMediaFile(file: File): boolean {
   return (
     file.type.startsWith("image/") ||
     file.type.startsWith("video/") ||
-    /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(
-      lowerName,
-    )
+    /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(lowerName)
   );
 }
 
@@ -199,8 +194,9 @@ function App() {
   const isContextMenuMode =
     new URLSearchParams(window.location.search).get("context") === "true";
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [selectedWallDataFile, setSelectedWallDataFile] =
-    useState<File | null>(null);
+  const [selectedWallDataFile, setSelectedWallDataFile] = useState<File | null>(
+    null,
+  );
   const [selectedWallData, setSelectedWallData] =
     useState<CompanionWallData | null>(null);
   const [selectedRawFiles, setSelectedRawFiles] = useState<File[]>([]);
@@ -212,19 +208,22 @@ function App() {
     [],
   );
   const [layoutMode, setLayoutMode] = useState<MapLayoutMode>("GRID");
-  const [mapPlacementMode, setMapPlacementMode] = useState<MapPlacementMode>("RIGHT");
+  const [mapPlacementMode, setMapPlacementMode] =
+    useState<MapPlacementMode>("RIGHT");
   const [layoutSpacing, setLayoutSpacing] = useState("80");
   const [layoutScalePercent, setLayoutScalePercent] = useState("100");
   const [includeWallsWithMaps, setIncludeWallsWithMaps] = useState(true);
   const [lockImportedMaps, setLockImportedMaps] = useState(true);
-  const [showMapLayoutOptions, setShowMapLayoutOptions] = useState(false);
-  const [showAdvancedLayoutOptions, setShowAdvancedLayoutOptions] = useState(false);
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+  const [importWallsOnlyMode, setImportWallsOnlyMode] = useState(false);
   const [multiSceneName, setMultiSceneName] = useState("Multi Map Scene");
   const [pendingMapSelection, setPendingMapSelection] = useState<{
     token: string;
     action: PendingMapSelectionAction;
   } | null>(null);
-  const [mapSelectionToken, setMapSelectionToken] = useState<string | null>(null);
+  const [mapSelectionToken, setMapSelectionToken] = useState<string | null>(
+    null,
+  );
   const [lastMapWorkflowAction, setLastMapWorkflowAction] =
     useState<PendingMapSelectionAction | null>(null);
 
@@ -242,15 +241,14 @@ function App() {
   const [hasImage, setHasImage] = useState(false);
   const [compressionMode, setCompressionMode] =
     useState<CompressionMode>("standard");
-  const [showAdvancedVideoOptions, setShowAdvancedVideoOptions] =
-    useState(false);
   const [preferredVideoCodec, setPreferredVideoCodec] =
     useState<VideoCodecPreference>("auto");
   const [browserCodecAvailability, setBrowserCodecAvailability] =
     useState<BrowserVideoCodecAvailability | null>(null);
   const [removeVideoAudio, setRemoveVideoAudio] = useState(false);
   const [forceVideoTranscode, setForceVideoTranscode] = useState(false);
-  const [maxVideoDimension, setMaxVideoDimension] = useState<string>("");
+  const [maxResolutionDimension, setMaxResolutionDimension] =
+    useState<string>("");
   const [isVideoCompressionSupported, setIsVideoCompressionSupported] =
     useState(true);
   const [videoCompressionSupportMessage, setVideoCompressionSupportMessage] =
@@ -312,20 +310,22 @@ function App() {
       previewHideTimeoutRef.current = null;
     }, 140);
   };
-  const selectedSceneIndexes =
-    isContextMenuMode
-      ? [selectedSceneIndex]
-      : selectedSceneIndices.length > 0
-        ? selectedSceneIndices
-        : [selectedSceneIndex];
+  const selectedSceneIndexes = isContextMenuMode
+    ? [selectedSceneIndex]
+    : selectedSceneIndices.length > 0
+      ? selectedSceneIndices
+      : [selectedSceneIndex];
   const selectedScenes = selectedSceneIndexes
     .map((idx) => availableScenes[idx])
     .filter((scene): scene is SceneInfo => !!scene);
   const hasRawMediaSources =
-    selectedRawFiles.length > 0 || (!!selectedFile && isRawMediaFile(selectedFile));
+    selectedRawFiles.length > 0 ||
+    (!!selectedFile && isRawMediaFile(selectedFile));
   const hasArchiveMapSources =
     availableScenes.length > 0 &&
-    selectedScenes.some((scene) => !!(scene.data.img || scene.data.background?.src));
+    selectedScenes.some(
+      (scene) => !!(scene.data.img || scene.data.background?.src),
+    );
   const hasCompanionWallData = !!selectedWallData;
   const hasMapWorkflowSources = hasArchiveMapSources || hasRawMediaSources;
   const selectedSceneHasWallData =
@@ -333,7 +333,9 @@ function App() {
     selectedScenes.some((scene) => sceneHasWallData(scene.data));
   const selectedSceneHasMap =
     availableScenes.length === 0 ||
-    selectedScenes.some((scene) => !!(scene.data.img || scene.data.background?.src));
+    selectedScenes.some(
+      (scene) => !!(scene.data.img || scene.data.background?.src),
+    );
   const selectedSceneIsVideo = selectedScenes.some((scene) => !!scene.isVideo);
   const selectedFileIsVideo =
     !!selectedFile &&
@@ -369,18 +371,19 @@ function App() {
     (hasImage || (!!selectedFile && selectedWallData));
   const shouldUseMultiMapSceneCreation =
     !isContextMenuMode && hasMapWorkflowSources && selectedSourceCount > 1;
+  const shouldShowLayoutControls =
+    !isContextMenuMode && hasMapWorkflowSources && selectedSourceCount > 1;
+  const shouldShowPlacementControl =
+    !isContextMenuMode && hasMapWorkflowSources;
+  const hasMixedMapAndWallSources =
+    hasMapWorkflowSources && hasWallImportSources;
+  const canUseWallsOnlyMode = !isContextMenuMode && hasMixedMapAndWallSources;
   const useMultiSceneSelectionLabel =
     !isContextMenuMode && selectedSceneIndices.length > 1;
   const shouldPreferWallImportForCurrent =
-    (hasCompanionWallData && !hasRawMediaSources) ||
-    !hasMapWorkflowSources;
-  const shouldShowMapLayoutOptions =
-    !isContextMenuMode &&
-    hasMapWorkflowSources &&
-    (showMapLayoutOptions ||
-      selectedSourceCount > 1 ||
-      pendingMapSelection !== null ||
-      mapSelectionToken !== null);
+    (hasCompanionWallData && !hasRawMediaSources) || !hasMapWorkflowSources;
+  const showWallsOnlyActionButton =
+    !isContextMenuMode && hasWallImportSources && !hasMapWorkflowSources;
   const videoCompressionBlocked =
     selectedInputIsVideo && !isVideoCompressionSupported;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
@@ -457,6 +460,11 @@ function App() {
 
   useEffect(() => {
     let isMounted = true;
+    const parsedMaxDimension = Number(maxResolutionDimension);
+    const preflightOptions =
+      Number.isFinite(parsedMaxDimension) && parsedMaxDimension > 0
+        ? { maxDimension: parsedMaxDimension }
+        : undefined;
 
     const setSupported = () => {
       if (!isMounted) return;
@@ -478,7 +486,12 @@ function App() {
 
       if (availableScenes.length > 0) {
         const scene = selectedScenes.find((candidate) => candidate.isVideo);
-        if (!scene || !scene.isVideo || !zipObject || !isFoundryVTTData(scene.data)) {
+        if (
+          !scene ||
+          !scene.isVideo ||
+          !zipObject ||
+          !isFoundryVTTData(scene.data)
+        ) {
           setSupported();
           return;
         }
@@ -501,6 +514,7 @@ function App() {
           } else {
             const preflight = await preflightVideoCompression(
               mediaBlob,
+              preflightOptions,
             );
             if (!isMounted) return;
             if (!preflight.supported) {
@@ -542,6 +556,7 @@ function App() {
       } else {
         const preflight = await preflightVideoCompression(
           primaryMediaFile,
+          preflightOptions,
         );
         if (!isMounted) return;
         if (!preflight.supported) {
@@ -568,6 +583,7 @@ function App() {
     selectedRawFiles,
     selectedFileIsVideo,
     selectedInputIsVideo,
+    maxResolutionDimension,
     zipObject,
   ]);
 
@@ -675,19 +691,26 @@ function App() {
     }
 
     if (availableScenes.length > 0) {
-      setHasImage(selectedScenes.some((scene) => !!(scene.data.img || scene.data.background?.src)));
+      setHasImage(
+        selectedScenes.some(
+          (scene) => !!(scene.data.img || scene.data.background?.src),
+        ),
+      );
     }
   }, [availableScenes, selectedScenes, selectedRawFiles, hasImage]);
 
   useEffect(() => {
-    if (!hasMapWorkflowSources) {
-      if (showMapLayoutOptions) setShowMapLayoutOptions(false);
-      if (showAdvancedLayoutOptions) setShowAdvancedLayoutOptions(false);
+    if (!hasMapWorkflowSources && showAdvancedOptions) {
+      setShowAdvancedOptions(false);
+    }
+    if (!canUseWallsOnlyMode && importWallsOnlyMode) {
+      setImportWallsOnlyMode(false);
     }
   }, [
     hasMapWorkflowSources,
-    showMapLayoutOptions,
-    showAdvancedLayoutOptions,
+    showAdvancedOptions,
+    canUseWallsOnlyMode,
+    importWallsOnlyMode,
   ]);
 
   // Set theme CSS variables when theme changes
@@ -1448,7 +1471,7 @@ function App() {
   const buildVideoCompressionOptions = (
     abortSignal?: AbortSignal,
   ): VideoCompressionOptions => {
-    const parsedMaxDimension = Number(maxVideoDimension);
+    const parsedMaxDimension = Number(maxResolutionDimension);
     return {
       preferredCodec: preferredVideoCodec,
       keepAudio: !removeVideoAudio,
@@ -1512,7 +1535,7 @@ function App() {
       preferredVideoCodec,
       removeVideoAudio,
       forceVideoTranscode,
-      maxVideoDimension,
+      maxResolutionDimension,
     });
   };
 
@@ -1554,15 +1577,18 @@ function App() {
         selectedWallData && mediaFiles.length === 1 && file === selectedFile
           ? selectedWallData
           : undefined;
+      const wallData = companionData
+        ? isFoundryVTTData(companionData)
+          ? convertFoundryToVTTData(companionData)
+          : companionData
+        : undefined;
+      const sourceDpi = wallData?.resolution?.pixels_per_grid ?? 100;
+
       sources.push({
         name: file.name,
         mediaBlob: file,
-        dpi: 100,
-        wallData: companionData
-          ? isFoundryVTTData(companionData)
-            ? convertFoundryToVTTData(companionData)
-            : companionData
-          : undefined,
+        dpi: sourceDpi,
+        wallData,
       });
     }
 
@@ -1770,6 +1796,11 @@ function App() {
   };
 
   const handleImportToCurrentScene = () => {
+    if (importWallsOnlyMode && canUseWallsOnlyMode) {
+      void handleAddWallsToCurrentScene();
+      return;
+    }
+
     if (shouldPreferWallImportForCurrent && hasWallImportSources) {
       void handleAddWallsToCurrentScene();
       return;
@@ -1912,7 +1943,7 @@ function App() {
       ) {
         OBR.notification.show(
           toNotificationMessage(
-            "This browser could not finish video compression in time. Try a browser/device with hardware-accelerated video encoding, or lower Max video dimension.",
+            "This browser could not finish video compression in time. Try a browser/device with hardware-accelerated video encoding, or lower Max resolution.",
           ),
           "WARNING",
         );
@@ -1924,8 +1955,8 @@ function App() {
       ) {
         const hint =
           compressionMode === "high"
-            ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max video dimension in Advanced options."
-            : "Try reducing Max video dimension in Advanced options or using H.264 codec.";
+            ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max resolution in Advanced settings."
+            : "Try reducing Max resolution in Advanced settings or using H.264 codec.";
         const suffix = message.endsWith(".") ? "" : ".";
         OBR.notification.show(
           toNotificationMessage(`${message}${suffix} ${hint}`),
@@ -1964,7 +1995,7 @@ function App() {
           spacing: getLayoutSpacing(),
           scale: getLayoutScale(),
           placement: "ORIGIN",
-        });          
+        });
 
         await showMapWorkflowMismatchWarning(result);
 
@@ -2140,15 +2171,20 @@ function App() {
                     : `Select Maps (${selectedScenes.length}/${availableScenes.length})`}
                 </Typography>
                 {!isContextMenuMode && availableScenes.length > 1 && (
-                  <Typography variant="caption" className="help-text" sx={{ mb: 0.5 }}>
-                    Click to select one map. Hold Shift to select a range. Hold Cmd/Ctrl and click to toggle selection.
+                  <Typography
+                    variant="caption"
+                    className="help-text"
+                    sx={{ mb: 0.5 }}>
+                    Click to select one map. Hold Shift to select a range. Hold
+                    Cmd/Ctrl and click to toggle selection.
                   </Typography>
                 )}
                 <div
                   className="scene-gallery"
                   onClickCapture={() => {
                     if (!canHoverPreview || !hoveredSceneThumb) return;
-                    suppressedPreviewCardIndexRef.current = previewSourceIndexRef.current;
+                    suppressedPreviewCardIndexRef.current =
+                      previewSourceIndexRef.current;
                     clearPreviewOpenTimeout();
                     clearPreviewHideTimeout();
                     setHoveredSceneThumb(null);
@@ -2157,11 +2193,15 @@ function App() {
                   {availableScenes.map((s, idx) => (
                     <div
                       key={idx}
-                      className={`scene-card ${(isContextMenuMode
-                        ? selectedSceneIndex === idx
-                        : selectedSceneIndices.includes(idx))
-                        ? "selected"
-                        : ""}`}
+                      className={`scene-card ${
+                        (
+                          isContextMenuMode
+                            ? selectedSceneIndex === idx
+                            : selectedSceneIndices.includes(idx)
+                        )
+                          ? "selected"
+                          : ""
+                      }`}
                       onClick={(event) => {
                         if (suppressNextCardClickRef.current) {
                           suppressNextCardClickRef.current = false;
@@ -2219,7 +2259,8 @@ function App() {
                       }}
                       onMouseEnter={() => {
                         if (!canHoverPreview || !s.thumbUrl) return;
-                        if (suppressedPreviewCardIndexRef.current === idx) return;
+                        if (suppressedPreviewCardIndexRef.current === idx)
+                          return;
                         const preview = {
                           url: s.thumbUrl,
                           isVideo: s.isVideo,
@@ -2271,7 +2312,8 @@ function App() {
                       }}
                       onPointerUp={() => {
                         if (canHoverPreview) return;
-                        const pressStartedAt = touchPreviewPressStartedAtRef.current;
+                        const pressStartedAt =
+                          touchPreviewPressStartedAtRef.current;
                         touchPreviewPressStartedAtRef.current = null;
 
                         if (!s.thumbUrl || pressStartedAt === null) {
@@ -2306,8 +2348,7 @@ function App() {
                         if (canHoverPreview) return;
                         touchPreviewPressStartedAtRef.current = null;
                         clearPreviewOpenTimeout();
-                      }}
-                      >
+                      }}>
                       <div className="scene-thumb-container">
                         {s.isVideo && (
                           <div className="video-badge">
@@ -2354,152 +2395,6 @@ function App() {
                 </div>
               </Box>
             )}
-
-            {!isContextMenuMode &&
-              hasMapWorkflowSources &&
-              selectedSourceCount <= 1 && (
-                <Button
-                  onClick={() =>
-                    setShowMapLayoutOptions((previous) => !previous)
-                  }
-                  disabled={isLoading}
-                  variant="text"
-                  size="small"
-                  sx={{ alignSelf: "flex-start", px: 0.5 }}>
-                  {showMapLayoutOptions
-                    ? "Hide map layout options"
-                    : "Show map layout options"}
-                </Button>
-              )}
-
-            {shouldShowMapLayoutOptions && (
-              <Box className="options section-gap">
-                <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  Map Layout Options
-                </Typography>
-                <Stack spacing={1}>
-                  <Typography variant="caption" className="help-text">
-                    Selected sources: {selectedSourceCount}
-                    {pendingMapSelection ? " - selection pending" : ""}
-                  </Typography>
-
-                  {shouldUseMultiMapSceneCreation && (
-                    <TextField
-                      label="New Scene Name"
-                      value={multiSceneName}
-                      onChange={(e) => setMultiSceneName(e.target.value)}
-                      size="small"
-                      fullWidth
-                      disabled={isLoading}
-                    />
-                  )}
-
-                  <FormControl fullWidth size="small">
-                    <InputLabel id="layout-mode-label">Layout</InputLabel>
-                    <Select
-                      labelId="layout-mode-label"
-                      label="Layout"
-                      value={layoutMode}
-                      onChange={(e) =>
-                        setLayoutMode(e.target.value as MapLayoutMode)
-                      }
-                      disabled={isLoading}>
-                      <MenuItem value="GRID">Grid (auto columns)</MenuItem>
-                      <MenuItem value="ROW">Single row</MenuItem>
-                      <MenuItem value="COLUMN">Single column</MenuItem>
-                      <MenuItem value="STACK">Stacked on top of each other</MenuItem>
-                    </Select>
-                  </FormControl>
-
-                  <Button
-                    onClick={() => setShowAdvancedLayoutOptions(!showAdvancedLayoutOptions)}
-                    disabled={isLoading}
-                    variant="text"
-                    size="small"
-                    sx={{ alignSelf: "flex-start", px: 0.5 }}>
-                    {showAdvancedLayoutOptions
-                      ? "Hide advanced layout options"
-                      : "Show advanced layout options"}
-                  </Button>
-
-                  {showAdvancedLayoutOptions && (
-                    <Stack className="advanced-layout-options" spacing={1}>
-                      {hasMapWorkflowSources && (
-                        <FormControl fullWidth size="small">
-                          <InputLabel id="placement-mode-label">
-                           Map Placement
-                          </InputLabel>
-                          <Select
-                            labelId="placement-mode-label"
-                            label="Placement"
-                            value={mapPlacementMode}
-                            onChange={(e) =>
-                              setMapPlacementMode(e.target.value as MapPlacementMode)
-                            }
-                            disabled={isLoading}>
-                            <MenuItem value="RIGHT">
-                              Place Right of Existing
-                            </MenuItem>
-                            <MenuItem value="BELOW">
-                              Place Below Existing
-                            </MenuItem>
-                            <MenuItem value="ORIGIN">Place at Origin</MenuItem>
-                          </Select>
-                        </FormControl>
-                      )}
-
-                      <TextField
-                        type="number"
-                        label="Spacing (px)"
-                        value={layoutSpacing}
-                        onChange={(e) => setLayoutSpacing(e.target.value)}
-                        inputProps={{ min: 0, step: 1 }}
-                        size="small"
-                        fullWidth
-                        disabled={isLoading}
-                      />
-
-                      <TextField
-                        type="number"
-                        label="Scale (%)"
-                        value={layoutScalePercent}
-                        onChange={(e) => setLayoutScalePercent(e.target.value)}
-                        inputProps={{ min: 10, step: 5 }}
-                        size="small"
-                        fullWidth
-                        disabled={isLoading}
-                      />
-
-                      <FormControlLabel
-                        control={
-                          <Checkbox
-                            size="small"
-                            checked={includeWallsWithMaps}
-                            onChange={(e) =>
-                              setIncludeWallsWithMaps(e.target.checked)
-                            }
-                            disabled={isLoading}
-                          />
-                        }
-                        label="Include walls/doors when available"
-                      />
-
-                      <FormControlLabel
-                        control={
-                          <Checkbox
-                            size="small"
-                            checked={lockImportedMaps}
-                            onChange={(e) => setLockImportedMaps(e.target.checked)}
-                            disabled={isLoading}
-                          />
-                        }
-                        label="Lock placed maps"
-                      />
-                    </Stack>
-                  )}
-                </Stack>
-              </Box>
-            )}
           </Stack>
 
           {hoveredSceneThumb && (
@@ -2514,15 +2409,21 @@ function App() {
                 hideHoverPreviewSoon();
               }}
               onClick={() => {
-                suppressedPreviewCardIndexRef.current = previewSourceIndexRef.current;
+                suppressedPreviewCardIndexRef.current =
+                  previewSourceIndexRef.current;
                 clearPreviewOpenTimeout();
                 clearPreviewHideTimeout();
                 setHoveredSceneThumb(null);
               }}
               onKeyDown={(event) => {
-                if (event.key === "Escape" || event.key === "Enter" || event.key === " ") {
+                if (
+                  event.key === "Escape" ||
+                  event.key === "Enter" ||
+                  event.key === " "
+                ) {
                   event.preventDefault();
-                  suppressedPreviewCardIndexRef.current = previewSourceIndexRef.current;
+                  suppressedPreviewCardIndexRef.current =
+                    previewSourceIndexRef.current;
                   clearPreviewOpenTimeout();
                   clearPreviewHideTimeout();
                   setHoveredSceneThumb(null);
@@ -2561,7 +2462,9 @@ function App() {
                     }
                     disabled={isLoading}>
                     <MenuItem value="none">No Compression</MenuItem>
-                    <MenuItem value="standard" disabled={videoCompressionBlocked}>
+                    <MenuItem
+                      value="standard"
+                      disabled={videoCompressionBlocked}>
                       {selectedInputIsVideo
                         ? "Nestling (Max 50MB)"
                         : "Nestling / Fledgeling (Max 25MB)"}
@@ -2575,7 +2478,10 @@ function App() {
                 </FormControl>
 
                 {videoCompressionBlocked && videoCompressionSupportMessage && (
-                  <Typography variant="caption" className="help-text" color="warning.main">
+                  <Typography
+                    variant="caption"
+                    className="help-text"
+                    color="warning.main">
                     {videoCompressionSupportMessage}
                   </Typography>
                 )}
@@ -2605,23 +2511,181 @@ function App() {
                   )}
                 </Box>
 
-                {selectedInputIsVideo && (
-                  <>
-                    <Button
-                      onClick={() =>
-                        setShowAdvancedVideoOptions(!showAdvancedVideoOptions)
-                      }
-                      disabled={isLoading || videoCompressionBlocked}
-                      variant="text"
-                      size="small"
-                      sx={{ alignSelf: "flex-start", px: 0.5 }}>
-                      {showAdvancedVideoOptions
-                        ? "Hide advanced video options"
-                        : "Show advanced video options"}
-                    </Button>
+                <Button
+                  onClick={() =>
+                    setShowAdvancedOptions((previous) => !previous)
+                  }
+                  disabled={isLoading}
+                  variant="text"
+                  size="small"
+                  sx={{ alignSelf: "flex-start", px: 0.5 }}>
+                  {showAdvancedOptions
+                    ? "Hide advanced settings"
+                    : "Show advanced settings"}
+                </Button>
 
-                    {showAdvancedVideoOptions && (
-                      <Stack className="advanced-video-options" spacing={1}>
+                {showAdvancedOptions && (
+                  <Stack className="advanced-video-options" spacing={1}>
+                    <Typography variant="caption" className="help-text">
+                      Selected sources: {selectedSourceCount}
+                      {pendingMapSelection ? " - selection pending" : ""}
+                    </Typography>
+
+                    {shouldUseMultiMapSceneCreation && (
+                      <TextField
+                        label="New Scene Name"
+                        value={multiSceneName}
+                        onChange={(e) => setMultiSceneName(e.target.value)}
+                        size="small"
+                        fullWidth
+                        disabled={isLoading}
+                      />
+                    )}
+
+                    {shouldShowPlacementControl && (
+                      <FormControl fullWidth size="small">
+                        <InputLabel id="placement-mode-label">
+                          Map Placement
+                        </InputLabel>
+                        <Select
+                          labelId="placement-mode-label"
+                          label="Map Placement"
+                          value={mapPlacementMode}
+                          onChange={(e) =>
+                            setMapPlacementMode(
+                              e.target.value as MapPlacementMode,
+                            )
+                          }
+                          disabled={isLoading}>
+                          <MenuItem value="RIGHT">
+                            Place right of existing
+                          </MenuItem>
+                          <MenuItem value="BELOW">
+                            Place below existing
+                          </MenuItem>
+                          <MenuItem value="ORIGIN">Place at origin</MenuItem>
+                        </Select>
+                      </FormControl>
+                    )}
+
+                    {shouldShowLayoutControls && (
+                      <>
+                        <FormControl fullWidth size="small">
+                          <InputLabel id="layout-mode-label">Layout</InputLabel>
+                          <Select
+                            labelId="layout-mode-label"
+                            label="Layout"
+                            value={layoutMode}
+                            onChange={(e) =>
+                              setLayoutMode(e.target.value as MapLayoutMode)
+                            }
+                            disabled={isLoading}>
+                            <MenuItem value="GRID">
+                              Grid (auto columns)
+                            </MenuItem>
+                            <MenuItem value="ROW">Single row</MenuItem>
+                            <MenuItem value="COLUMN">Single column</MenuItem>
+                            <MenuItem value="STACK">
+                              Stacked on top of each other
+                            </MenuItem>
+                          </Select>
+                        </FormControl>
+
+                        <TextField
+                          type="number"
+                          label="Spacing (px)"
+                          value={layoutSpacing}
+                          onChange={(e) => setLayoutSpacing(e.target.value)}
+                          inputProps={{ min: 0, step: 1 }}
+                          size="small"
+                          fullWidth
+                          disabled={isLoading}
+                        />
+
+                        <TextField
+                          type="number"
+                          label="Scale (%)"
+                          value={layoutScalePercent}
+                          onChange={(e) =>
+                            setLayoutScalePercent(e.target.value)
+                          }
+                          inputProps={{ min: 10, step: 5 }}
+                          size="small"
+                          fullWidth
+                          disabled={isLoading}
+                        />
+                      </>
+                    )}
+
+                    {hasMapWorkflowSources && (
+                      <>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              size="small"
+                              checked={includeWallsWithMaps}
+                              onChange={(e) =>
+                                setIncludeWallsWithMaps(e.target.checked)
+                              }
+                              disabled={isLoading}
+                            />
+                          }
+                          label="Include walls/doors when available"
+                        />
+
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              size="small"
+                              checked={lockImportedMaps}
+                              onChange={(e) =>
+                                setLockImportedMaps(e.target.checked)
+                              }
+                              disabled={isLoading}
+                            />
+                          }
+                          label="Lock placed maps"
+                        />
+                      </>
+                    )}
+
+                    {canUseWallsOnlyMode && (
+                      <FormControlLabel
+                        control={
+                          <Checkbox
+                            size="small"
+                            checked={importWallsOnlyMode}
+                            onChange={(e) =>
+                              setImportWallsOnlyMode(e.target.checked)
+                            }
+                            disabled={isLoading}
+                          />
+                        }
+                        label="Import walls only (skip map upload)"
+                      />
+                    )}
+
+                    <TextField
+                      type="number"
+                      label="Max resolution (optional)"
+                      inputProps={{ min: 0, step: 1 }}
+                      value={maxResolutionDimension}
+                      onChange={(e) =>
+                        setMaxResolutionDimension(e.target.value)
+                      }
+                      placeholder="e.g. 1920"
+                      disabled={isLoading || videoCompressionBlocked}
+                      size="small"
+                      fullWidth
+                    />
+
+                    <Typography variant="caption" className="help-text">
+                      Limits the longest side in pixels for both images and
+                      videos. Leave empty to keep original resolution.
+                    </Typography>
+
+                    {selectedInputIsVideo && (
+                      <>
                         <FormControl fullWidth size="small">
                           <InputLabel id="video-codec-label">
                             Preferred Video Codec
@@ -2652,22 +2716,34 @@ function App() {
                             </MenuItem>
                             <MenuItem
                               value="av1"
-                              disabled={!!browserCodecAvailability && !browserCodecAvailability.av1}>
-                              {browserCodecAvailability && !browserCodecAvailability.av1
+                              disabled={
+                                !!browserCodecAvailability &&
+                                !browserCodecAvailability.av1
+                              }>
+                              {browserCodecAvailability &&
+                              !browserCodecAvailability.av1
                                 ? "AV1 (not available in current browser)"
                                 : "AV1 (maximum compression)"}
                             </MenuItem>
                             <MenuItem
                               value="h265"
-                              disabled={!!browserCodecAvailability && !browserCodecAvailability.h265}>
-                              {browserCodecAvailability && !browserCodecAvailability.h265
+                              disabled={
+                                !!browserCodecAvailability &&
+                                !browserCodecAvailability.h265
+                              }>
+                              {browserCodecAvailability &&
+                              !browserCodecAvailability.h265
                                 ? "H.265/HEVC (not available in current browser)"
                                 : "H.265/HEVC (high efficiency)"}
                             </MenuItem>
                             <MenuItem
                               value="h264"
-                              disabled={!!browserCodecAvailability && !browserCodecAvailability.h264}>
-                              {browserCodecAvailability && !browserCodecAvailability.h264
+                              disabled={
+                                !!browserCodecAvailability &&
+                                !browserCodecAvailability.h264
+                              }>
+                              {browserCodecAvailability &&
+                              !browserCodecAvailability.h264
                                 ? "H.264 (not available in current browser)"
                                 : "H.264 (maximum compatibility)"}
                             </MenuItem>
@@ -2714,26 +2790,9 @@ function App() {
                           }
                           label="Transcode anyway when already under size limit"
                         />
-
-                        <TextField
-                          type="number"
-                          label="Max video dimension (optional)"
-                          inputProps={{ min: 0, step: 1 }}
-                          value={maxVideoDimension}
-                          onChange={(e) => setMaxVideoDimension(e.target.value)}
-                          placeholder="e.g. 1920"
-                          disabled={isLoading || videoCompressionBlocked}
-                          size="small"
-                          fullWidth
-                        />
-
-                        <Typography variant="caption" className="help-text">
-                          Limits the longest side in pixels (for example 1920).
-                          Leave empty to keep original resolution.
-                        </Typography>
-                      </Stack>
+                      </>
                     )}
-                  </>
+                  </Stack>
                 )}
               </Stack>
             </Box>
@@ -2783,7 +2842,9 @@ function App() {
                   size="small"
                   sx={{ minWidth: "auto", px: 1 }}
                   onClick={() =>
-                    runMapWorkflowFromSelectionState({ forceSelectionPrompt: true })
+                    runMapWorkflowFromSelectionState({
+                      forceSelectionPrompt: true,
+                    })
                   }
                   disabled={isLoading || !mapSelectionToken}>
                   Re-select
@@ -2793,7 +2854,9 @@ function App() {
                   size="small"
                   sx={{ minWidth: "auto", px: 1 }}
                   onClick={() =>
-                    runMapWorkflowFromSelectionState({ resetSelectionCache: true })
+                    runMapWorkflowFromSelectionState({
+                      resetSelectionCache: true,
+                    })
                   }
                   disabled={
                     isLoading ||
@@ -2820,31 +2883,10 @@ function App() {
             spacing={1}>
             {!isContextMenuMode && uploadProgress === null && (
               <Button
-                onClick={handleImportToCurrentScene}
+                onClick={handleCreateSceneDestination}
                 variant="contained"
                 disabled={
-                  isLoading ||
-                  uploadProgress !== null ||
-                  !canImportToCurrentScene
-                }>
-                {uploadProgress !== null
-                  ? `Compressing… ${uploadProgress}%`
-                  : isLoading
-                    ? "Uploading..."
-                    : pendingMapSelection?.action === "add-current"
-                      ? "Continue Import to Current Scene"
-                      : "Import to Current Scene"}
-              </Button>
-            )}
-
-            {!isContextMenuMode && uploadProgress === null && (
-              <Button
-                onClick={handleCreateSceneDestination}
-                variant="outlined"
-                disabled={
-                  isLoading ||
-                  uploadProgress !== null ||
-                  !canCreateNewScene
+                  isLoading || uploadProgress !== null || !canCreateNewScene
                 }>
                 {!hasImage
                   ? "Create New Scene (No Map Image)"
@@ -2854,9 +2896,30 @@ function App() {
               </Button>
             )}
 
+            {!isContextMenuMode && uploadProgress === null && (
+              <Button
+                onClick={handleImportToCurrentScene}
+                variant="outlined"
+                disabled={
+                  isLoading ||
+                  uploadProgress !== null ||
+                  !canImportToCurrentScene
+                }>
+                {uploadProgress !== null
+                  ? `Compressing… ${uploadProgress}%`
+                  : isLoading
+                    ? "Uploading..."
+                    : importWallsOnlyMode && canUseWallsOnlyMode
+                      ? "Import Walls Only to Current Scene"
+                      : pendingMapSelection?.action === "add-current"
+                        ? "Continue Import to Current Scene"
+                        : "Import to Current Scene"}
+              </Button>
+            )}
+
             {!isContextMenuMode &&
               uploadProgress === null &&
-              hasWallImportSources && (
+              showWallsOnlyActionButton && (
                 <Button
                   onClick={handleAddWallsToCurrentScene}
                   variant="text"

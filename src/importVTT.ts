@@ -257,6 +257,7 @@ interface OptimizationOptions {
     compressionMode?: CompressionMode;
     maxSizeInMB?: number;
     maxMegapixels?: number;
+    maxDimension?: number;
 }
 
 function getImageExtensionFromMimeType(mimeType: string, fallback: string): string {
@@ -355,12 +356,14 @@ async function optimizeImage(
         maxSizeInMB = 24, // Default to slightly under 25MB for safety
         maxMegapixels = compressionMode === 'standard' ? 67 : 144
     } = options;
+    const maxDimension = Number(options.maxDimension);
+    const hasMaxDimensionCap = Number.isFinite(maxDimension) && maxDimension > 0;
     const maxSizeInBytes = maxSizeInMB * 1024 * 1024;
     reportStage('Loading image');
     reportProgress(2);
 
     // If no compression is requested and the image is under the maximum size, return it as is
-    if (compressionMode === 'none' && imageBlob.size <= maxSizeInBytes) {
+    if (compressionMode === 'none' && imageBlob.size <= maxSizeInBytes && !hasMaxDimensionCap) {
         reportStage('Using original image');
         reportProgress(100);
         return imageBlob;
@@ -379,6 +382,12 @@ async function optimizeImage(
             // Start with original dimensions
             let width = img.width;
             let height = img.height;
+
+            if (hasMaxDimensionCap && Math.max(width, height) > maxDimension) {
+                const scale = maxDimension / Math.max(width, height);
+                width = Math.max(1, Math.floor(width * scale));
+                height = Math.max(1, Math.floor(height * scale));
+            }
 
             // Check megapixels constraint
             const megapixels = (width * height) / (1024 * 1024);
@@ -980,9 +989,9 @@ function getCodecRatePolicy(
             ? 0.9
             : targetCodec === 'h265'
                 ? 0.88
-            : targetCodec === 'vp9'
-                ? 0.95
-                : 1.05);
+                : targetCodec === 'vp9'
+                    ? 0.95
+                    : 1.05);
 
     const equivalentFactor = equivalentByPair[key] ?? fallbackEquivalent;
     const qualityFloorFactor = preserveQualityMode
@@ -1597,9 +1606,8 @@ function sanitizeMapName(name: string): string {
     return compact || 'Map';
 }
 
-function buildUploadName(prefix: string, index: number, name: string): string {
-    const sanitized = sanitizeMapName(name).slice(0, 40);
-    return `${prefix}-${String(index + 1).padStart(2, '0')}-${sanitized}`;
+function buildUploadName(name: string): string {
+    return sanitizeMapName(name).slice(0, 40);
 }
 
 function clampPositiveNumber(value: number | undefined, fallback: number): number {
@@ -1764,6 +1772,7 @@ async function prepareMapSources(
                         compressionMode,
                         maxSizeInMB: compressionMode === 'high' ? 49 : 24,
                         maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+                        maxDimension: videoOptions?.maxDimension,
                     },
                     reportProgress,
                     onStage,
@@ -1780,7 +1789,7 @@ async function prepareMapSources(
 
             prepared.push({
                 displayName: sanitizeMapName(source.name),
-                uploadName: buildUploadName(prefix, i, source.name),
+                uploadName: buildUploadName(source.name),
                 selectionKey: `${prefix}:map:${i + 1}`,
                 file,
                 dpi: clampPositiveNumber(effectiveDpi, sourceDpi),
@@ -2289,6 +2298,7 @@ async function uploadRawMediaScene(
             compressionMode,
             maxSizeInMB: compressionMode === 'high' ? 49 : 24,
             maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+            maxDimension: videoOptions?.maxDimension,
         };
         finalBlob = await optimizeImage(file, optimizationOptions, onProgress, onStage);
         fileExtension = getImageExtensionFromMimeType(finalBlob.type, 'png');
@@ -2356,7 +2366,8 @@ export async function uploadSceneFromVTT(
     const optimizationOptions: OptimizationOptions = {
         compressionMode,
         maxSizeInMB: compressionMode === 'high' ? 49 : 24, // Using 49MB and 24MB to leave some safety margin
-        maxMegapixels: compressionMode === 'standard' ? 67 : 144
+        maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+        maxDimension: videoOptions?.maxDimension,
     };
 
     // UVTT data embeds map images, not videos.
@@ -2411,7 +2422,8 @@ export async function uploadFoundryScene(
     const optimizationOptions: OptimizationOptions = {
         compressionMode,
         maxSizeInMB: compressionMode === 'high' ? 49 : 24,
-        maxMegapixels: compressionMode === 'standard' ? 67 : 144
+        maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+        maxDimension: videoOptions?.maxDimension,
     };
 
     const isVideo = imageBlob.type.startsWith('video/');
@@ -2501,6 +2513,7 @@ export async function uploadMediaSceneWithWallData(
         compressionMode,
         maxSizeInMB: compressionMode === 'high' ? 49 : 24,
         maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+        maxDimension: videoOptions?.maxDimension,
     };
 
     let finalBlob: Blob = mediaFile;
