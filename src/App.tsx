@@ -12,6 +12,7 @@ import {
   createSceneWithMultipleMaps,
   MapSelectionPendingError,
   type MapWorkflowResult,
+  buildMapImportSourceFromVTTFile,
   convertFoundryToVTTData,
   type MapImportSource,
   type MapLayoutMode,
@@ -324,13 +325,19 @@ function App() {
   const hasRawMediaSources =
     selectedRawFiles.length > 0 ||
     (!!selectedFile && isRawMediaFile(selectedFile));
+  const hasEmbeddedMapDataSource =
+    availableScenes.length === 0 &&
+    !!selectedFile &&
+    !isRawMediaFile(selectedFile) &&
+    hasImage;
   const hasArchiveMapSources =
     availableScenes.length > 0 &&
     selectedScenes.some(
       (scene) => !!(scene.data.img || scene.data.background?.src),
     );
   const hasCompanionWallData = !!selectedWallData;
-  const hasMapWorkflowSources = hasArchiveMapSources || hasRawMediaSources;
+  const hasMapWorkflowSources =
+    hasArchiveMapSources || hasRawMediaSources || hasEmbeddedMapDataSource;
   const selectedSceneHasWallData =
     availableScenes.length === 0 ||
     selectedScenes.some((scene) => sceneHasWallData(scene.data));
@@ -1599,6 +1606,19 @@ function App() {
         dpi: sourceDpi,
         wallData,
       });
+    }
+
+    if (
+      sources.length === 0 &&
+      selectedFile &&
+      !isRawMediaFile(selectedFile) &&
+      hasImage
+    ) {
+      const embeddedMapSource =
+        await buildMapImportSourceFromVTTFile(selectedFile);
+      if (embeddedMapSource) {
+        sources.push(embeddedMapSource);
+      }
     }
 
     return sources;

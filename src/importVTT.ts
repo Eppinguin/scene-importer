@@ -130,6 +130,52 @@ export interface MapImportSource {
     wallData?: VTTMapData;
 }
 
+export async function buildMapImportSourceFromVTTFile(file: File): Promise<MapImportSource | null> {
+    if (isRawMediaFile(file)) {
+        return {
+            name: file.name.replace(/\.[^/.]+$/, '') || file.name,
+            mediaBlob: file,
+            dpi: 100,
+        };
+    }
+
+    const content = await readFileAsText(file);
+    const parsedJson = JSON.parse(content);
+
+    if (isFoundryVTTData(parsedJson)) {
+        return null;
+    }
+
+    if (!isUniversalVTTData(parsedJson)) {
+        throw new Error('Unsupported VTT file format. Please use a valid UVTT/DD2VTT file.');
+    }
+
+    const data = parsedJson as UniversalVTT;
+    if (!data.image) {
+        return null;
+    }
+
+    const imageData = atob(data.image);
+    const arrayBuffer = new ArrayBuffer(imageData.length);
+    const uint8Array = new Uint8Array(arrayBuffer);
+    for (let i = 0; i < imageData.length; i++) {
+        uint8Array[i] = imageData.charCodeAt(i);
+    }
+
+    const imageType = getImageTypeFromBase64(data.image);
+    const imageBlob = new Blob([arrayBuffer], { type: imageType });
+    const { image, ...vttData } = data;
+    void image;
+    const wallData = vttData as VTTMapData;
+
+    return {
+        name: file.name.replace(/\.[^/.]+$/, '') || file.name,
+        mediaBlob: imageBlob,
+        dpi: clampPositiveNumber(wallData.resolution?.pixels_per_grid, 100),
+        wallData,
+    };
+}
+
 export interface MultiMapImportOptions {
     layout?: MapLayoutMode;
     spacing?: number;
