@@ -232,6 +232,7 @@ function App() {
     isVideo?: boolean;
   } | null>(null);
   const [canHoverPreview, setCanHoverPreview] = useState(false);
+  const [touchMultiSelectMode, setTouchMultiSelectMode] = useState(false);
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [manualDownloadUrl, setManualDownloadUrl] = useState<string | null>(
     null,
@@ -318,6 +319,8 @@ function App() {
   const selectedScenes = selectedSceneIndexes
     .map((idx) => availableScenes[idx])
     .filter((scene): scene is SceneInfo => !!scene);
+  const usesTouchSelectionControls =
+    !isContextMenuMode && availableScenes.length > 1 && !canHoverPreview;
   const hasRawMediaSources =
     selectedRawFiles.length > 0 ||
     (!!selectedFile && isRawMediaFile(selectedFile));
@@ -457,6 +460,12 @@ function App() {
     clearPreviewHideTimeout();
     setHoveredSceneThumb(null);
   }, [canHoverPreview]);
+
+  useEffect(() => {
+    if (canHoverPreview && touchMultiSelectMode) {
+      setTouchMultiSelectMode(false);
+    }
+  }, [canHoverPreview, touchMultiSelectMode]);
 
   useEffect(() => {
     let isMounted = true;
@@ -2175,9 +2184,59 @@ function App() {
                     variant="caption"
                     className="help-text"
                     sx={{ mb: 0.5 }}>
-                    Click to select one map. Hold Shift to select a range. Hold
-                    Cmd/Ctrl and click to toggle selection.
+                    {usesTouchSelectionControls
+                      ? touchMultiSelectMode
+                        ? "Multi-select mode: tap maps to toggle selection."
+                        : "Tap a map to select one. Turn on Multi-select mode to pick several maps."
+                      : "Click to select one map. Hold Shift to select a range. Hold Cmd/Ctrl and click to toggle selection."}
                   </Typography>
+                )}
+                {usesTouchSelectionControls && (
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    className="touch-selection-controls"
+                    sx={{ mb: 1 }}>
+                    <Button
+                      size="small"
+                      variant={touchMultiSelectMode ? "contained" : "outlined"}
+                      onClick={() => {
+                        setTouchMultiSelectMode((previous) => {
+                          if (previous) {
+                            setSelectedSceneIndices([selectedSceneIndex]);
+                          }
+                          return !previous;
+                        });
+                      }}>
+                      {touchMultiSelectMode
+                        ? "Multi-select: On"
+                        : "Enable Multi-select"}
+                    </Button>
+                    {touchMultiSelectMode && (
+                      <>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => {
+                            const everyIndex = Array.from(
+                              { length: availableScenes.length },
+                              (_, sceneIndex) => sceneIndex,
+                            );
+                            setSelectedSceneIndices(everyIndex);
+                          }}>
+                          Select All
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => {
+                            setSelectedSceneIndices([selectedSceneIndex]);
+                          }}>
+                          Keep One
+                        </Button>
+                      </>
+                    )}
+                  </Stack>
                 )}
                 <div
                   className="scene-gallery"
@@ -2222,7 +2281,9 @@ function App() {
 
                         const isRangeSelect = event.shiftKey;
                         const isMultiSelectToggle =
-                          event.metaKey || event.ctrlKey;
+                          event.metaKey ||
+                          event.ctrlKey ||
+                          (usesTouchSelectionControls && touchMultiSelectMode);
 
                         if (isRangeSelect) {
                           const start = Math.min(anchorIndex, idx);

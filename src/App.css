@@ -323,3 +323,7 @@ html, body {
   font-size: 0.78rem;
   color: var(--text-secondary, #c3c3c3);
 }
+
+.touch-selection-controls {
+  flex-wrap: wrap;
+}
