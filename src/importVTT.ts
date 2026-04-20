@@ -179,6 +179,7 @@ export async function buildMapImportSourceFromVTTFile(file: File): Promise<MapIm
 export interface MultiMapImportOptions {
     layout?: MapLayoutMode;
     spacing?: number;
+    snapToGrid?: boolean;
     scale?: number;
     placement?: MapPlacementMode;
     includeWalls?: boolean;
@@ -188,8 +189,18 @@ export interface MultiMapImportOptions {
     videoOptions?: VideoCompressionOptions;
     onProgress?: (progress: number) => void;
     onStage?: (stage: string) => void;
+    onFileProgress?: (progress: MapFileProgress) => void;
     selectionToken?: string;
     forceSelectionPrompt?: boolean;
+}
+
+export interface MapFileProgress {
+    fileName: string;
+    currentFile: number;
+    totalFiles: number;
+    completedFiles: number;
+    remainingFiles: number;
+    phase: 'preparing' | 'prepared';
 }
 
 export interface MapWorkflowResult {
@@ -1663,13 +1674,27 @@ function clampPositiveNumber(value: number | undefined, fallback: number): numbe
     return value;
 }
 
+function snapUpToGrid(value: number, gridSize: number): number {
+    const safeGridSize = clampPositiveNumber(gridSize, 100);
+    return Math.ceil(value / safeGridSize) * safeGridSize;
+}
+
+function snapToNearestGrid(value: number, gridSize: number): number {
+    const safeGridSize = clampPositiveNumber(gridSize, 100);
+    return Math.round(value / safeGridSize) * safeGridSize;
+}
+
 function computeLayoutPositions(
     widths: number[],
     heights: number[],
     layout: MapLayoutMode,
-    spacing: number
+    spacing: number,
+    gridSize: number,
+    snapToGrid = true
 ): Vector2[] {
     const positions: Vector2[] = [];
+    const normalizedSpacing = Math.max(0, spacing);
+    const safeGridSize = clampPositiveNumber(gridSize, 100);
 
     if (layout === 'STACK') {
         for (let i = 0; i < widths.length; i++) {
@@ -1682,7 +1707,8 @@ function computeLayoutPositions(
         let x = 0;
         for (let i = 0; i < widths.length; i++) {
             positions.push({ x, y: 0 });
-            x += widths[i] + spacing;
+            const nextX = x + widths[i] + normalizedSpacing;
+            x = snapToGrid ? snapUpToGrid(nextX, safeGridSize) : nextX;
         }
         return positions;
     }
@@ -1691,7 +1717,8 @@ function computeLayoutPositions(
         let y = 0;
         for (let i = 0; i < widths.length; i++) {
             positions.push({ x: 0, y });
-            y += heights[i] + spacing;
+            const nextY = y + heights[i] + normalizedSpacing;
+            y = snapToGrid ? snapUpToGrid(nextY, safeGridSize) : nextY;
         }
         return positions;
     }
@@ -1705,14 +1732,16 @@ function computeLayoutPositions(
         const column = i % columns;
         if (column === 0) {
             if (i > 0) {
-                y += rowMaxHeight + spacing;
+                const nextY = y + rowMaxHeight + normalizedSpacing;
+                y = snapToGrid ? snapUpToGrid(nextY, safeGridSize) : nextY;
             }
             x = 0;
             rowMaxHeight = 0;
         }
 
         positions.push({ x, y });
-        x += widths[i] + spacing;
+        const nextX = x + widths[i] + normalizedSpacing;
+        x = snapToGrid ? snapUpToGrid(nextX, safeGridSize) : nextX;
         rowMaxHeight = Math.max(rowMaxHeight, heights[i]);
     }
 
@@ -1742,6 +1771,7 @@ async function prepareMapSources(
         compressionMode = 'standard',
         onProgress,
         onStage,
+        onFileProgress,
         videoOptions,
         selectionToken,
         forceSelectionPrompt = false,
@@ -1770,6 +1800,14 @@ async function prepareMapSources(
         for (let i = 0; i < sources.length; i++) {
             const source = sources[i];
             const sourceDpi = clampPositiveNumber(source.dpi, 100);
+            onFileProgress?.({
+                fileName: source.name,
+                currentFile: i + 1,
+                totalFiles: total,
+                completedFiles: i,
+                remainingFiles: Math.max(0, total - i),
+                phase: 'preparing',
+            });
             const startProgress = (i / total) * 70;
             const endProgress = ((i + 1) / total) * 70;
             const reportProgress = (localProgress: number) => {
@@ -1841,6 +1879,15 @@ async function prepareMapSources(
                 dpi: clampPositiveNumber(effectiveDpi, sourceDpi),
                 wallData: source.wallData,
             });
+
+            onFileProgress?.({
+                fileName: source.name,
+                currentFile: i + 1,
+                totalFiles: total,
+                completedFiles: i + 1,
+                remainingFiles: Math.max(0, total - (i + 1)),
+                phase: 'prepared',
+            });
         }
 
         if (onProgress) {
@@ -1900,7 +1947,8 @@ async function prepareMapSources(
     const preparedByUploadName = new Map(prepared.map((entry, index) => [entry.uploadName, index]));
 
     const scale = clampPositiveNumber(options.scale, 1);
-    const spacing = Math.max(0, Math.round(options.spacing ?? 80));
+    const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
+    const shouldSnapToGrid = options.snapToGrid ?? true;
     const layout = options.layout ?? 'GRID';
 
     const displayWidths = selectedCandidates.map((entry) => {
@@ -1911,7 +1959,7 @@ async function prepareMapSources(
         const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
         return (entry.image.height * targetDpi / sourceDpi) * scale;
     });
-    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing);
+    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing, targetDpi, shouldSnapToGrid);
 
     if (onProgress) {
         onProgress(92);
@@ -1962,7 +2010,8 @@ export async function addMapsToCurrentScene(
     const lockMaps = options.lockMaps ?? true;
     const prepared = await prepareMapSources(sources, targetDpi, options);
 
-    const spacing = Math.max(0, Math.round(options.spacing ?? 80));
+    const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
+    const shouldSnapToGrid = options.snapToGrid ?? true;
     let placementOffset: Vector2 = { x: 0, y: 0 };
     const existingMaps = await OBR.scene.items.getItems((item) => item.layer === 'MAP');
     if (existingMaps.length > 0) {
@@ -1970,15 +2019,15 @@ export async function addMapsToCurrentScene(
         const placementMode = options.placement ?? 'RIGHT';
         if (placementMode === 'BELOW') {
             placementOffset = {
-                x: bounds.min.x,
-                y: bounds.max.y + spacing,
+                x: shouldSnapToGrid ? snapToNearestGrid(bounds.min.x, targetDpi) : bounds.min.x,
+                y: shouldSnapToGrid ? snapUpToGrid(bounds.max.y + spacing, targetDpi) : bounds.max.y + spacing,
             };
         } else if (placementMode === 'ORIGIN') {
             placementOffset = { x: 0, y: 0 };
         } else {
             placementOffset = {
-                x: bounds.max.x + spacing,
-                y: bounds.min.y,
+                x: shouldSnapToGrid ? snapUpToGrid(bounds.max.x + spacing, targetDpi) : bounds.max.x + spacing,
+                y: shouldSnapToGrid ? snapToNearestGrid(bounds.min.y, targetDpi) : bounds.min.y,
             };
         }
     }
@@ -2058,7 +2107,8 @@ export async function addWallsToCurrentSceneWithLayout(
 
     const targetDpi = await OBR.scene.grid.getDpi();
     const scale = clampPositiveNumber(options.scale, 1);
-    const spacing = Math.max(0, Math.round(options.spacing ?? 80));
+    const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
+    const shouldSnapToGrid = options.snapToGrid ?? true;
     const layout = options.layout ?? 'GRID';
 
     const displayWidths: number[] = [];
@@ -2109,7 +2159,7 @@ export async function addWallsToCurrentSceneWithLayout(
         }
     }
 
-    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing);
+    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing, targetDpi, shouldSnapToGrid);
 
     let placementOffset: Vector2 = { x: 0, y: 0 };
     const existingMaps = await OBR.scene.items.getItems((item) => item.layer === 'MAP');
@@ -2118,15 +2168,15 @@ export async function addWallsToCurrentSceneWithLayout(
         const placementMode = options.placement ?? 'RIGHT';
         if (placementMode === 'BELOW') {
             placementOffset = {
-                x: bounds.min.x,
-                y: bounds.max.y + spacing,
+                x: shouldSnapToGrid ? snapToNearestGrid(bounds.min.x, targetDpi) : bounds.min.x,
+                y: shouldSnapToGrid ? snapUpToGrid(bounds.max.y + spacing, targetDpi) : bounds.max.y + spacing,
             };
         } else if (placementMode === 'ORIGIN') {
             placementOffset = { x: 0, y: 0 };
         } else {
             placementOffset = {
-                x: bounds.max.x + spacing,
-                y: bounds.min.y,
+                x: shouldSnapToGrid ? snapUpToGrid(bounds.max.x + spacing, targetDpi) : bounds.max.x + spacing,
+                y: shouldSnapToGrid ? snapToNearestGrid(bounds.min.y, targetDpi) : bounds.min.y,
             };
         }
     }

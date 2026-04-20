@@ -12,6 +12,7 @@ import {
   createSceneWithMultipleMaps,
   MapSelectionPendingError,
   type MapWorkflowResult,
+  type MapFileProgress,
   buildMapImportSourceFromVTTFile,
   convertFoundryToVTTData,
   type MapImportSource,
@@ -222,7 +223,8 @@ function App() {
   const [layoutMode, setLayoutMode] = useState<MapLayoutMode>("GRID");
   const [mapPlacementMode, setMapPlacementMode] =
     useState<MapPlacementMode>("RIGHT");
-  const [layoutSpacing, setLayoutSpacing] = useState("80");
+  const [layoutSpacing, setLayoutSpacing] = useState("");
+  const [snapToGrid, setSnapToGrid] = useState(true);
   const [layoutScalePercent, setLayoutScalePercent] = useState("100");
   const [includeWallsWithMaps, setIncludeWallsWithMaps] = useState(true);
   const [lockImportedMaps, setLockImportedMaps] = useState(true);
@@ -269,6 +271,8 @@ function App() {
 
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [compressionStage, setCompressionStage] = useState<string | null>(null);
+  const [mapFileProgress, setMapFileProgress] =
+    useState<MapFileProgress | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [isGM, setIsGM] = useState(false);
@@ -1639,9 +1643,10 @@ function App() {
     return Math.max(0.1, parsed / 100);
   };
 
-  const getLayoutSpacing = (): number => {
+  const getLayoutSpacing = (): number | undefined => {
+    if (layoutSpacing.trim() === "") return undefined;
     const parsed = Number(layoutSpacing);
-    if (!Number.isFinite(parsed) || parsed < 0) return 80;
+    if (!Number.isFinite(parsed) || parsed < 0) return undefined;
     return Math.round(parsed);
   };
 
@@ -1686,6 +1691,7 @@ function App() {
       removeVideoAudio,
       forceVideoTranscode,
       maxResolutionDimension,
+      snapToGrid,
     });
   };
 
@@ -1786,6 +1792,7 @@ function App() {
     setIsLoading(true);
     setUploadProgress(0);
     setCompressionStage("Preparing maps");
+    setMapFileProgress(null);
 
     try {
       const sources = await buildMapImportSources();
@@ -1823,6 +1830,7 @@ function App() {
       const result = await addMapsToCurrentScene(sources, {
         layout: layoutMode,
         spacing: getLayoutSpacing(),
+        snapToGrid,
         scale: getLayoutScale(),
         placement: mapPlacementMode,
         includeWalls: includeWallsWithMaps,
@@ -1833,6 +1841,7 @@ function App() {
         videoOptions: buildVideoCompressionOptions(abortController.signal),
         onProgress: setUploadProgress,
         onStage: setCompressionStage,
+        onFileProgress: setMapFileProgress,
       });
 
       await showMapWorkflowMismatchWarning(result);
@@ -1862,6 +1871,7 @@ function App() {
       compressionAbortRef.current = null;
       setUploadProgress(null);
       setCompressionStage(null);
+      setMapFileProgress(null);
       setIsLoading(false);
     }
   };
@@ -1872,6 +1882,7 @@ function App() {
     setIsLoading(true);
     setUploadProgress(0);
     setCompressionStage("Preparing maps");
+    setMapFileProgress(null);
 
     try {
       const sources = await buildMapImportSources();
@@ -1909,6 +1920,7 @@ function App() {
       const result = await createSceneWithMultipleMaps(sources, {
         layout: layoutMode,
         spacing: getLayoutSpacing(),
+        snapToGrid,
         scale: getLayoutScale(),
         includeWalls: includeWallsWithMaps,
         lockMaps: lockImportedMaps,
@@ -1919,6 +1931,7 @@ function App() {
         videoOptions: buildVideoCompressionOptions(abortController.signal),
         onProgress: setUploadProgress,
         onStage: setCompressionStage,
+        onFileProgress: setMapFileProgress,
       });
 
       await showMapWorkflowMismatchWarning(result);
@@ -1946,6 +1959,7 @@ function App() {
       compressionAbortRef.current = null;
       setUploadProgress(null);
       setCompressionStage(null);
+      setMapFileProgress(null);
       setIsLoading(false);
     }
   };
@@ -2011,6 +2025,7 @@ function App() {
     setIsLoading(true);
     resetMapWorkflowState();
     setUploadProgress(0);
+    setMapFileProgress(null);
     setCompressionStage(
       selectedInputIsVideo ? "Preparing video encoder" : "Preparing image",
     );
@@ -2168,6 +2183,7 @@ function App() {
       compressionAbortRef.current = null;
       setUploadProgress(null);
       setCompressionStage(null);
+      setMapFileProgress(null);
       setIsLoading(false);
     }
   };
@@ -2189,6 +2205,7 @@ function App() {
         const result = await addWallsToCurrentSceneWithLayout(sources, {
           layout: layoutMode,
           spacing: getLayoutSpacing(),
+          snapToGrid,
           scale: getLayoutScale(),
           placement: "ORIGIN",
         });
@@ -2859,13 +2876,27 @@ function App() {
 
                         <TextField
                           type="number"
-                          label="Spacing (px)"
+                          label="Minimum Spacing (px, optional)"
                           value={layoutSpacing}
                           onChange={(e) => setLayoutSpacing(e.target.value)}
                           inputProps={{ min: 0, step: 1 }}
+                          placeholder="One grid size"
+                          helperText="Minimum free space between maps. Leave empty to default to one grid square."
                           size="small"
                           fullWidth
                           disabled={isLoading}
+                        />
+
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              size="small"
+                              checked={snapToGrid}
+                              onChange={(e) => setSnapToGrid(e.target.checked)}
+                              disabled={isLoading}
+                            />
+                          }
+                          label="Snap placement to grid"
                         />
 
                         <TextField
@@ -3066,6 +3097,13 @@ function App() {
 
           {uploadProgress !== null && (
             <Box className="compression-progress">
+              {mapFileProgress && mapFileProgress.totalFiles > 1 && (
+                <Typography
+                  className="compression-progress-label"
+                  variant="caption">
+                  {`File ${mapFileProgress.currentFile} of ${mapFileProgress.totalFiles} (${mapFileProgress.remainingFiles} remaining): ${mapFileProgress.fileName}`}
+                </Typography>
+              )}
               <Typography
                 className="compression-progress-label"
                 variant="caption">
