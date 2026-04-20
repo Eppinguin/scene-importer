@@ -65,6 +65,14 @@ type SceneInfo = {
   isVideo?: boolean;
 };
 
+type PairedImportSelection = {
+  name: string;
+  mediaFile: File;
+  wallDataFile: File;
+  wallData: VTTMapData;
+  isVideo: boolean;
+};
+
 type PendingMapSelectionAction = "add-current" | "multi-scene";
 type CompanionWallData = FoundryVTTData | VTTMapData;
 type MapWorkflowRunOptions = {
@@ -201,6 +209,9 @@ function App() {
   const [selectedWallData, setSelectedWallData] =
     useState<CompanionWallData | null>(null);
   const [selectedRawFiles, setSelectedRawFiles] = useState<File[]>([]);
+  const [selectedPairedImports, setSelectedPairedImports] = useState<
+    PairedImportSelection[]
+  >([]);
   const [moduleUrl, setModuleUrl] = useState("");
   const [zipObject, setZipObject] = useState<JSZip | null>(null);
   const [availableScenes, setAvailableScenes] = useState<SceneInfo[]>([]);
@@ -325,6 +336,7 @@ function App() {
   const hasRawMediaSources =
     selectedRawFiles.length > 0 ||
     (!!selectedFile && isRawMediaFile(selectedFile));
+  const hasPairedMapSources = selectedPairedImports.length > 0;
   const hasEmbeddedMapDataSource =
     availableScenes.length === 0 &&
     !!selectedFile &&
@@ -337,7 +349,10 @@ function App() {
     );
   const hasCompanionWallData = !!selectedWallData;
   const hasMapWorkflowSources =
-    hasArchiveMapSources || hasRawMediaSources || hasEmbeddedMapDataSource;
+    hasArchiveMapSources ||
+    hasRawMediaSources ||
+    hasEmbeddedMapDataSource ||
+    hasPairedMapSources;
   const selectedSceneHasWallData =
     availableScenes.length === 0 ||
     selectedScenes.some((scene) => sceneHasWallData(scene.data));
@@ -347,6 +362,9 @@ function App() {
       (scene) => !!(scene.data.img || scene.data.background?.src),
     );
   const selectedSceneIsVideo = selectedScenes.some((scene) => !!scene.isVideo);
+  const selectedPairedImportsContainVideo = selectedPairedImports.some(
+    (selection) => selection.isVideo,
+  );
   const selectedFileIsVideo =
     !!selectedFile &&
     (selectedFile.type.startsWith("video/") ||
@@ -359,17 +377,21 @@ function App() {
   const selectedInputIsVideo =
     availableScenes.length > 0
       ? selectedSceneIsVideo
-      : selectedRawFiles.length > 0
-        ? selectedRawFilesContainVideo
-        : selectedFileIsVideo;
+      : selectedPairedImports.length > 0
+        ? selectedPairedImportsContainVideo
+        : selectedRawFiles.length > 0
+          ? selectedRawFilesContainVideo
+          : selectedFileIsVideo;
   const selectedSourceCount =
     availableScenes.length > 0
       ? selectedScenes.length
-      : selectedRawFiles.length > 0
-        ? selectedRawFiles.length
-        : selectedFile
-          ? 1
-          : 0;
+      : selectedPairedImports.length > 0
+        ? selectedPairedImports.length
+        : selectedRawFiles.length > 0
+          ? selectedRawFiles.length
+          : selectedFile
+            ? 1
+            : 0;
   const hasWallImportSources =
     (availableScenes.length > 0 && selectedSceneHasWallData) ||
     !!selectedWallData ||
@@ -701,7 +723,7 @@ function App() {
   }, [selectedSceneIndices, selectedSceneIndex]);
 
   useEffect(() => {
-    if (selectedRawFiles.length > 0) {
+    if (selectedRawFiles.length > 0 || selectedPairedImports.length > 0) {
       if (!hasImage) setHasImage(true);
       return;
     }
@@ -713,7 +735,13 @@ function App() {
         ),
       );
     }
-  }, [availableScenes, selectedScenes, selectedRawFiles, hasImage]);
+  }, [
+    availableScenes,
+    selectedScenes,
+    selectedRawFiles,
+    selectedPairedImports,
+    hasImage,
+  ]);
 
   useEffect(() => {
     if (!hasMapWorkflowSources && showAdvancedOptions) {
@@ -773,6 +801,12 @@ function App() {
       .replace(/^\.\//, "")
       .replace(/^\//, "")
       .replace(/\/+/g, "/");
+
+  const normalizeFileStem = (fileName: string): string =>
+    fileName
+      .toLowerCase()
+      .replace(/\.[^/.]+$/, "")
+      .trim();
 
   const findLevelDbFilesForPack = (zip: JSZip, packPath: string): string[] => {
     const allPaths = Object.keys(zip.files);
@@ -1004,6 +1038,7 @@ function App() {
         setSelectedWallDataFile(null);
         setSelectedWallData(null);
         setSelectedRawFiles([]);
+        setSelectedPairedImports([]);
         resetMapWorkflowState();
         setIsFoundryFormat(true);
         const firstScene = scenes[0].data;
@@ -1015,6 +1050,7 @@ function App() {
         setSelectedSceneIndices([]);
         setSelectedWallDataFile(null);
         setSelectedWallData(null);
+        setSelectedPairedImports([]);
         resetMapWorkflowState();
       }
     } catch (e) {
@@ -1025,6 +1061,7 @@ function App() {
       setSelectedSceneIndices([]);
       setSelectedWallDataFile(null);
       setSelectedWallData(null);
+      setSelectedPairedImports([]);
       resetMapWorkflowState();
     }
     setIsLoading(false);
@@ -1114,6 +1151,7 @@ function App() {
     setSelectedWallDataFile(null);
     setSelectedWallData(null);
     setSelectedRawFiles([]);
+    setSelectedPairedImports([]);
     setAvailableScenes([]);
     setSelectedSceneIndices([]);
     setZipObject(null);
@@ -1127,6 +1165,82 @@ function App() {
       file.type === "application/json" ||
       file.type === "application/octet-stream"
     );
+  };
+
+  const buildPairedImportSelections = async (
+    files: File[],
+  ): Promise<{
+    pairedImports: PairedImportSelection[];
+    unmatchedMediaFiles: File[];
+    unmatchedJsonFiles: File[];
+  }> => {
+    const mediaFiles = files.filter((file) => isRawMediaFile(file));
+    const jsonFiles = files.filter((file) => isJsonDataFile(file));
+
+    if (mediaFiles.length === 0 || jsonFiles.length === 0) {
+      return {
+        pairedImports: [],
+        unmatchedMediaFiles: mediaFiles,
+        unmatchedJsonFiles: jsonFiles,
+      };
+    }
+
+    const parsedJsonFiles = await Promise.all(
+      jsonFiles.map(async (file) => ({
+        file,
+        stem: normalizeFileStem(file.name),
+        wallData: await parseWallDataFile(file),
+      })),
+    );
+
+    const jsonBuckets = new Map<string, typeof parsedJsonFiles>();
+    for (const entry of parsedJsonFiles) {
+      const bucket = jsonBuckets.get(entry.stem) ?? [];
+      bucket.push(entry);
+      jsonBuckets.set(entry.stem, bucket);
+    }
+
+    const pairedImports: PairedImportSelection[] = [];
+    const unmatchedMediaFiles: File[] = [];
+
+    for (const mediaFile of mediaFiles) {
+      const stem = normalizeFileStem(mediaFile.name);
+      const bucket = jsonBuckets.get(stem);
+      const match = bucket?.shift();
+
+      if (!match) {
+        unmatchedMediaFiles.push(mediaFile);
+        continue;
+      }
+
+      if (bucket && bucket.length === 0) {
+        jsonBuckets.delete(stem);
+      }
+
+      const wallData = isFoundryVTTData(match.wallData)
+        ? convertFoundryToVTTData(match.wallData)
+        : match.wallData;
+
+      pairedImports.push({
+        name: stem || mediaFile.name,
+        mediaFile,
+        wallDataFile: match.file,
+        wallData,
+        isVideo:
+          mediaFile.type.startsWith("video/") ||
+          /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(mediaFile.name.toLowerCase()),
+      });
+    }
+
+    const unmatchedJsonFiles = Array.from(jsonBuckets.values()).flatMap(
+      (bucket) => bucket.map((entry) => entry.file),
+    );
+
+    return {
+      pairedImports,
+      unmatchedMediaFiles,
+      unmatchedJsonFiles,
+    };
   };
 
   const normalizeVTTWallDataPayload = (payload: unknown): VTTMapData | null => {
@@ -1208,6 +1322,7 @@ function App() {
     setSelectedWallDataFile(null);
     setSelectedWallData(null);
     setSelectedRawFiles([]);
+    setSelectedPairedImports([]);
     setIsFoundryFormat(false);
     setHasImage(true);
     setAvailableScenes([]);
@@ -1340,24 +1455,40 @@ function App() {
       }
 
       const mediaFiles = files.filter((file) => isRawMediaFile(file));
-      const jsonFiles = files.filter((file) => !isRawMediaFile(file));
+      const jsonFiles = files.filter((file) => isJsonDataFile(file));
+      const hasMixedMediaAndJson =
+        mediaFiles.length > 0 && jsonFiles.length > 0;
 
-      const isSingleSceneMediaWithWallsSelection =
-        !isContextMenuMode &&
-        files.length === 2 &&
-        mediaFiles.length === 1 &&
-        jsonFiles.length === 1 &&
-        isJsonDataFile(jsonFiles[0]);
-
-      if (isSingleSceneMediaWithWallsSelection) {
+      if (hasMixedMediaAndJson) {
         try {
-          const wallData = await parseWallDataFile(jsonFiles[0]);
-          const mediaFile = mediaFiles[0];
+          const { pairedImports, unmatchedMediaFiles, unmatchedJsonFiles } =
+            await buildPairedImportSelections(files);
 
-          setSelectedFile(mediaFile);
-          setSelectedWallDataFile(jsonFiles[0]);
-          setSelectedWallData(wallData);
+          if (pairedImports.length === 0) {
+            await OBR.notification.show(
+              "No matching media/JSON filename pairs were found. Make sure each image/video and its Foundry JSON share the same base name.",
+              "WARNING",
+            );
+            if (fileInputRef.current) {
+              fileInputRef.current.value = "";
+            }
+            return;
+          }
+
+          if (unmatchedMediaFiles.length > 0 || unmatchedJsonFiles.length > 0) {
+            const skippedCount =
+              unmatchedMediaFiles.length + unmatchedJsonFiles.length;
+            await OBR.notification.show(
+              `${skippedCount} unpaired file(s) were skipped because they did not match by name.`,
+              "WARNING",
+            );
+          }
+
+          setSelectedPairedImports(pairedImports);
           setSelectedRawFiles([]);
+          setSelectedFile(null);
+          setSelectedWallDataFile(null);
+          setSelectedWallData(null);
           setAvailableScenes([]);
           setSelectedSceneIndices([]);
           setZipObject(null);
@@ -1368,7 +1499,7 @@ function App() {
           const message =
             error instanceof Error
               ? error.message
-              : "Could not parse wall data JSON.";
+              : "Could not parse one or more wall data JSON files.";
           await OBR.notification.show(message, "WARNING");
           if (fileInputRef.current) {
             fileInputRef.current.value = "";
@@ -1379,7 +1510,7 @@ function App() {
 
       if (!files.every((file) => isRawMediaFile(file))) {
         await OBR.notification.show(
-          "Select image/video files only, or select exactly one image/video file plus one wall data JSON file.",
+          "Select image/video files only, or select matching image/video and wall data JSON files together.",
           "WARNING",
         );
         if (fileInputRef.current) {
@@ -1389,6 +1520,7 @@ function App() {
       }
 
       setSelectedRawFiles(files);
+      setSelectedPairedImports([]);
       setSelectedFile(null);
       setSelectedWallDataFile(null);
       setSelectedWallData(null);
@@ -1464,6 +1596,7 @@ function App() {
           setSelectedFile(null);
           setSelectedWallDataFile(null);
           setSelectedWallData(null);
+          setSelectedPairedImports([]);
           setIsFoundryFormat(false);
           setHasImage(false);
         }
@@ -1478,6 +1611,7 @@ function App() {
         setSelectedFile(null);
         setSelectedWallDataFile(null);
         setSelectedWallData(null);
+        setSelectedPairedImports([]);
         setIsFoundryFormat(false);
         setHasImage(false);
       }
@@ -1557,6 +1691,19 @@ function App() {
 
   const buildMapImportSources = async (): Promise<MapImportSource[]> => {
     const sources: MapImportSource[] = [];
+
+    if (selectedPairedImports.length > 0) {
+      for (const pairedImport of selectedPairedImports) {
+        sources.push({
+          name: pairedImport.name,
+          mediaBlob: pairedImport.mediaFile,
+          dpi: pairedImport.wallData.resolution.pixels_per_grid,
+          wallData: pairedImport.wallData,
+        });
+      }
+
+      return sources;
+    }
 
     if (availableScenes.length > 0) {
       if (!zipObject) {
@@ -1846,7 +1993,12 @@ function App() {
   };
 
   const handleCreateNewScene = async () => {
-    if (!selectedFile && availableScenes.length === 0) return;
+    if (
+      !selectedFile &&
+      availableScenes.length === 0 &&
+      selectedPairedImports.length === 0
+    )
+      return;
 
     const waitForProgressFrame = async () => {
       await new Promise<void>((resolve) => {
@@ -1864,14 +2016,28 @@ function App() {
     );
     await waitForProgressFrame();
     try {
-      const fileToUpload = selectedFile;
       const abortController = new AbortController();
       compressionAbortRef.current = abortController;
       const videoCompressionOptions = buildVideoCompressionOptions(
         abortController.signal,
       );
 
-      if (availableScenes.length > 0 && zipObject) {
+      if (selectedPairedImports.length > 0) {
+        const pairedImport = selectedPairedImports[0];
+        const uploadName =
+          pairedImport.name ||
+          pairedImport.mediaFile.name.replace(/\.[^/.]+$/, "");
+
+        await uploadMediaSceneWithWallData(
+          pairedImport.mediaFile,
+          pairedImport.wallData,
+          uploadName,
+          compressionMode,
+          (progress) => setUploadProgress(progress),
+          videoCompressionOptions,
+          (stage) => setCompressionStage(stage),
+        );
+      } else if (availableScenes.length > 0 && zipObject) {
         const scene = availableScenes[selectedSceneIndex].data;
         if (!isFoundryVTTData(scene)) {
           throw new Error("Selected scene data is not compatible.");
@@ -1893,7 +2059,8 @@ function App() {
         setUploadProgress(null);
         setCompressionStage(null);
         setIsLoading(true);
-      } else if (fileToUpload) {
+      } else if (selectedFile) {
+        const fileToUpload = selectedFile;
         if (selectedWallData) {
           if (!isRawMediaFile(fileToUpload)) {
             throw new Error(
@@ -2188,6 +2355,24 @@ function App() {
                     .map((file) => file.name)
                     .join(", ")}
                   {selectedRawFiles.length > 3 ? "..." : ""}
+                </Typography>
+              </Box>
+            )}
+
+            {selectedPairedImports.length > 0 && (
+              <Box className="selected-file-block">
+                <Typography className="selected-file" variant="body2">
+                  Paired imports: {selectedPairedImports.length}
+                </Typography>
+                <Typography className="file-info" variant="caption">
+                  {selectedPairedImports
+                    .slice(0, 3)
+                    .map((pairedImport) => pairedImport.name)
+                    .join(", ")}
+                  {selectedPairedImports.length > 3 ? "..." : ""}
+                </Typography>
+                <Typography className="file-info" variant="caption">
+                  Media and JSON files are matched by their base filename.
                 </Typography>
               </Box>
             )}
