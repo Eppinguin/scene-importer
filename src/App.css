@@ -13,7 +13,10 @@ html, body {
 #root {
   background-color: transparent;
   min-height: 0;
-  height: auto;
+  height: 100%;
+  max-height: 100%;
+  overflow-x: hidden;
+  overflow-y:auto;
 }
 
 .container {
@@ -236,7 +239,8 @@ html, body {
   padding: 8px;
   border-radius: 10px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
+  pointer-events: auto;
+  cursor: pointer;
   border: 1px solid rgba(var(--text-primary-rgb, 255, 255, 255), 0.2);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -253,6 +257,10 @@ html, body {
   max-height: min(74vh, calc(100vh - 40px));
   object-fit: contain;
   border-radius: 6px;
+}
+
+.scene-preview-float.hover-through {
+  pointer-events: none;
 }
 
 @media (min-width: 760px) {
@@ -310,8 +318,48 @@ html, body {
   margin-top: 0.2rem;
 }
 
+.advanced-option-group {
+  padding: 0.6rem 0.6rem 0.6rem;
+  border: 1px solid rgba(var(--text-primary-rgb, 255, 255, 255), 0.12);
+  border-radius: 10px;
+  background: rgba(var(--background-paper-rgb, 42, 42, 42), 0.12);
+}
+
+.advanced-option-group-heading {
+  display: block;
+  margin: 0 0 0.62rem;
+  font-size: 0.74rem;
+  line-height: 1.1;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+  color: var(--text-secondary, #c3c3c3);
+}
+
+.advanced-option-group > .MuiStack-root {
+  margin-top: 0.15rem;
+}
+
+.import-options-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.import-option-toggle {
+  margin: 0;
+  min-height: 1.38rem;
+}
+
+.import-option-toggle .MuiFormControlLabel-label {
+  font-size: 0.86rem;
+  line-height: 1.2;
+}
+
 .help-text {
   margin: 0;
   font-size: 0.78rem;
   color: var(--text-secondary, #c3c3c3);
+}
+
+.touch-selection-controls {
+  flex-wrap: wrap;
 }

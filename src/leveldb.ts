@@ -401,3 +401,64 @@ export function extractScenesFromLevelDB(
 
     return Array.from(sceneMap.values());
 }
+
+/**
+ * Extract scene documents embedded inside Adventure compendium documents.
+ *
+ * Foundry Adventure packs store documents under keys like `!adventures!<documentId>`.
+ * Each adventure document may include a `scenes` array containing full scene data.
+ *
+ * @param ldbBuffers Array of ArrayBuffer contents from .ldb files in the pack directory.
+ * @returns Array of parsed scene objects, deduplicated by _id (latest wins).
+ */
+export function extractScenesFromAdventureLevelDB(
+    ldbBuffers: ArrayBuffer[]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): any[] {
+    const adventureDocsByKey = new Map<string, {
+        sequence: number;
+        value: string | null;
+        deleted: boolean;
+    }>();
+
+    for (const buffer of ldbBuffers) {
+        const entries = parseSSTTableEntries(buffer, '!adventures!');
+
+        for (const entry of entries) {
+            const current = adventureDocsByKey.get(entry.key);
+            if (!current || entry.sequence > current.sequence) {
+                adventureDocsByKey.set(entry.key, {
+                    sequence: entry.sequence,
+                    value: entry.value,
+                    deleted: entry.deleted,
+                });
+            }
+        }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sceneMap = new Map<string, any>();
+
+    for (const entry of adventureDocsByKey.values()) {
+        if (entry.deleted || entry.value === null) {
+            continue;
+        }
+
+        try {
+            const adventure = JSON.parse(entry.value) as { scenes?: unknown[] };
+            if (!Array.isArray(adventure.scenes)) continue;
+
+            for (const sceneCandidate of adventure.scenes) {
+                if (!sceneCandidate || typeof sceneCandidate !== 'object') continue;
+                const scene = sceneCandidate as { _id?: string; _key?: string };
+                const id = scene._id || scene._key;
+                if (!id) continue;
+                sceneMap.set(id, scene);
+            }
+        } catch {
+            // Skip entries that aren't valid JSON
+        }
+    }
+
+    return Array.from(sceneMap.values());
+}

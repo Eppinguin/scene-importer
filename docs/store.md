@@ -1,6 +1,6 @@
 ---
 title: Scene Importer
-description: Import VTT wall data (.uvtt, .dd2vtt, Foundry) for Dynamic Fog, or automatically compress raw media uploads to fit your tier limits.
+description: Import VTT wall/light data (.uvtt, .dd2vtt, Foundry) for Dynamic Fog, or automatically compress raw media uploads to fit your tier limits.
 author: Eppinguin
 image: https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/header.webp
 icon: https://scene-importer.pages.dev/Logo.webp
@@ -14,15 +14,15 @@ learn-more: https://github.com/Eppinguin/scene-importer
 
 # Scene Importer
 
-Import VTT wall data directly for [Dynamic Fog](https://extensions.owlbear.rodeo/dynamic-fog) using Universal VTT (.uvtt), DD2VTT (.dd2vtt), or FoundryVTT files (JSON, ZIP, or URLs). Alternatively, you can upload raw image and video files and let the extension automatically compress them to fit your Owlbear Rodeo subscription limits.
+Import VTT wall/light data directly for [Dynamic Fog](https://extensions.owlbear.rodeo/dynamic-fog) using Universal VTT (.uvtt), DD2VTT (.dd2vtt), or FoundryVTT files (JSON, ZIP, or URLs). Alternatively, you can upload raw image and video files and let the extension automatically compress them to fit your Owlbear Rodeo subscription limits.
 
-This importer is designed to work with the Dynamic Fog Extension, providing an easy way to import walls and doors from your existing maps. For users seeking advanced features like dynamic lighting and custom fog backgrounds, check out the excellent [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
+This importer is designed to work with the Dynamic Fog Extension, providing an easy way to import walls, doors, and lights from your existing maps. For users seeking advanced features like dynamic lighting and custom fog backgrounds, check out the excellent [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
 
 ![add walls from menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-menu.gif)
 
 ## Import a New Map
 
-This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls and doors.
+This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls, doors, and lights.
 
 1. Click the Scene Importer icon in the top left corner.
 2. Select your `.uvtt`, `.dd2vtt`, `.zip` module file, raw image, raw video, or paste a URL. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. Upload a Foundry ZIP module instead)._
@@ -34,9 +34,9 @@ This will create a new scene using your VTT file or raw media file. If a VTT fil
 
 _Note: If your UVTT file does not contain a map image, you will not be able to use the "Create New Scene" option. In this case, you should first set up your scene with a map image manually, and then use the "Add Walls to Current Scene" feature._
 
-## Add Walls and Doors to an Existing Scene or Map
+## Add Walls, Doors, and Lights to an Existing Scene or Map
 
-This option is for adding walls and doors to a scene that already exists or to a specific map image you've already placed.
+This option is for adding walls, doors, and lights to a scene that already exists or to a specific map image you've already placed.
 
 ### Using the Importer Window:
 
@@ -44,17 +44,17 @@ This option is for adding walls and doors to a scene that already exists or to a
 2. Click the Scene Importer button in the toolbar.
 3. Select your `.uvtt`, `.dd2vtt`, `.json`, `.zip` file, or paste a URL.
 4. Click "Add Walls to Current Scene".
-5. The walls and doors will be added to the current scene.
+5. The walls, doors, and lights will be added to the current scene.
 
 ### Using the Map's Context Menu (for existing maps):
 
-For existing maps, you can add Walls and Doors using the Map's Context Menu (right-click menu). This method automatically positions the walls relative to the map's current location and scale, which is useful when you have already positioned or resized the map, or when working with multiple maps in a single scene.
+For existing maps, you can add walls, doors, and lights using the map's context menu (right-click menu). This method automatically positions the imported fog data relative to the map's current location and scale, which is useful when you have already positioned or resized the map, or when working with multiple maps in a single scene.
 
 1. Select the Map you want to Import Walls for.
 2. Right Click it.
 3. Click "Import Walls".
 4. The extension will automatically open the Importer Selector so you can choose exactly which wall structure to cast onto your highlighted image.
-5. Wait for Walls and Doors to be added to the Map.
+5. Wait for walls, doors, and lights to be added to the map.
 
 ![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-context-menu.gif)
 

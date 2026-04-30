@@ -1,8 +1,19 @@
 import type { Vector2 } from "@owlbear-rodeo/sdk";
 
+export interface VTTLight {
+    position: Vector2;
+    range: number;
+    color: string;
+    angle?: number;
+    rotation?: number;
+    hidden?: boolean;
+    vision?: boolean;
+}
+
 export interface VTTMapData {
     line_of_sight: Vector2[][];
     objects_line_of_sight: Vector2[][];
+    lights?: VTTLight[];
     portals?: {
         position: { x: number; y: number };
         bounds: Vector2[];
@@ -15,6 +26,7 @@ export interface VTTMapData {
         map_size: { x: number; y: number };
         pixels_per_grid: number;
     };
+    gridScale?: string;
 }
 
 export interface FoundryVTTWall {
@@ -26,11 +38,41 @@ export interface FoundryVTTWall {
     sound?: number;
 }
 
+export interface FoundryVTTLight {
+    x: number;
+    y: number;
+    hidden?: boolean;
+    vision?: boolean;
+    rotation?: number;
+    walls?: boolean;
+    tintColor?: string;
+    tintAlpha?: number;
+    config?: {
+        dim?: number;
+        bright?: number;
+        rotation?: number;
+        angle?: number;
+        color?: string;
+        tintColor?: string;
+        tintAlpha?: number;
+        luminosity?: number;
+        attenuation?: number;
+        walls?: boolean;
+        vision?: boolean;
+    };
+    dim?: number;
+    bright?: number;
+    angle?: number;
+    color?: string;
+    luminosity?: number;
+    attenuation?: number;
+}
+
 export interface FoundryVTTData {
     name: string;
     width: number;
     height: number;
-    grid: number | { size: number;[key: string]: unknown };
+    grid: number | { size: number; distance?: number; units?: string;[key: string]: unknown };
     gridDistance?: number;
     gridUnits?: string;
     padding?: number;
@@ -42,6 +84,7 @@ export interface FoundryVTTData {
         src?: string;
     };
     walls?: FoundryVTTWall[];
+    lights?: FoundryVTTLight[];
 }
 
 export interface UniversalVTT extends VTTMapData {
@@ -50,12 +93,6 @@ export interface UniversalVTT extends VTTMapData {
         baked_lighting: boolean;
         ambient_light: string;
     };
-    lights?: {
-        position: Vector2;
-        range: number;
-        intensity: number;
-        color: string;
-        shadows: boolean;
-    }[];
+    lights?: VTTLight[];
     image?: string;
 }

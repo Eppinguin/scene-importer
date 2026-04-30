@@ -2,20 +2,33 @@ import { useState, useRef, useEffect } from "react";
 import "./App.css";
 import {
   uploadSceneFromVTT,
+  uploadMediaSceneWithWallData,
   addItemsFromVTT,
   addItemsFromData,
   uploadFoundryScene,
   extractImageFromZip,
+  addMapsToCurrentScene,
+  addWallsToCurrentSceneWithLayout,
+  createSceneWithMultipleMaps,
+  MapSelectionPendingError,
+  type MapWorkflowResult,
+  type MapFileProgress,
+  buildMapImportSourceFromVTTFile,
   convertFoundryToVTTData,
+  type MapImportSource,
+  type MapLayoutMode,
+  type MapPlacementMode,
   type CompressionMode,
   type VideoCompressionErrorCode,
   type VideoCodecPreference,
   type VideoCompressionOptions,
+  type LightImportOptions,
   preflightVideoCompression,
   type BrowserVideoCodecAvailability,
   getBrowserVideoCodecAvailability,
   isFoundryVTTData,
   hasMapImage,
+  clearMapSelectionState,
 } from "./importVTT";
 import OBR, { type Theme } from "@owlbear-rodeo/sdk";
 import JSZip from "jszip";
@@ -31,7 +44,7 @@ import Select from "@mui/material/Select";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
-import { extractScenesFromLevelDB } from "./leveldb";
+import { extractScenesFromFoundryZip } from "./foundryZip";
 import type { FoundryVTTData, VTTMapData } from "./vttTypes";
 
 type SceneData = (FoundryVTTData | VTTMapData) & {
@@ -54,6 +67,42 @@ type SceneInfo = {
   isVideo?: boolean;
 };
 
+type PairedImportSelection = {
+  name: string;
+  mediaFile: File;
+  wallDataFile: File;
+  wallData: VTTMapData;
+  isVideo: boolean;
+};
+
+type PendingMapSelectionAction = "add-current" | "multi-scene";
+type CompanionWallData = FoundryVTTData | VTTMapData;
+type MapWorkflowRunOptions = {
+  forceSelectionPrompt?: boolean;
+  resetSelectionCache?: boolean;
+};
+
+const PREVIEW_HOVER_OPEN_DELAY_MS = 500;
+const PREVIEW_TOUCH_OPEN_DELAY_MS = 240;
+const PREVIEW_TOUCH_RELEASE_THRESHOLD_MS = 120;
+
+const showMapWorkflowMismatchWarning = async (
+  result: MapWorkflowResult,
+  options: { includeWalls: boolean; includeLights: boolean },
+) => {
+  if (!options.includeWalls && !options.includeLights) return;
+  if (result.unmatchedSelectionNames.length === 0) return;
+
+  const unmatchedCount = result.unmatchedSelectionNames.length;
+  const preview = result.unmatchedSelectionNames.slice(0, 3).join(", ");
+  const moreSuffix = unmatchedCount > 3 ? ` (+${unmatchedCount - 3} more)` : "";
+
+  await OBR.notification.show(
+    `${unmatchedCount} selected map(s) did not match uploaded metadata, so walls/doors/lights were skipped for those maps. ${preview}${moreSuffix}`,
+    "WARNING",
+  );
+};
+
 const hexToRgbChannels = (color: string): string | null => {
   const hex = color.match(/^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/)?.[1];
   if (!hex) return null;
@@ -64,7 +113,7 @@ const hexToRgbChannels = (color: string): string | null => {
   return `${r}, ${g}, ${b}`;
 };
 
-const sceneHasWallData = (sceneData: SceneData): boolean => {
+const sceneHasWallsOrDoors = (sceneData: SceneData): boolean => {
   if (isFoundryVTTData(sceneData)) {
     return Array.isArray(sceneData.walls) && sceneData.walls.length > 0;
   }
@@ -73,9 +122,55 @@ const sceneHasWallData = (sceneData: SceneData): boolean => {
   return (
     (Array.isArray(vttData.line_of_sight) &&
       vttData.line_of_sight.length > 0) ||
+    (Array.isArray(vttData.objects_line_of_sight) &&
+      vttData.objects_line_of_sight.length > 0) ||
     (Array.isArray(vttData.portals) && vttData.portals.length > 0)
   );
 };
+
+const sceneHasLightData = (sceneData: SceneData): boolean => {
+  if (isFoundryVTTData(sceneData)) {
+    const foundryLights = (sceneData as { lights?: unknown[] }).lights;
+    return Array.isArray(foundryLights) && foundryLights.length > 0;
+  }
+
+  const vttData = sceneData as Partial<VTTMapData>;
+  return Array.isArray(vttData.lights) && vttData.lights.length > 0;
+};
+
+const wallDataHasLights = (wallData: CompanionWallData | null): boolean => {
+  if (!wallData) return false;
+  if (isFoundryVTTData(wallData)) {
+    const foundryLights = (wallData as { lights?: unknown[] }).lights;
+    return Array.isArray(foundryLights) && foundryLights.length > 0;
+  }
+  return Array.isArray(wallData.lights) && wallData.lights.length > 0;
+};
+
+const wallDataHasWallsOrDoors = (
+  wallData: CompanionWallData | null,
+): boolean => {
+  if (!wallData) return false;
+  if (isFoundryVTTData(wallData)) {
+    return Array.isArray(wallData.walls) && wallData.walls.length > 0;
+  }
+  return (
+    (Array.isArray(wallData.line_of_sight) &&
+      wallData.line_of_sight.length > 0) ||
+    (Array.isArray(wallData.objects_line_of_sight) &&
+      wallData.objects_line_of_sight.length > 0) ||
+    (Array.isArray(wallData.portals) && wallData.portals.length > 0)
+  );
+};
+
+function isRawMediaFile(file: File): boolean {
+  const lowerName = file.name.toLowerCase();
+  return (
+    file.type.startsWith("image/") ||
+    file.type.startsWith("video/") ||
+    /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(lowerName)
+  );
+}
 
 type VideoReadabilityProbe = {
   readable: boolean;
@@ -136,19 +231,70 @@ const probeBrowserVideoReadability = async (
   });
 };
 
+const hashMapSourceSignature = (value: string): string => {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+};
+
 function App() {
   const isContextMenuMode =
     new URLSearchParams(window.location.search).get("context") === "true";
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedWallDataFile, setSelectedWallDataFile] = useState<File | null>(
+    null,
+  );
+  const [selectedWallData, setSelectedWallData] =
+    useState<CompanionWallData | null>(null);
+  const [selectedRawFiles, setSelectedRawFiles] = useState<File[]>([]);
+  const [selectedPairedImports, setSelectedPairedImports] = useState<
+    PairedImportSelection[]
+  >([]);
   const [moduleUrl, setModuleUrl] = useState("");
   const [zipObject, setZipObject] = useState<JSZip | null>(null);
   const [availableScenes, setAvailableScenes] = useState<SceneInfo[]>([]);
   const [selectedSceneIndex, setSelectedSceneIndex] = useState(0);
+  const [selectedSceneIndices, setSelectedSceneIndices] = useState<number[]>(
+    [],
+  );
+  const [layoutMode, setLayoutMode] = useState<MapLayoutMode>("GRID");
+  const [mapPlacementMode, setMapPlacementMode] =
+    useState<MapPlacementMode>("RIGHT");
+  const [layoutSpacing, setLayoutSpacing] = useState("");
+  const [snapToGrid, setSnapToGrid] = useState(true);
+  const [layoutScalePercent, setLayoutScalePercent] = useState("100");
+  const [includeMapImages, setIncludeMapImages] = useState(true);
+  const [includeWallsWithMaps, setIncludeWallsWithMaps] = useState(true);
+  const [includeImportedLights, setIncludeImportedLights] = useState(true);
+  const [importedLightType, setImportedLightType] = useState<
+    "AUTO" | "PRIMARY" | "SECONDARY" | "AUXILIARY"
+  >("AUTO");
+  const [useSoftEdgesForLights, setUseSoftEdgesForLights] = useState(true);
+  const [lightShadowDetail, setLightShadowDetail] = useState<
+    "fast" | "obr-default"
+  >("fast");
+  const [lockImportedMaps, setLockImportedMaps] = useState(true);
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+  const [multiSceneName, setMultiSceneName] = useState("Multi Map Scene");
+  const [pendingMapSelection, setPendingMapSelection] = useState<{
+    token: string;
+    action: PendingMapSelectionAction;
+  } | null>(null);
+  const [mapSelectionToken, setMapSelectionToken] = useState<string | null>(
+    null,
+  );
+  const [lastMapWorkflowAction, setLastMapWorkflowAction] =
+    useState<PendingMapSelectionAction | null>(null);
 
   const [hoveredSceneThumb, setHoveredSceneThumb] = useState<{
     url: string;
     isVideo?: boolean;
   } | null>(null);
+  const [canHoverPreview, setCanHoverPreview] = useState(false);
+  const [touchMultiSelectMode, setTouchMultiSelectMode] = useState(false);
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [manualDownloadUrl, setManualDownloadUrl] = useState<string | null>(
     null,
@@ -156,17 +302,19 @@ function App() {
 
   const [isFoundryFormat, setIsFoundryFormat] = useState(false);
   const [hasImage, setHasImage] = useState(false);
+  const [selectedFileHasWallsOrDoors, setSelectedFileHasWallsOrDoors] =
+    useState(false);
+  const [selectedFileHasLights, setSelectedFileHasLights] = useState(false);
   const [compressionMode, setCompressionMode] =
     useState<CompressionMode>("standard");
-  const [showAdvancedVideoOptions, setShowAdvancedVideoOptions] =
-    useState(false);
   const [preferredVideoCodec, setPreferredVideoCodec] =
     useState<VideoCodecPreference>("auto");
   const [browserCodecAvailability, setBrowserCodecAvailability] =
     useState<BrowserVideoCodecAvailability | null>(null);
   const [removeVideoAudio, setRemoveVideoAudio] = useState(false);
   const [forceVideoTranscode, setForceVideoTranscode] = useState(false);
-  const [maxVideoDimension, setMaxVideoDimension] = useState<string>("");
+  const [maxResolutionDimension, setMaxResolutionDimension] =
+    useState<string>("");
   const [isVideoCompressionSupported, setIsVideoCompressionSupported] =
     useState(true);
   const [videoCompressionSupportMessage, setVideoCompressionSupportMessage] =
@@ -174,6 +322,8 @@ function App() {
 
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [compressionStage, setCompressionStage] = useState<string | null>(null);
+  const [mapFileProgress, setMapFileProgress] =
+    useState<MapFileProgress | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [theme, setTheme] = useState<Theme | null>(null);
   const [isGM, setIsGM] = useState(false);
@@ -181,19 +331,192 @@ function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const compressionAbortRef = useRef<AbortController | null>(null);
   const heightRafRef = useRef<number | null>(null);
-  const selectedModuleScene = availableScenes[selectedSceneIndex];
-  const selectedSceneHasWallData = selectedModuleScene
-    ? sceneHasWallData(selectedModuleScene.data)
-    : true;
-  const selectedSceneIsVideo = !!selectedModuleScene?.isVideo;
+  const previewOpenTimeoutRef = useRef<number | null>(null);
+  const previewHideTimeoutRef = useRef<number | null>(null);
+  const suppressNextCardClickRef = useRef(false);
+  const previewSourceIndexRef = useRef<number | null>(null);
+  const suppressedPreviewCardIndexRef = useRef<number | null>(null);
+  const touchPreviewPressStartedAtRef = useRef<number | null>(null);
+
+  const clearPreviewOpenTimeout = () => {
+    if (previewOpenTimeoutRef.current !== null) {
+      window.clearTimeout(previewOpenTimeoutRef.current);
+      previewOpenTimeoutRef.current = null;
+    }
+  };
+
+  const clearPreviewHideTimeout = () => {
+    if (previewHideTimeoutRef.current !== null) {
+      window.clearTimeout(previewHideTimeoutRef.current);
+      previewHideTimeoutRef.current = null;
+    }
+  };
+
+  const schedulePreviewOpen = (
+    sourceIndex: number,
+    preview: { url: string; isVideo?: boolean },
+    delayMs: number,
+    onShow?: () => void,
+  ) => {
+    if (suppressedPreviewCardIndexRef.current === sourceIndex) return;
+    clearPreviewOpenTimeout();
+    clearPreviewHideTimeout();
+    previewOpenTimeoutRef.current = window.setTimeout(() => {
+      previewSourceIndexRef.current = sourceIndex;
+      setHoveredSceneThumb(preview);
+      previewOpenTimeoutRef.current = null;
+      onShow?.();
+    }, delayMs);
+  };
+
+  const hideHoverPreviewSoon = () => {
+    clearPreviewOpenTimeout();
+    clearPreviewHideTimeout();
+    previewHideTimeoutRef.current = window.setTimeout(() => {
+      setHoveredSceneThumb(null);
+      previewSourceIndexRef.current = null;
+      previewHideTimeoutRef.current = null;
+    }, 140);
+  };
+  const selectedSceneIndexes = isContextMenuMode
+    ? [selectedSceneIndex]
+    : selectedSceneIndices.length > 0
+      ? selectedSceneIndices
+      : [selectedSceneIndex];
+  const selectedScenes = selectedSceneIndexes
+    .map((idx) => availableScenes[idx])
+    .filter((scene): scene is SceneInfo => !!scene);
+  const usesTouchSelectionControls =
+    !isContextMenuMode && availableScenes.length > 1 && !canHoverPreview;
+  const hasRawMediaSources =
+    selectedRawFiles.length > 0 ||
+    (!!selectedFile && isRawMediaFile(selectedFile));
+  const hasPairedMapSources = selectedPairedImports.length > 0;
+  const hasEmbeddedMapDataSource =
+    availableScenes.length === 0 &&
+    !!selectedFile &&
+    !isRawMediaFile(selectedFile) &&
+    hasImage;
+  const hasArchiveMapSources =
+    availableScenes.length > 0 &&
+    selectedScenes.some(
+      (scene) => !!(scene.data.img || scene.data.background?.src),
+    );
+  const hasArchiveLightSources =
+    availableScenes.length > 0 &&
+    selectedScenes.some((scene) => sceneHasLightData(scene.data));
+  const hasCompanionWallData = wallDataHasWallsOrDoors(selectedWallData);
+  const hasCompanionLightData = wallDataHasLights(selectedWallData);
+  const hasPairedImportWallData = selectedPairedImports.some((selection) =>
+    wallDataHasWallsOrDoors(selection.wallData),
+  );
+  const hasPairedImportLightData = selectedPairedImports.some(
+    (selection) =>
+      Array.isArray(selection.wallData.lights) &&
+      selection.wallData.lights.length > 0,
+  );
+  const hasStandaloneFileLightData =
+    !!selectedFile && !isRawMediaFile(selectedFile) && selectedFileHasLights;
+  const hasStandaloneFileWallData =
+    !!selectedFile &&
+    !isRawMediaFile(selectedFile) &&
+    selectedFileHasWallsOrDoors;
+  const hasLightImportSources =
+    hasArchiveLightSources ||
+    hasCompanionLightData ||
+    hasPairedImportLightData ||
+    hasStandaloneFileLightData;
+  const hasMapWorkflowSources =
+    hasArchiveMapSources ||
+    hasRawMediaSources ||
+    hasEmbeddedMapDataSource ||
+    hasPairedMapSources;
+  const selectedSceneHasWallsOrDoors =
+    availableScenes.length === 0 ||
+    selectedScenes.some((scene) => sceneHasWallsOrDoors(scene.data));
+  const selectedSceneHasEnabledFogData =
+    availableScenes.length === 0 ||
+    selectedScenes.some(
+      (scene) =>
+        (includeWallsWithMaps && sceneHasWallsOrDoors(scene.data)) ||
+        (includeImportedLights && sceneHasLightData(scene.data)),
+    );
+  const selectedSceneHasMap =
+    availableScenes.length === 0 ||
+    selectedScenes.some(
+      (scene) => !!(scene.data.img || scene.data.background?.src),
+    );
+  const selectedSceneIsVideo = selectedScenes.some((scene) => !!scene.isVideo);
+  const selectedPairedImportsContainVideo = selectedPairedImports.some(
+    (selection) => selection.isVideo,
+  );
   const selectedFileIsVideo =
     !!selectedFile &&
     (selectedFile.type.startsWith("video/") ||
       /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(selectedFile.name.toLowerCase()));
+  const selectedRawFilesContainVideo = selectedRawFiles.some(
+    (file) =>
+      file.type.startsWith("video/") ||
+      /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(file.name.toLowerCase()),
+  );
   const selectedInputIsVideo =
-    availableScenes.length > 0 ? selectedSceneIsVideo : selectedFileIsVideo;
+    availableScenes.length > 0
+      ? selectedSceneIsVideo
+      : selectedPairedImports.length > 0
+        ? selectedPairedImportsContainVideo
+        : selectedRawFiles.length > 0
+          ? selectedRawFilesContainVideo
+          : selectedFileIsVideo;
+  const selectedSourceCount =
+    availableScenes.length > 0
+      ? selectedScenes.length
+      : selectedPairedImports.length > 0
+        ? selectedPairedImports.length
+        : selectedRawFiles.length > 0
+          ? selectedRawFiles.length
+          : selectedFile
+            ? 1
+            : 0;
+  const hasWallImportSources =
+    (availableScenes.length > 0 && selectedSceneHasWallsOrDoors) ||
+    hasCompanionWallData ||
+    hasPairedImportWallData ||
+    hasStandaloneFileWallData;
+  const wantsMapImport = includeMapImages && hasMapWorkflowSources;
+  const wantsWallDoorImport = includeWallsWithMaps && hasWallImportSources;
+  const wantsLightImport = includeImportedLights && hasLightImportSources;
+  const wantsFogFeatureImport = wantsWallDoorImport || wantsLightImport;
+  const canImportToCurrentScene = wantsMapImport || wantsFogFeatureImport;
+  const canCreateNewScene =
+    !isContextMenuMode &&
+    selectedSourceCount > 0 &&
+    includeMapImages &&
+    hasMapWorkflowSources;
+  const shouldUseMultiMapSceneCreation =
+    !isContextMenuMode &&
+    includeMapImages &&
+    hasMapWorkflowSources &&
+    selectedSourceCount > 1;
+  const shouldShowLayoutControls =
+    !isContextMenuMode &&
+    includeMapImages &&
+    hasMapWorkflowSources &&
+    selectedSourceCount > 1;
+  const shouldShowPlacementControl =
+    !isContextMenuMode && includeMapImages && hasMapWorkflowSources;
+  const useMultiSceneSelectionLabel =
+    !isContextMenuMode && selectedSceneIndices.length > 1;
   const videoCompressionBlocked =
     selectedInputIsVideo && !isVideoCompressionSupported;
+  const shouldShowImportOptionsPanel = isContextMenuMode
+    ? hasWallImportSources || hasLightImportSources
+    : hasImage || hasWallImportSources || hasLightImportSources;
+  const hasQuickImportOptions = includeMapImages && hasImage;
+  const hasAdvancedOptionContent =
+    hasMapWorkflowSources ||
+    hasWallImportSources ||
+    hasLightImportSources ||
+    hasImage;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
 
   useEffect(
@@ -237,7 +560,48 @@ function App() {
   }, [browserCodecAvailability, preferredVideoCodec]);
 
   useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+
+    const mediaQuery = window.matchMedia("(hover: hover) and (pointer: fine)");
+    const updateCanHover = () => {
+      setCanHoverPreview(mediaQuery.matches);
+    };
+
+    updateCanHover();
+    mediaQuery.addEventListener("change", updateCanHover);
+
+    return () => {
+      mediaQuery.removeEventListener("change", updateCanHover);
+    };
+  }, []);
+
+  useEffect(
+    () => () => {
+      clearPreviewOpenTimeout();
+      clearPreviewHideTimeout();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    clearPreviewOpenTimeout();
+    clearPreviewHideTimeout();
+    setHoveredSceneThumb(null);
+  }, [canHoverPreview]);
+
+  useEffect(() => {
+    if (canHoverPreview && touchMultiSelectMode) {
+      setTouchMultiSelectMode(false);
+    }
+  }, [canHoverPreview, touchMultiSelectMode]);
+
+  useEffect(() => {
     let isMounted = true;
+    const parsedMaxDimension = Number(maxResolutionDimension);
+    const preflightOptions =
+      Number.isFinite(parsedMaxDimension) && parsedMaxDimension > 0
+        ? { maxDimension: parsedMaxDimension }
+        : undefined;
 
     const setSupported = () => {
       if (!isMounted) return;
@@ -258,8 +622,13 @@ function App() {
       }
 
       if (availableScenes.length > 0) {
-        const scene = availableScenes[selectedSceneIndex];
-        if (!scene || !scene.isVideo || !zipObject || !isFoundryVTTData(scene.data)) {
+        const scene = selectedScenes.find((candidate) => candidate.isVideo);
+        if (
+          !scene ||
+          !scene.isVideo ||
+          !zipObject ||
+          !isFoundryVTTData(scene.data)
+        ) {
           setSupported();
           return;
         }
@@ -282,6 +651,7 @@ function App() {
           } else {
             const preflight = await preflightVideoCompression(
               mediaBlob,
+              preflightOptions,
             );
             if (!isMounted) return;
             if (!preflight.supported) {
@@ -301,12 +671,19 @@ function App() {
         return;
       }
 
-      if (!selectedFileIsVideo || !selectedFile) {
+      const primaryMediaFile =
+        selectedRawFiles.find(
+          (file) =>
+            file.type.startsWith("video/") ||
+            /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(file.name.toLowerCase()),
+        ) || (selectedFileIsVideo ? selectedFile : null);
+
+      if (!primaryMediaFile) {
         setSupported();
         return;
       }
 
-      const probe = await probeBrowserVideoReadability(selectedFile);
+      const probe = await probeBrowserVideoReadability(primaryMediaFile);
       if (!isMounted) return;
 
       if (!probe.readable) {
@@ -315,7 +692,8 @@ function App() {
         );
       } else {
         const preflight = await preflightVideoCompression(
-          selectedFile,
+          primaryMediaFile,
+          preflightOptions,
         );
         if (!isMounted) return;
         if (!preflight.supported) {
@@ -337,10 +715,12 @@ function App() {
     };
   }, [
     availableScenes,
-    selectedSceneIndex,
+    selectedScenes,
     selectedFile,
+    selectedRawFiles,
     selectedFileIsVideo,
     selectedInputIsVideo,
+    maxResolutionDimension,
     zipObject,
   ]);
 
@@ -419,6 +799,55 @@ function App() {
     isContextMenuMode,
   ]);
 
+  useEffect(() => {
+    if (availableScenes.length === 0) {
+      if (selectedSceneIndices.length > 0) {
+        setSelectedSceneIndices([]);
+      }
+      return;
+    }
+
+    if (selectedSceneIndices.length === 0) {
+      setSelectedSceneIndices([selectedSceneIndex]);
+    }
+  }, [availableScenes, selectedSceneIndex, selectedSceneIndices]);
+
+  useEffect(() => {
+    if (selectedSceneIndices.length === 0) {
+      return;
+    }
+    if (!selectedSceneIndices.includes(selectedSceneIndex)) {
+      setSelectedSceneIndex(selectedSceneIndices[0]);
+    }
+  }, [selectedSceneIndices, selectedSceneIndex]);
+
+  useEffect(() => {
+    if (selectedRawFiles.length > 0 || selectedPairedImports.length > 0) {
+      if (!hasImage) setHasImage(true);
+      return;
+    }
+
+    if (availableScenes.length > 0) {
+      setHasImage(
+        selectedScenes.some(
+          (scene) => !!(scene.data.img || scene.data.background?.src),
+        ),
+      );
+    }
+  }, [
+    availableScenes,
+    selectedScenes,
+    selectedRawFiles,
+    selectedPairedImports,
+    hasImage,
+  ]);
+
+  useEffect(() => {
+    if (!hasAdvancedOptionContent && showAdvancedOptions) {
+      setShowAdvancedOptions(false);
+    }
+  }, [hasAdvancedOptionContent, showAdvancedOptions]);
+
   // Set theme CSS variables when theme changes
   useEffect(() => {
     if (!theme) return;
@@ -457,203 +886,21 @@ function App() {
     if (textRgb) root.style.setProperty("--text-primary-rgb", textRgb);
   }, [theme]);
 
-  const normalizeZipPath = (path: string): string =>
-    path
-      .replace(/\\/g, "/")
-      .replace(/^\.\//, "")
-      .replace(/^\//, "")
-      .replace(/\/+/g, "/");
-
-  const findLevelDbFilesForPack = (zip: JSZip, packPath: string): string[] => {
-    const allPaths = Object.keys(zip.files);
-    const normalizedPackPath = normalizeZipPath(packPath).replace(/\/+$/, "");
-    const candidateRoots = new Set<string>();
-
-    if (normalizedPackPath) {
-      candidateRoots.add(normalizedPackPath);
-
-      if (normalizedPackPath.toLowerCase().endsWith(".db")) {
-        candidateRoots.add(normalizedPackPath.slice(0, -3));
-      }
-
-      const lastSlash = normalizedPackPath.lastIndexOf("/");
-      const baseName =
-        lastSlash >= 0
-          ? normalizedPackPath.slice(lastSlash + 1)
-          : normalizedPackPath;
-      if (baseName.toLowerCase().endsWith(".db")) {
-        const trimmedBase = baseName.slice(0, -3);
-        candidateRoots.add(trimmedBase);
-        if (lastSlash >= 0) {
-          candidateRoots.add(
-            `${normalizedPackPath.slice(0, lastSlash + 1)}${trimmedBase}`,
-          );
-        }
-      }
-    }
-
-    const normalizedCandidates = Array.from(candidateRoots).map((candidate) =>
-      normalizeZipPath(candidate).replace(/\/+$/, "/").toLowerCase(),
-    );
-
-    const matches = allPaths.filter((path) => {
-      const normalizedPath = normalizeZipPath(path).toLowerCase();
-      if (!normalizedPath.endsWith(".ldb")) return false;
-
-      return normalizedCandidates.some(
-        (candidate) =>
-          normalizedPath.startsWith(candidate) ||
-          normalizedPath.includes(`/${candidate}`),
-      );
-    });
-
-    return Array.from(new Set(matches)).sort();
-  };
+  const normalizeFileStem = (fileName: string): string =>
+    fileName
+      .toLowerCase()
+      .replace(/\.[^/.]+$/, "")
+      .trim();
 
   const handleZipFile = async (fileOrBlob: Blob | File) => {
     setIsLoading(true);
     try {
       const zip = await JSZip.loadAsync(fileOrBlob);
       setZipObject(zip);
-
-      let moduleJsonFile = zip.file("module.json");
-      if (!moduleJsonFile) {
-        const match = Object.keys(zip.files).find((p) =>
-          p.endsWith("module.json"),
-        );
-        if (match) moduleJsonFile = zip.file(match);
-      }
-
-      let moduleJson = null;
-      if (moduleJsonFile) {
-        const content = await moduleJsonFile.async("string");
-        moduleJson = JSON.parse(content);
-      }
-
-      const scenes: SceneInfo[] = [];
-
-      if (moduleJson && Array.isArray(moduleJson.packs)) {
-        for (const pack of moduleJson.packs) {
-          if (pack.type === "Scene" && pack.path) {
-            let packPath = pack.path.replace(/\\/g, "/");
-            if (packPath.startsWith(".")) packPath = packPath.substring(1);
-            if (packPath.startsWith("/")) packPath = packPath.substring(1);
-
-            let packFile = zip.file(packPath);
-            if (!packFile) {
-              const match = Object.keys(zip.files).find(
-                (p) => p.endsWith(packPath) || packPath.endsWith(p),
-              );
-              if (match) packFile = zip.file(match);
-            }
-
-            if (packFile) {
-              const content = await packFile.async("string");
-              const lines = content
-                .split("\n")
-                .filter((l) => l.trim().length > 0);
-              for (const line of lines) {
-                try {
-                  const scene = JSON.parse(line);
-                  if (
-                    isFoundryVTTData(scene) &&
-                    typeof scene.name === "string"
-                  ) {
-                    scenes.push({
-                      name: scene.name,
-                      data: scene,
-                      fileSource:
-                        fileOrBlob instanceof File ? fileOrBlob.name : "module",
-                    });
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-            } else {
-              // Try LevelDB format (it might be a directory in the zip)
-              // Support both legacy `<pack>.db` paths and modern `<pack>/` ldb directories.
-              const ldbFiles = findLevelDbFilesForPack(zip, packPath);
-
-              if (ldbFiles.length > 0) {
-                const ldbBuffers: ArrayBuffer[] = [];
-                for (const f of ldbFiles) {
-                  ldbBuffers.push(await zip.file(f)!.async("arraybuffer"));
-                }
-                const ldbScenes = extractScenesFromLevelDB(ldbBuffers);
-                for (const scene of ldbScenes) {
-                  if (
-                    isFoundryVTTData(scene) &&
-                    typeof scene.name === "string"
-                  ) {
-                    scenes.push({
-                      name: scene.name,
-                      data: scene,
-                      fileSource:
-                        fileOrBlob instanceof File ? fileOrBlob.name : "module",
-                    });
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      if (scenes.length === 0) {
-        const allLdbFiles = Object.keys(zip.files)
-          .filter((path) => path.toLowerCase().endsWith(".ldb"))
-          .sort();
-
-        if (allLdbFiles.length > 0) {
-          const ldbBuffers: ArrayBuffer[] = [];
-          for (const ldbPath of allLdbFiles) {
-            ldbBuffers.push(await zip.file(ldbPath)!.async("arraybuffer"));
-          }
-
-          const ldbScenes = extractScenesFromLevelDB(ldbBuffers);
-          for (const scene of ldbScenes) {
-            if (isFoundryVTTData(scene) && typeof scene.name === "string") {
-              scenes.push({
-                name: scene.name,
-                data: scene,
-                fileSource:
-                  fileOrBlob instanceof File ? fileOrBlob.name : "module",
-              });
-            }
-          }
-        }
-
-        if (scenes.length === 0) {
-          for (const path of Object.keys(zip.files)) {
-            if (path.endsWith(".db") || path.endsWith(".json")) {
-              if (path.endsWith("module.json")) continue;
-              const content = await zip.file(path)!.async("string");
-              const lines = content
-                .split("\n")
-                .filter((l) => l.trim().length > 0);
-              for (const line of lines) {
-                try {
-                  const scene = JSON.parse(line);
-                  if (
-                    isFoundryVTTData(scene) &&
-                    typeof scene.name === "string"
-                  ) {
-                    scenes.push({
-                      name: scene.name,
-                      data: scene,
-                      fileSource:
-                        fileOrBlob instanceof File ? fileOrBlob.name : "module",
-                    });
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-            }
-          }
-        }
-      }
+      const scenes: SceneInfo[] = await extractScenesFromFoundryZip(
+        zip,
+        fileOrBlob instanceof File ? fileOrBlob.name : "module",
+      );
 
       if (scenes.length > 0) {
         // Pre-fetch thumbnails as object URLs
@@ -689,20 +936,42 @@ function App() {
 
         setAvailableScenes(scenes);
         setSelectedSceneIndex(0);
+        setSelectedSceneIndices([0]);
         setSelectedFile(null);
+        setSelectedWallDataFile(null);
+        setSelectedWallData(null);
+        setSelectedRawFiles([]);
+        setSelectedPairedImports([]);
+        resetMapWorkflowState();
         setIsFoundryFormat(true);
+        setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasLights(false);
         const firstScene = scenes[0].data;
         setHasImage(!!(firstScene.img || firstScene.background?.src));
       } else {
         OBR.notification.show("No scenes found in this ZIP.", "WARNING");
         setZipObject(null);
         setAvailableScenes([]);
+        setSelectedSceneIndices([]);
+        setSelectedWallDataFile(null);
+        setSelectedWallData(null);
+        setSelectedPairedImports([]);
+        resetMapWorkflowState();
+        setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasLights(false);
       }
     } catch (e) {
       console.error(e);
       OBR.notification.show("Failed to parse ZIP file.", "ERROR");
       setZipObject(null);
       setAvailableScenes([]);
+      setSelectedSceneIndices([]);
+      setSelectedWallDataFile(null);
+      setSelectedWallData(null);
+      setSelectedPairedImports([]);
+      resetMapWorkflowState();
+      setSelectedFileHasWallsOrDoors(false);
+      setSelectedFileHasLights(false);
     }
     setIsLoading(false);
   };
@@ -779,8 +1048,27 @@ function App() {
     // Otherwise, it's a standard VTT scene or regular Foundry config map
     const foundryFormat = isFoundryVTTData(fileData);
     const imageExists = hasMapImage(fileData);
+    const fileHasWallsOrDoors = foundryFormat
+      ? Array.isArray((fileData as { walls?: unknown[] }).walls) &&
+        ((fileData as { walls?: unknown[] }).walls?.length ?? 0) > 0
+      : (Array.isArray((fileData as Partial<VTTMapData>).line_of_sight) &&
+          ((fileData as Partial<VTTMapData>).line_of_sight?.length ?? 0) > 0) ||
+        (Array.isArray(
+          (fileData as Partial<VTTMapData>).objects_line_of_sight,
+        ) &&
+          ((fileData as Partial<VTTMapData>).objects_line_of_sight?.length ??
+            0) > 0) ||
+        (Array.isArray((fileData as Partial<VTTMapData>).portals) &&
+          ((fileData as Partial<VTTMapData>).portals?.length ?? 0) > 0);
+    const fileHasLights = foundryFormat
+      ? Array.isArray((fileData as { lights?: unknown[] }).lights) &&
+        ((fileData as { lights?: unknown[] }).lights?.length ?? 0) > 0
+      : Array.isArray((fileData as Partial<VTTMapData>).lights) &&
+        ((fileData as Partial<VTTMapData>).lights?.length ?? 0) > 0;
     setIsFoundryFormat(foundryFormat);
     setHasImage(imageExists);
+    setSelectedFileHasWallsOrDoors(fileHasWallsOrDoors);
+    setSelectedFileHasLights(fileHasLights);
 
     const fileObj =
       originalBlob instanceof File
@@ -788,27 +1076,192 @@ function App() {
         : new File([originalBlob], originalName, { type: originalBlob.type });
 
     setSelectedFile(fileObj);
+    setSelectedWallDataFile(null);
+    setSelectedWallData(null);
+    setSelectedRawFiles([]);
+    setSelectedPairedImports([]);
     setAvailableScenes([]);
+    setSelectedSceneIndices([]);
     setZipObject(null);
+    resetMapWorkflowState();
   };
 
-  const isRawMediaFile = (file: File): boolean => {
+  const isJsonDataFile = (file: File): boolean => {
     const lowerName = file.name.toLowerCase();
     return (
-      file.type.startsWith("image/") ||
-      file.type.startsWith("video/") ||
-      /\.(png|jpe?g|webp|avif|gif|bmp|mp4|webm|mov|avi|mkv|ogv)$/i.test(
-        lowerName,
-      )
+      lowerName.endsWith(".json") ||
+      file.type === "application/json" ||
+      file.type === "application/octet-stream"
+    );
+  };
+
+  const buildPairedImportSelections = async (
+    files: File[],
+  ): Promise<{
+    pairedImports: PairedImportSelection[];
+    unmatchedMediaFiles: File[];
+    unmatchedJsonFiles: File[];
+  }> => {
+    const mediaFiles = files.filter((file) => isRawMediaFile(file));
+    const jsonFiles = files.filter((file) => isJsonDataFile(file));
+
+    if (mediaFiles.length === 0 || jsonFiles.length === 0) {
+      return {
+        pairedImports: [],
+        unmatchedMediaFiles: mediaFiles,
+        unmatchedJsonFiles: jsonFiles,
+      };
+    }
+
+    const parsedJsonFiles = await Promise.all(
+      jsonFiles.map(async (file) => ({
+        file,
+        stem: normalizeFileStem(file.name),
+        wallData: await parseWallDataFile(file),
+      })),
+    );
+
+    const jsonBuckets = new Map<string, typeof parsedJsonFiles>();
+    for (const entry of parsedJsonFiles) {
+      const bucket = jsonBuckets.get(entry.stem) ?? [];
+      bucket.push(entry);
+      jsonBuckets.set(entry.stem, bucket);
+    }
+
+    const pairedImports: PairedImportSelection[] = [];
+    const unmatchedMediaFiles: File[] = [];
+
+    for (const mediaFile of mediaFiles) {
+      const stem = normalizeFileStem(mediaFile.name);
+      const bucket = jsonBuckets.get(stem);
+      const match = bucket?.shift();
+
+      if (!match) {
+        unmatchedMediaFiles.push(mediaFile);
+        continue;
+      }
+
+      if (bucket && bucket.length === 0) {
+        jsonBuckets.delete(stem);
+      }
+
+      const wallData = isFoundryVTTData(match.wallData)
+        ? convertFoundryToVTTData(match.wallData)
+        : match.wallData;
+
+      pairedImports.push({
+        name: stem || mediaFile.name,
+        mediaFile,
+        wallDataFile: match.file,
+        wallData,
+        isVideo:
+          mediaFile.type.startsWith("video/") ||
+          /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(mediaFile.name.toLowerCase()),
+      });
+    }
+
+    const unmatchedJsonFiles = Array.from(jsonBuckets.values()).flatMap(
+      (bucket) => bucket.map((entry) => entry.file),
+    );
+
+    return {
+      pairedImports,
+      unmatchedMediaFiles,
+      unmatchedJsonFiles,
+    };
+  };
+
+  const normalizeVTTWallDataPayload = (payload: unknown): VTTMapData | null => {
+    if (!payload || typeof payload !== "object") return null;
+
+    const source = payload as Partial<VTTMapData> & {
+      resolution?: {
+        map_origin?: { x?: unknown; y?: unknown };
+        map_size?: { x?: unknown; y?: unknown };
+        pixels_per_grid?: unknown;
+      };
+    };
+
+    const resolution = source.resolution;
+    if (!resolution || typeof resolution !== "object") return null;
+
+    const pixelsPerGrid = Number(resolution.pixels_per_grid);
+    const mapSizeX = Number(resolution.map_size?.x);
+    const mapSizeY = Number(resolution.map_size?.y);
+    const mapOriginX = Number(resolution.map_origin?.x ?? 0);
+    const mapOriginY = Number(resolution.map_origin?.y ?? 0);
+
+    if (
+      !Number.isFinite(pixelsPerGrid) ||
+      pixelsPerGrid <= 0 ||
+      !Number.isFinite(mapSizeX) ||
+      !Number.isFinite(mapSizeY)
+    ) {
+      return null;
+    }
+
+    const lineOfSight = Array.isArray(source.line_of_sight)
+      ? source.line_of_sight
+      : [];
+    const objectLineOfSight = Array.isArray(source.objects_line_of_sight)
+      ? source.objects_line_of_sight
+      : [];
+    const portals = Array.isArray(source.portals) ? source.portals : [];
+    const lights = Array.isArray(source.lights) ? source.lights : [];
+
+    if (
+      lineOfSight.length === 0 &&
+      objectLineOfSight.length === 0 &&
+      portals.length === 0 &&
+      lights.length === 0
+    ) {
+      return null;
+    }
+
+    return {
+      line_of_sight: lineOfSight,
+      objects_line_of_sight: objectLineOfSight,
+      portals,
+      lights,
+      resolution: {
+        map_origin: { x: mapOriginX, y: mapOriginY },
+        map_size: { x: mapSizeX, y: mapSizeY },
+        pixels_per_grid: pixelsPerGrid,
+      },
+    };
+  };
+
+  const parseWallDataFile = async (file: File): Promise<CompanionWallData> => {
+    const parsed = JSON.parse(await file.text()) as unknown;
+
+    if (isFoundryVTTData(parsed)) {
+      return parsed;
+    }
+
+    const normalizedVttWallData = normalizeVTTWallDataPayload(parsed);
+    if (normalizedVttWallData) {
+      return normalizedVttWallData;
+    }
+
+    throw new Error(
+      "Wall data JSON must be Foundry scene wall data or UVTT-style wall/light data with a valid resolution block.",
     );
   };
 
   const processMediaFile = (file: File) => {
     setSelectedFile(file);
+    setSelectedWallDataFile(null);
+    setSelectedWallData(null);
+    setSelectedRawFiles([]);
+    setSelectedPairedImports([]);
     setIsFoundryFormat(false);
     setHasImage(true);
+    setSelectedFileHasWallsOrDoors(false);
+    setSelectedFileHasLights(false);
     setAvailableScenes([]);
+    setSelectedSceneIndices([]);
     setZipObject(null);
+    resetMapWorkflowState();
   };
 
   const handleFetchUrl = async () => {
@@ -863,6 +1316,16 @@ function App() {
         mediaUrlPattern.test(moduleUrl.toLowerCase());
 
       if (isMediaUrl) {
+        if (isContextMenuMode) {
+          await OBR.notification.show(
+            "Context menu import only supports wall-data files (.uvtt, .dd2vtt, .json, or .zip).",
+            "WARNING",
+          );
+          if (fileInputRef.current) fileInputRef.current.value = "";
+          setIsLoading(false);
+          return;
+        }
+
         const mediaBlob = await res.blob();
         const fileName =
           moduleUrl.split("/").pop()?.split("?")[0] || "downloaded.asset";
@@ -907,8 +1370,110 @@ function App() {
     event: React.ChangeEvent<HTMLInputElement>,
   ) => {
     setManualDownloadUrl(null);
-    const file = event.target.files?.[0];
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) return;
+
+    resetMapWorkflowState();
+
+    if (files.length > 1) {
+      if (isContextMenuMode) {
+        await OBR.notification.show(
+          "Context menu import accepts one wall-data file at a time (.uvtt, .dd2vtt, .json, or .zip).",
+          "WARNING",
+        );
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
+        return;
+      }
+
+      const mediaFiles = files.filter((file) => isRawMediaFile(file));
+      const jsonFiles = files.filter((file) => isJsonDataFile(file));
+      const hasMixedMediaAndJson =
+        mediaFiles.length > 0 && jsonFiles.length > 0;
+
+      if (hasMixedMediaAndJson) {
+        try {
+          const { pairedImports, unmatchedMediaFiles, unmatchedJsonFiles } =
+            await buildPairedImportSelections(files);
+
+          if (pairedImports.length === 0) {
+            await OBR.notification.show(
+              "No matching media/JSON filename pairs were found. Make sure each image/video and its Foundry JSON share the same base name.",
+              "WARNING",
+            );
+            if (fileInputRef.current) {
+              fileInputRef.current.value = "";
+            }
+            return;
+          }
+
+          if (unmatchedMediaFiles.length > 0 || unmatchedJsonFiles.length > 0) {
+            const skippedCount =
+              unmatchedMediaFiles.length + unmatchedJsonFiles.length;
+            await OBR.notification.show(
+              `${skippedCount} unpaired file(s) were skipped because they did not match by name.`,
+              "WARNING",
+            );
+          }
+
+          setSelectedPairedImports(pairedImports);
+          setSelectedRawFiles([]);
+          setSelectedFile(null);
+          setSelectedWallDataFile(null);
+          setSelectedWallData(null);
+          setAvailableScenes([]);
+          setSelectedSceneIndices([]);
+          setZipObject(null);
+          setIsFoundryFormat(false);
+          setHasImage(true);
+          setSelectedFileHasWallsOrDoors(false);
+          setSelectedFileHasLights(false);
+          return;
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Could not parse one or more wall data JSON files.";
+          await OBR.notification.show(message, "WARNING");
+          if (fileInputRef.current) {
+            fileInputRef.current.value = "";
+          }
+          return;
+        }
+      }
+
+      if (!files.every((file) => isRawMediaFile(file))) {
+        await OBR.notification.show(
+          "Select image/video files only, or select matching image/video and wall data JSON files together.",
+          "WARNING",
+        );
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
+        return;
+      }
+
+      setSelectedRawFiles(files);
+      setSelectedPairedImports([]);
+      setSelectedFile(null);
+      setSelectedWallDataFile(null);
+      setSelectedWallData(null);
+      setAvailableScenes([]);
+      setSelectedSceneIndices([]);
+      setZipObject(null);
+      setIsFoundryFormat(false);
+      setHasImage(true);
+      setSelectedFileHasWallsOrDoors(false);
+      setSelectedFileHasLights(false);
+      return;
+    }
+
+    const file = files[0];
     if (file) {
+      setSelectedWallDataFile(null);
+      setSelectedWallData(null);
+      setSelectedRawFiles([]);
       const fileName = file.name.toLowerCase();
       if (fileName.endsWith(".zip")) {
         await handleZipFile(file);
@@ -917,6 +1482,16 @@ function App() {
       }
 
       if (isRawMediaFile(file)) {
+        if (isContextMenuMode) {
+          await OBR.notification.show(
+            "Context menu import only supports wall-data files (.uvtt, .dd2vtt, .json, or .zip).",
+            "WARNING",
+          );
+          if (fileInputRef.current) {
+            fileInputRef.current.value = "";
+          }
+          return;
+        }
         processMediaFile(file);
         return;
       }
@@ -956,8 +1531,13 @@ function App() {
             fileInputRef.current.value = "";
           }
           setSelectedFile(null);
+          setSelectedWallDataFile(null);
+          setSelectedWallData(null);
+          setSelectedPairedImports([]);
           setIsFoundryFormat(false);
           setHasImage(false);
+          setSelectedFileHasWallsOrDoors(false);
+          setSelectedFileHasLights(false);
         }
       } else {
         await OBR.notification.show(
@@ -968,14 +1548,433 @@ function App() {
           fileInputRef.current.value = "";
         }
         setSelectedFile(null);
+        setSelectedWallDataFile(null);
+        setSelectedWallData(null);
+        setSelectedPairedImports([]);
         setIsFoundryFormat(false);
         setHasImage(false);
+        setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasLights(false);
       }
     }
   };
 
+  const buildVideoCompressionOptions = (
+    abortSignal?: AbortSignal,
+  ): VideoCompressionOptions => {
+    const parsedMaxDimension = Number(maxResolutionDimension);
+    return {
+      preferredCodec: preferredVideoCodec,
+      keepAudio: !removeVideoAudio,
+      forceTranscodeUnderLimit: forceVideoTranscode,
+      ...(abortSignal ? { abortSignal } : {}),
+      ...(Number.isFinite(parsedMaxDimension) && parsedMaxDimension > 0
+        ? { maxDimension: parsedMaxDimension }
+        : {}),
+    };
+  };
+
+  const buildLightImportOptions = (): LightImportOptions => {
+    return {
+      includeLights: includeImportedLights,
+      sourceRadius: lightShadowDetail === "obr-default" ? 25 : 0,
+      falloff: useSoftEdgesForLights ? 1.5 : 0.2,
+      lightType: importedLightType,
+    };
+  };
+
+  const getLayoutScale = (): number => {
+    const parsed = Number(layoutScalePercent);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 1;
+    return Math.max(0.1, parsed / 100);
+  };
+
+  const getLayoutSpacing = (): number | undefined => {
+    if (layoutSpacing.trim() === "") return undefined;
+    const parsed = Number(layoutSpacing);
+    if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+    return Math.round(parsed);
+  };
+
+  const buildMapSelectionToken = (
+    sources: MapImportSource[],
+    settingsFingerprint: string,
+  ): string => {
+    const signature = sources
+      .map((source, index) => {
+        const media = source.mediaBlob;
+        const fileLike = media as File;
+        const lastModified =
+          typeof fileLike.lastModified === "number" ? fileLike.lastModified : 0;
+        const wallData = source.wallData;
+        const wallResolution = wallData?.resolution;
+
+        return [
+          index,
+          source.name,
+          media.type,
+          media.size,
+          lastModified,
+          Math.round(source.dpi ?? 0),
+          wallResolution?.pixels_per_grid ?? 0,
+          wallResolution?.map_size?.x ?? 0,
+          wallResolution?.map_size?.y ?? 0,
+        ].join("|");
+      })
+      .concat(settingsFingerprint)
+      .join("||");
+
+    return `scene-importer:${hashMapSourceSignature(signature)}`;
+  };
+
+  const buildMapSelectionSettingsFingerprint = (
+    action: PendingMapSelectionAction,
+  ): string => {
+    return JSON.stringify({
+      action,
+      compressionMode,
+      preferredVideoCodec,
+      removeVideoAudio,
+      forceVideoTranscode,
+      maxResolutionDimension,
+      snapToGrid,
+      includeMapImages,
+      includeWallsWithMaps,
+      includeImportedLights,
+      importedLightType,
+      lightShadowDetail,
+      useSoftEdgesForLights,
+    });
+  };
+
+  const buildMapImportSources = async (): Promise<MapImportSource[]> => {
+    const sources: MapImportSource[] = [];
+
+    if (selectedPairedImports.length > 0) {
+      for (const pairedImport of selectedPairedImports) {
+        sources.push({
+          name: pairedImport.name,
+          mediaBlob: pairedImport.mediaFile,
+          dpi: pairedImport.wallData.resolution.pixels_per_grid,
+          wallData: pairedImport.wallData,
+        });
+      }
+
+      return sources;
+    }
+
+    if (availableScenes.length > 0) {
+      if (!zipObject) {
+        throw new Error("Scene archive is not loaded.");
+      }
+
+      for (const scene of selectedScenes) {
+        if (!isFoundryVTTData(scene.data)) continue;
+        const imgPath = scene.data.img || scene.data.background?.src;
+        if (!imgPath) continue;
+
+        const mediaBlob = await extractImageFromZip(zipObject, imgPath);
+        const wallData = convertFoundryToVTTData(scene.data);
+        sources.push({
+          name: scene.name || "Map",
+          mediaBlob,
+          dpi: wallData.resolution.pixels_per_grid,
+          wallData,
+        });
+      }
+
+      return sources;
+    }
+
+    const mediaFiles =
+      selectedRawFiles.length > 0
+        ? selectedRawFiles
+        : selectedFile && isRawMediaFile(selectedFile)
+          ? [selectedFile]
+          : [];
+
+    for (const file of mediaFiles) {
+      const companionData =
+        selectedWallData && mediaFiles.length === 1 && file === selectedFile
+          ? selectedWallData
+          : undefined;
+      const wallData = companionData
+        ? isFoundryVTTData(companionData)
+          ? convertFoundryToVTTData(companionData)
+          : companionData
+        : undefined;
+      const sourceDpi = wallData?.resolution?.pixels_per_grid ?? 100;
+
+      sources.push({
+        name: file.name,
+        mediaBlob: file,
+        dpi: sourceDpi,
+        wallData,
+      });
+    }
+
+    if (
+      sources.length === 0 &&
+      selectedFile &&
+      !isRawMediaFile(selectedFile) &&
+      hasImage
+    ) {
+      const embeddedMapSource =
+        await buildMapImportSourceFromVTTFile(selectedFile);
+      if (embeddedMapSource) {
+        sources.push(embeddedMapSource);
+      }
+    }
+
+    return sources;
+  };
+
+  const resetMapWorkflowState = () => {
+    if (mapSelectionToken) {
+      clearMapSelectionState(mapSelectionToken);
+    }
+    setPendingMapSelection(null);
+    setMapSelectionToken(null);
+    setLastMapWorkflowAction(null);
+  };
+
+  const handleAddMapsToCurrentScene = async (
+    runOptions: MapWorkflowRunOptions = {},
+  ) => {
+    setIsLoading(true);
+    setUploadProgress(0);
+    setCompressionStage("Preparing maps");
+    setMapFileProgress(null);
+
+    try {
+      const sources = await buildMapImportSources();
+      if (sources.length === 0) {
+        await OBR.notification.show(
+          "No map images were found in the current selection.",
+          "WARNING",
+        );
+        return;
+      }
+
+      const abortController = new AbortController();
+      compressionAbortRef.current = abortController;
+
+      const computedSelectionToken = buildMapSelectionToken(
+        sources,
+        buildMapSelectionSettingsFingerprint("add-current"),
+      );
+      if (runOptions.resetSelectionCache) {
+        clearMapSelectionState(computedSelectionToken);
+      }
+
+      const hasMatchingPendingSelection =
+        pendingMapSelection?.action === "add-current" &&
+        pendingMapSelection.token === computedSelectionToken;
+
+      const activeSelectionToken = runOptions.resetSelectionCache
+        ? computedSelectionToken
+        : hasMatchingPendingSelection
+          ? pendingMapSelection.token
+          : mapSelectionToken === computedSelectionToken
+            ? mapSelectionToken
+            : computedSelectionToken;
+
+      const result = await addMapsToCurrentScene(sources, {
+        layout: layoutMode,
+        spacing: getLayoutSpacing(),
+        snapToGrid,
+        scale: getLayoutScale(),
+        placement: mapPlacementMode,
+        includeWalls: includeWallsWithMaps,
+        lightOptions: buildLightImportOptions(),
+        lockMaps: lockImportedMaps,
+        compressionMode,
+        selectionToken: activeSelectionToken,
+        forceSelectionPrompt: !!runOptions.forceSelectionPrompt,
+        videoOptions: buildVideoCompressionOptions(abortController.signal),
+        onProgress: setUploadProgress,
+        onStage: setCompressionStage,
+        onFileProgress: setMapFileProgress,
+      });
+
+      await showMapWorkflowMismatchWarning(result, {
+        includeWalls: includeWallsWithMaps,
+        includeLights: includeImportedLights,
+      });
+
+      setMapSelectionToken(activeSelectionToken);
+      setPendingMapSelection(null);
+      setLastMapWorkflowAction("add-current");
+      await OBR.notification.show("Maps added to current scene.", "SUCCESS");
+      if (isContextMenuMode) {
+        await OBR.modal.close("com.eppinguin.scene-importer/modal");
+      }
+    } catch (error) {
+      if (error instanceof MapSelectionPendingError) {
+        setMapSelectionToken(error.token);
+        setPendingMapSelection({ token: error.token, action: "add-current" });
+        setLastMapWorkflowAction("add-current");
+        await OBR.notification.show(
+          "No maps were selected. Click Continue Map Selection to reopen the picker without re-uploading.",
+          "INFO",
+        );
+        return;
+      }
+      console.error("Error adding maps to scene:", error);
+      const message = error instanceof Error ? error.message : "Unknown error";
+      await OBR.notification.show(`Error adding maps: ${message}`, "ERROR");
+    } finally {
+      compressionAbortRef.current = null;
+      setUploadProgress(null);
+      setCompressionStage(null);
+      setMapFileProgress(null);
+      setIsLoading(false);
+    }
+  };
+
+  const handleCreateMultiMapScene = async (
+    runOptions: MapWorkflowRunOptions = {},
+  ) => {
+    setIsLoading(true);
+    setUploadProgress(0);
+    setCompressionStage("Preparing maps");
+    setMapFileProgress(null);
+
+    try {
+      const sources = await buildMapImportSources();
+      if (sources.length === 0) {
+        await OBR.notification.show(
+          "No map images were found in the current selection.",
+          "WARNING",
+        );
+        return;
+      }
+
+      const abortController = new AbortController();
+      compressionAbortRef.current = abortController;
+
+      const computedSelectionToken = buildMapSelectionToken(
+        sources,
+        buildMapSelectionSettingsFingerprint("multi-scene"),
+      );
+      if (runOptions.resetSelectionCache) {
+        clearMapSelectionState(computedSelectionToken);
+      }
+
+      const hasMatchingPendingSelection =
+        pendingMapSelection?.action === "multi-scene" &&
+        pendingMapSelection.token === computedSelectionToken;
+
+      const activeSelectionToken = runOptions.resetSelectionCache
+        ? computedSelectionToken
+        : hasMatchingPendingSelection
+          ? pendingMapSelection.token
+          : mapSelectionToken === computedSelectionToken
+            ? mapSelectionToken
+            : computedSelectionToken;
+
+      const result = await createSceneWithMultipleMaps(sources, {
+        layout: layoutMode,
+        spacing: getLayoutSpacing(),
+        snapToGrid,
+        scale: getLayoutScale(),
+        includeWalls: includeWallsWithMaps,
+        lightOptions: buildLightImportOptions(),
+        lockMaps: lockImportedMaps,
+        compressionMode,
+        sceneName: multiSceneName,
+        selectionToken: activeSelectionToken,
+        forceSelectionPrompt: !!runOptions.forceSelectionPrompt,
+        videoOptions: buildVideoCompressionOptions(abortController.signal),
+        onProgress: setUploadProgress,
+        onStage: setCompressionStage,
+        onFileProgress: setMapFileProgress,
+      });
+
+      await showMapWorkflowMismatchWarning(result, {
+        includeWalls: includeWallsWithMaps,
+        includeLights: includeImportedLights,
+      });
+
+      setMapSelectionToken(activeSelectionToken);
+      setPendingMapSelection(null);
+      setLastMapWorkflowAction("multi-scene");
+      await OBR.notification.show("Multi-map scene created.", "SUCCESS");
+      await OBR.modal.close("com.eppinguin.scene-importer/modal");
+    } catch (error) {
+      if (error instanceof MapSelectionPendingError) {
+        setMapSelectionToken(error.token);
+        setPendingMapSelection({ token: error.token, action: "multi-scene" });
+        setLastMapWorkflowAction("multi-scene");
+        await OBR.notification.show(
+          "No maps were selected. Click Continue Map Selection to reopen the picker without re-uploading.",
+          "INFO",
+        );
+        return;
+      }
+      console.error("Error creating multi-map scene:", error);
+      const message = error instanceof Error ? error.message : "Unknown error";
+      await OBR.notification.show(`Error creating scene: ${message}`, "ERROR");
+    } finally {
+      compressionAbortRef.current = null;
+      setUploadProgress(null);
+      setCompressionStage(null);
+      setMapFileProgress(null);
+      setIsLoading(false);
+    }
+  };
+
+  const runMapWorkflowByAction = (
+    action: PendingMapSelectionAction,
+    runOptions: MapWorkflowRunOptions = {},
+  ) => {
+    if (action === "add-current") {
+      void handleAddMapsToCurrentScene(runOptions);
+      return;
+    }
+    void handleCreateMultiMapScene(runOptions);
+  };
+
+  const runMapWorkflowFromSelectionState = (
+    runOptions: MapWorkflowRunOptions = {},
+  ) => {
+    const action =
+      pendingMapSelection?.action ||
+      lastMapWorkflowAction ||
+      (shouldUseMultiMapSceneCreation ? "multi-scene" : "add-current");
+    runMapWorkflowByAction(action, runOptions);
+  };
+
+  const handleImportToCurrentScene = () => {
+    if (wantsMapImport) {
+      runMapWorkflowByAction("add-current");
+      return;
+    }
+    if (wantsFogFeatureImport) {
+      void handleAddWallsToCurrentScene();
+      return;
+    }
+    void OBR.notification.show(
+      "Enable at least one import option (image, walls/doors, lights).",
+      "INFO",
+    );
+  };
+
+  const handleCreateSceneDestination = () => {
+    if (shouldUseMultiMapSceneCreation) {
+      runMapWorkflowByAction("multi-scene");
+      return;
+    }
+    void handleCreateNewScene();
+  };
+
   const handleCreateNewScene = async () => {
-    if (!selectedFile && availableScenes.length === 0) return;
+    if (
+      !selectedFile &&
+      availableScenes.length === 0 &&
+      selectedPairedImports.length === 0
+    )
+      return;
 
     const waitForProgressFrame = async () => {
       await new Promise<void>((resolve) => {
@@ -986,27 +1985,41 @@ function App() {
     };
 
     setIsLoading(true);
+    resetMapWorkflowState();
     setUploadProgress(0);
+    setMapFileProgress(null);
     setCompressionStage(
       selectedInputIsVideo ? "Preparing video encoder" : "Preparing image",
     );
     await waitForProgressFrame();
     try {
-      const fileToUpload = selectedFile;
       const abortController = new AbortController();
       compressionAbortRef.current = abortController;
-      const parsedMaxDimension = Number(maxVideoDimension);
-      const videoCompressionOptions: VideoCompressionOptions = {
-        preferredCodec: preferredVideoCodec,
-        keepAudio: !removeVideoAudio,
-        forceTranscodeUnderLimit: forceVideoTranscode,
-        abortSignal: abortController.signal,
-        ...(Number.isFinite(parsedMaxDimension) && parsedMaxDimension > 0
-          ? { maxDimension: parsedMaxDimension }
-          : {}),
+      const videoCompressionOptions = buildVideoCompressionOptions(
+        abortController.signal,
+      );
+      const fogImportOptions = {
+        includeWalls: includeWallsWithMaps,
+        lightOptions: buildLightImportOptions(),
       };
 
-      if (availableScenes.length > 0 && zipObject) {
+      if (selectedPairedImports.length > 0) {
+        const pairedImport = selectedPairedImports[0];
+        const uploadName =
+          pairedImport.name ||
+          pairedImport.mediaFile.name.replace(/\.[^/.]+$/, "");
+
+        await uploadMediaSceneWithWallData(
+          pairedImport.mediaFile,
+          pairedImport.wallData,
+          uploadName,
+          compressionMode,
+          (progress) => setUploadProgress(progress),
+          videoCompressionOptions,
+          (stage) => setCompressionStage(stage),
+          fogImportOptions,
+        );
+      } else if (availableScenes.length > 0 && zipObject) {
         const scene = availableScenes[selectedSceneIndex].data;
         if (!isFoundryVTTData(scene)) {
           throw new Error("Selected scene data is not compatible.");
@@ -1023,19 +2036,41 @@ function App() {
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
           (stage) => setCompressionStage(stage),
+          fogImportOptions,
         );
         // Compression done — clear progress bar, show uploading state
         setUploadProgress(null);
         setCompressionStage(null);
         setIsLoading(true);
-      } else if (fileToUpload) {
-        await uploadSceneFromVTT(
-          fileToUpload,
-          compressionMode,
-          (progress) => setUploadProgress(progress),
-          videoCompressionOptions,
-          (stage) => setCompressionStage(stage),
-        );
+      } else if (selectedFile) {
+        const fileToUpload = selectedFile;
+        if (selectedWallData) {
+          if (!isRawMediaFile(fileToUpload)) {
+            throw new Error(
+              "When using a wall data JSON companion file, the map file must be an image or video.",
+            );
+          }
+
+          await uploadMediaSceneWithWallData(
+            fileToUpload,
+            selectedWallData,
+            fileToUpload.name.replace(/\.[^/.]+$/, ""),
+            compressionMode,
+            (progress) => setUploadProgress(progress),
+            videoCompressionOptions,
+            (stage) => setCompressionStage(stage),
+            fogImportOptions,
+          );
+        } else {
+          await uploadSceneFromVTT(
+            fileToUpload,
+            compressionMode,
+            (progress) => setUploadProgress(progress),
+            videoCompressionOptions,
+            (stage) => setCompressionStage(stage),
+            fogImportOptions,
+          );
+        }
       }
       // Compression done — clear progress bar, show uploading state
       setUploadProgress(null);
@@ -1089,7 +2124,7 @@ function App() {
       ) {
         OBR.notification.show(
           toNotificationMessage(
-            "This browser could not finish video compression in time. Try a browser/device with hardware-accelerated video encoding, or lower Max video dimension.",
+            "This browser could not finish video compression in time. Try a browser/device with hardware-accelerated video encoding, or lower Max resolution.",
           ),
           "WARNING",
         );
@@ -1101,8 +2136,8 @@ function App() {
       ) {
         const hint =
           compressionMode === "high"
-            ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max video dimension in Advanced options."
-            : "Try reducing Max video dimension in Advanced options or using H.264 codec.";
+            ? "Bestling may exceed your account upload limit. Try Standard mode or reduce Max resolution in Advanced settings."
+            : "Try reducing Max resolution in Advanced settings or using H.264 codec.";
         const suffix = message.endsWith(".") ? "" : ".";
         OBR.notification.show(
           toNotificationMessage(`${message}${suffix} ${hint}`),
@@ -1118,30 +2153,96 @@ function App() {
       compressionAbortRef.current = null;
       setUploadProgress(null);
       setCompressionStage(null);
+      setMapFileProgress(null);
       setIsLoading(false);
     }
   };
 
   const handleAddWallsToCurrentScene = async () => {
-    if (!selectedFile && availableScenes.length === 0) return;
-    if (availableScenes.length > 0 && !selectedSceneHasWallData) {
+    if (!includeWallsWithMaps && !includeImportedLights) {
       await OBR.notification.show(
-        "Selected scene has no walls or doors to import.",
+        "Enable walls/doors or lights to import fog data.",
         "INFO",
       );
       return;
     }
 
+    if (
+      !selectedFile &&
+      availableScenes.length === 0 &&
+      selectedPairedImports.length === 0 &&
+      selectedRawFiles.length === 0
+    ) {
+      return;
+    }
+    if (availableScenes.length > 0 && !selectedSceneHasEnabledFogData) {
+      const noFogDataMessage =
+        includeWallsWithMaps && includeImportedLights
+          ? "Selected scene has no walls, doors, or lights to import."
+          : includeWallsWithMaps
+            ? "Selected scene has no walls or doors to import."
+            : "Selected scene has no lights to import.";
+      await OBR.notification.show(noFogDataMessage, "INFO");
+      return;
+    }
+
     setIsLoading(true);
     try {
-      const s = availableScenes[selectedSceneIndex];
-      if (s) {
-        const wallData = isFoundryVTTData(s.data)
-          ? convertFoundryToVTTData(s.data)
-          : (s.data as VTTMapData);
-        await addItemsFromData(wallData, isContextMenuMode);
+      if (!isContextMenuMode && hasMapWorkflowSources) {
+        const sources = await buildMapImportSources();
+        const result = await addWallsToCurrentSceneWithLayout(sources, {
+          layout: layoutMode,
+          spacing: getLayoutSpacing(),
+          snapToGrid,
+          scale: getLayoutScale(),
+          placement: "ORIGIN",
+          includeWalls: includeWallsWithMaps,
+          lightOptions: buildLightImportOptions(),
+        });
+
+        await showMapWorkflowMismatchWarning(result, {
+          includeWalls: includeWallsWithMaps,
+          includeLights: includeImportedLights,
+        });
+
+        if (result.wallsAppliedToMapCount === 0) {
+          await OBR.notification.show(
+            "No walls, doors, or lights were found for the selected maps.",
+            "INFO",
+          );
+        } else {
+          await OBR.notification.show(
+            `Imported walls/doors/lights for ${result.wallsAppliedToMapCount} map(s).`,
+            "SUCCESS",
+          );
+        }
+      } else if (selectedWallData) {
+        await addItemsFromData(
+          isFoundryVTTData(selectedWallData)
+            ? convertFoundryToVTTData(selectedWallData)
+            : selectedWallData,
+          isContextMenuMode,
+          {
+            includeWalls: includeWallsWithMaps,
+            lightOptions: buildLightImportOptions(),
+          },
+        );
+      } else if (availableScenes.length > 0) {
+        const s = availableScenes[selectedSceneIndex];
+        if (s) {
+          const wallData = isFoundryVTTData(s.data)
+            ? convertFoundryToVTTData(s.data)
+            : (s.data as VTTMapData);
+          await addItemsFromData(wallData, isContextMenuMode, {
+            includeWalls: includeWallsWithMaps,
+            lightOptions: buildLightImportOptions(),
+          });
+        }
       } else if (selectedFile) {
-        await addItemsFromVTT(selectedFile, isContextMenuMode);
+        await addItemsFromVTT(selectedFile, isContextMenuMode, {
+          includeWalls: includeWallsWithMaps,
+          lightOptions: buildLightImportOptions(),
+        });
       }
 
       if (isContextMenuMode) {
@@ -1179,6 +2280,7 @@ function App() {
           <Stack className="file-upload" spacing={1}>
             <input
               type="file"
+              multiple
               accept=".uvtt,.dd2vtt,.json,.zip,application/json,application/octet-stream,application/zip,image/*,video/*"
               capture={undefined}
               onChange={handleFileSelect}
@@ -1252,7 +2354,45 @@ function App() {
                 </Typography>
                 <Typography className="file-info" variant="caption">
                   {(isFoundryFormat || !hasImage) &&
-                    "No map image found (walls and doors only)"}
+                    "No map image found (walls, doors, and lights only)"}
+                </Typography>
+                {selectedWallDataFile && (
+                  <Typography className="file-info" variant="caption">
+                    Walls JSON: {selectedWallDataFile.name}
+                  </Typography>
+                )}
+              </Box>
+            )}
+
+            {selectedRawFiles.length > 0 && (
+              <Box className="selected-file-block">
+                <Typography className="selected-file" variant="body2">
+                  Selected files: {selectedRawFiles.length}
+                </Typography>
+                <Typography className="file-info" variant="caption">
+                  {selectedRawFiles
+                    .slice(0, 3)
+                    .map((file) => file.name)
+                    .join(", ")}
+                  {selectedRawFiles.length > 3 ? "..." : ""}
+                </Typography>
+              </Box>
+            )}
+
+            {selectedPairedImports.length > 0 && (
+              <Box className="selected-file-block">
+                <Typography className="selected-file" variant="body2">
+                  Paired imports: {selectedPairedImports.length}
+                </Typography>
+                <Typography className="file-info" variant="caption">
+                  {selectedPairedImports
+                    .slice(0, 3)
+                    .map((pairedImport) => pairedImport.name)
+                    .join(", ")}
+                  {selectedPairedImports.length > 3 ? "..." : ""}
+                </Typography>
+                <Typography className="file-info" variant="caption">
+                  Media and JSON files are matched by their base filename.
                 </Typography>
               </Box>
             )}
@@ -1260,28 +2400,241 @@ function App() {
             {availableScenes.length > 0 && (
               <Box className="scene-selection section-gap">
                 <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                  Select Scene ({availableScenes.length} found)
+                  {isContextMenuMode || !useMultiSceneSelectionLabel
+                    ? `Select Scene (${availableScenes.length} found)`
+                    : `Select Maps (${selectedScenes.length}/${availableScenes.length})`}
                 </Typography>
+                {!isContextMenuMode && availableScenes.length > 1 && (
+                  <Typography
+                    variant="caption"
+                    className="help-text"
+                    sx={{ mb: 0.5 }}>
+                    {usesTouchSelectionControls
+                      ? touchMultiSelectMode
+                        ? "Multi-select mode: tap maps to toggle selection."
+                        : "Tap a map to select one. Turn on Multi-select mode to pick several maps."
+                      : "Click to select one map. Hold Shift to select a range. Hold Cmd/Ctrl and click to toggle selection."}
+                  </Typography>
+                )}
+                {usesTouchSelectionControls && (
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    className="touch-selection-controls"
+                    sx={{ mb: 1 }}>
+                    <Button
+                      size="small"
+                      variant={touchMultiSelectMode ? "contained" : "outlined"}
+                      onClick={() => {
+                        setTouchMultiSelectMode((previous) => {
+                          if (previous) {
+                            setSelectedSceneIndices([selectedSceneIndex]);
+                          }
+                          return !previous;
+                        });
+                      }}>
+                      {touchMultiSelectMode
+                        ? "Multi-select: On"
+                        : "Enable Multi-select"}
+                    </Button>
+                    {touchMultiSelectMode && (
+                      <>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => {
+                            const everyIndex = Array.from(
+                              { length: availableScenes.length },
+                              (_, sceneIndex) => sceneIndex,
+                            );
+                            setSelectedSceneIndices(everyIndex);
+                          }}>
+                          Select All
+                        </Button>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => {
+                            setSelectedSceneIndices([selectedSceneIndex]);
+                          }}>
+                          Keep One
+                        </Button>
+                      </>
+                    )}
+                  </Stack>
+                )}
                 <div
                   className="scene-gallery"
+                  onClickCapture={() => {
+                    if (!canHoverPreview || !hoveredSceneThumb) return;
+                    suppressedPreviewCardIndexRef.current =
+                      previewSourceIndexRef.current;
+                    clearPreviewOpenTimeout();
+                    clearPreviewHideTimeout();
+                    setHoveredSceneThumb(null);
+                  }}
                   onScroll={() => setHoveredSceneThumb(null)}>
                   {availableScenes.map((s, idx) => (
                     <div
                       key={idx}
-                      className={`scene-card ${selectedSceneIndex === idx ? "selected" : ""}`}
-                      onClick={() => {
+                      className={`scene-card ${
+                        (
+                          isContextMenuMode
+                            ? selectedSceneIndex === idx
+                            : selectedSceneIndices.includes(idx)
+                        )
+                          ? "selected"
+                          : ""
+                      }`}
+                      onClick={(event) => {
+                        if (suppressNextCardClickRef.current) {
+                          suppressNextCardClickRef.current = false;
+                          return;
+                        }
+
+                        const anchorIndex = Math.min(
+                          Math.max(selectedSceneIndex, 0),
+                          Math.max(availableScenes.length - 1, 0),
+                        );
                         setSelectedSceneIndex(idx);
                         setHasImage(!!(s.data.img || s.data.background?.src));
+
+                        if (isContextMenuMode) {
+                          setSelectedSceneIndices([idx]);
+                          return;
+                        }
+
+                        const isRangeSelect = event.shiftKey;
+                        const isMultiSelectToggle =
+                          event.metaKey ||
+                          event.ctrlKey ||
+                          (usesTouchSelectionControls && touchMultiSelectMode);
+
+                        if (isRangeSelect) {
+                          const start = Math.min(anchorIndex, idx);
+                          const end = Math.max(anchorIndex, idx);
+                          const range = Array.from(
+                            { length: end - start + 1 },
+                            (_, offset) => start + offset,
+                          );
+
+                          if (isMultiSelectToggle) {
+                            setSelectedSceneIndices((previous) => {
+                              const merged = new Set([...previous, ...range]);
+                              return Array.from(merged).sort((a, b) => a - b);
+                            });
+                            return;
+                          }
+
+                          setSelectedSceneIndices(range);
+                          return;
+                        }
+
+                        if (!isMultiSelectToggle) {
+                          setSelectedSceneIndices([idx]);
+                          return;
+                        }
+
+                        setSelectedSceneIndices((previous) => {
+                          const exists = previous.includes(idx);
+                          const next = exists
+                            ? previous.filter((value) => value !== idx)
+                            : [...previous, idx];
+                          return next.length > 0 ? next : [idx];
+                        });
                       }}
                       onMouseEnter={() => {
-                        if (s.thumbUrl) {
+                        if (!canHoverPreview || !s.thumbUrl) return;
+                        if (suppressedPreviewCardIndexRef.current === idx)
+                          return;
+                        const preview = {
+                          url: s.thumbUrl,
+                          isVideo: s.isVideo,
+                        };
+
+                        if (hoveredSceneThumb) {
+                          clearPreviewOpenTimeout();
+                          clearPreviewHideTimeout();
+                          previewSourceIndexRef.current = idx;
+                          setHoveredSceneThumb(preview);
+                          return;
+                        }
+
+                        schedulePreviewOpen(
+                          idx,
+                          preview,
+                          PREVIEW_HOVER_OPEN_DELAY_MS,
+                        );
+                      }}
+                      onMouseLeave={() => {
+                        if (!canHoverPreview) return;
+                        if (suppressedPreviewCardIndexRef.current === idx) {
+                          suppressedPreviewCardIndexRef.current = null;
+                        }
+                        hideHoverPreviewSoon();
+                      }}
+                      onPointerDown={(event) => {
+                        if (canHoverPreview || !s.thumbUrl) return;
+                        if (
+                          event.pointerType !== "touch" &&
+                          event.pointerType !== "pen"
+                        ) {
+                          return;
+                        }
+
+                        touchPreviewPressStartedAtRef.current = Date.now();
+
+                        schedulePreviewOpen(
+                          idx,
+                          {
+                            url: s.thumbUrl,
+                            isVideo: s.isVideo,
+                          },
+                          PREVIEW_TOUCH_OPEN_DELAY_MS,
+                          () => {
+                            suppressNextCardClickRef.current = true;
+                          },
+                        );
+                      }}
+                      onPointerUp={() => {
+                        if (canHoverPreview) return;
+                        const pressStartedAt =
+                          touchPreviewPressStartedAtRef.current;
+                        touchPreviewPressStartedAtRef.current = null;
+
+                        if (!s.thumbUrl || pressStartedAt === null) {
+                          clearPreviewOpenTimeout();
+                          return;
+                        }
+
+                        const elapsedMs = Date.now() - pressStartedAt;
+                        if (
+                          !hoveredSceneThumb &&
+                          elapsedMs >= PREVIEW_TOUCH_RELEASE_THRESHOLD_MS
+                        ) {
+                          clearPreviewOpenTimeout();
+                          clearPreviewHideTimeout();
+                          previewSourceIndexRef.current = idx;
                           setHoveredSceneThumb({
                             url: s.thumbUrl,
                             isVideo: s.isVideo,
                           });
+                          suppressNextCardClickRef.current = true;
+                          return;
                         }
+
+                        clearPreviewOpenTimeout();
                       }}
-                      onMouseLeave={() => setHoveredSceneThumb(null)}>
+                      onPointerCancel={() => {
+                        if (canHoverPreview) return;
+                        touchPreviewPressStartedAtRef.current = null;
+                        clearPreviewOpenTimeout();
+                      }}
+                      onPointerLeave={() => {
+                        if (canHoverPreview) return;
+                        touchPreviewPressStartedAtRef.current = null;
+                        clearPreviewOpenTimeout();
+                      }}>
                       <div className="scene-thumb-container">
                         {s.isVideo && (
                           <div className="video-badge">
@@ -1331,7 +2684,37 @@ function App() {
           </Stack>
 
           {hoveredSceneThumb && (
-            <div className="scene-preview-float">
+            <div
+              className={`scene-preview-float${canHoverPreview ? " hover-through" : ""}`}
+              role="button"
+              tabIndex={0}
+              onMouseEnter={() => {
+                clearPreviewHideTimeout();
+              }}
+              onMouseLeave={() => {
+                hideHoverPreviewSoon();
+              }}
+              onClick={() => {
+                suppressedPreviewCardIndexRef.current =
+                  previewSourceIndexRef.current;
+                clearPreviewOpenTimeout();
+                clearPreviewHideTimeout();
+                setHoveredSceneThumb(null);
+              }}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Escape" ||
+                  event.key === "Enter" ||
+                  event.key === " "
+                ) {
+                  event.preventDefault();
+                  suppressedPreviewCardIndexRef.current =
+                    previewSourceIndexRef.current;
+                  clearPreviewOpenTimeout();
+                  clearPreviewHideTimeout();
+                  setHoveredSceneThumb(null);
+                }
+              }}>
               {hoveredSceneThumb.isVideo ? (
                 <video
                   src={hoveredSceneThumb.url}
@@ -1346,193 +2729,537 @@ function App() {
             </div>
           )}
 
-          {hasImage && !isContextMenuMode && (
+          {shouldShowImportOptionsPanel && (
             <Box className="options">
-              <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                Import Options
-              </Typography>
+              {!isContextMenuMode && hasQuickImportOptions && (
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Import Options
+                </Typography>
+              )}
               <Stack className="compression-options" spacing={1}>
-                <FormControl fullWidth size="small">
-                  <InputLabel id="compression-mode-label">
-                    Compression Mode
-                  </InputLabel>
-                  <Select
-                    labelId="compression-mode-label"
-                    label="Compression Mode"
-                    value={compressionMode}
-                    onChange={(e) =>
-                      setCompressionMode(e.target.value as CompressionMode)
-                    }
-                    disabled={isLoading}>
-                    <MenuItem value="none">No Compression</MenuItem>
-                    <MenuItem value="standard" disabled={videoCompressionBlocked}>
-                      {selectedInputIsVideo
-                        ? "Nestling (Max 50MB)"
-                        : "Nestling / Fledgeling (Max 25MB)"}
-                    </MenuItem>
-                    <MenuItem value="high" disabled={videoCompressionBlocked}>
-                      {selectedInputIsVideo
-                        ? "Fledgeling / Bestling (Max 100MB)"
-                        : "Bestling Tier (Max 50MB)"}
-                    </MenuItem>
-                  </Select>
-                </FormControl>
-
-                {videoCompressionBlocked && videoCompressionSupportMessage && (
-                  <Typography variant="caption" className="help-text" color="warning.main">
-                    {videoCompressionSupportMessage}
-                  </Typography>
-                )}
-
-                <Box className="compression-info">
-                  {compressionMode === "none" && (
-                    <Typography variant="body2">
-                      Uploads the original file without modification. The upload
-                      will fail if it exceeds your account's file size limit.
-                    </Typography>
-                  )}
-
-                  {compressionMode === "standard" && (
-                    <Typography variant="body2">
-                      {selectedInputIsVideo
-                        ? "Compresses the video to a maximum of 50MB to fit Nestling account limits."
-                        : "Compresses the image to a maximum of 25MB to fit Nestling and Fledgeling account limits."}
-                    </Typography>
-                  )}
-
-                  {compressionMode === "high" && (
-                    <Typography variant="body2">
-                      {selectedInputIsVideo
-                        ? "Compresses the video to a maximum of 100MB to fit Fledgeling and Bestling account limits."
-                        : "Compresses the image to a maximum of 50MB to fit Bestling account limits."}
-                    </Typography>
-                  )}
-                </Box>
-
-                <Button
-                  onClick={() =>
-                    setShowAdvancedVideoOptions(!showAdvancedVideoOptions)
-                  }
-                  disabled={isLoading || videoCompressionBlocked}
-                  variant="text"
-                  size="small"
-                  sx={{ alignSelf: "flex-start", px: 0.5 }}>
-                  {showAdvancedVideoOptions
-                    ? "Hide advanced video options"
-                    : "Show advanced video options"}
-                </Button>
-
-                {showAdvancedVideoOptions && (
-                  <Stack className="advanced-video-options" spacing={1}>
+                {!isContextMenuMode && includeMapImages && hasImage && (
+                  <>
                     <FormControl fullWidth size="small">
-                      <InputLabel id="video-codec-label">
-                        Preferred Video Codec
+                      <InputLabel id="compression-mode-label">
+                        Compression Mode
                       </InputLabel>
                       <Select
-                        labelId="video-codec-label"
-                        label="Preferred Video Codec"
-                        value={preferredVideoCodec}
+                        labelId="compression-mode-label"
+                        label="Compression Mode"
+                        value={compressionMode}
                         onChange={(e) =>
-                          setPreferredVideoCodec(
-                            e.target.value as VideoCodecPreference,
-                          )
+                          setCompressionMode(e.target.value as CompressionMode)
                         }
-                        disabled={isLoading || videoCompressionBlocked}>
-                        <MenuItem value="auto">
-                          Auto (AV1 - H.265 - VP9 - H.264)
+                        disabled={isLoading}>
+                        <MenuItem value="none">No Compression</MenuItem>
+                        <MenuItem
+                          value="standard"
+                          disabled={videoCompressionBlocked}>
+                          {selectedInputIsVideo
+                            ? "Nestling (Max 50MB)"
+                            : "Nestling / Fledgeling (Max 25MB)"}
                         </MenuItem>
                         <MenuItem
-                          value="vp9"
-                          disabled={
-                            !!browserCodecAvailability &&
-                            !browserCodecAvailability.vp9
-                          }>
-                          {browserCodecAvailability &&
-                          !browserCodecAvailability.vp9
-                            ? "VP9/WebM (not available in current browser)"
-                            : "VP9/WebM"}
-                        </MenuItem>
-                        <MenuItem
-                          value="av1"
-                          disabled={!!browserCodecAvailability && !browserCodecAvailability.av1}>
-                          {browserCodecAvailability && !browserCodecAvailability.av1
-                            ? "AV1 (not available in current browser)"
-                            : "AV1 (maximum compression)"}
-                        </MenuItem>
-                        <MenuItem
-                          value="h265"
-                          disabled={!!browserCodecAvailability && !browserCodecAvailability.h265}>
-                          {browserCodecAvailability && !browserCodecAvailability.h265
-                            ? "H.265/HEVC (not available in current browser)"
-                            : "H.265/HEVC (high efficiency)"}
-                        </MenuItem>
-                        <MenuItem
-                          value="h264"
-                          disabled={!!browserCodecAvailability && !browserCodecAvailability.h264}>
-                          {browserCodecAvailability && !browserCodecAvailability.h264
-                            ? "H.264 (not available in current browser)"
-                            : "H.264 (maximum compatibility)"}
+                          value="high"
+                          disabled={videoCompressionBlocked}>
+                          {selectedInputIsVideo
+                            ? "Fledgeling / Bestling (Max 100MB)"
+                            : "Bestling Tier (Max 50MB)"}
                         </MenuItem>
                       </Select>
                     </FormControl>
 
-                    {browserCodecAvailability && (
-                      <Typography variant="caption" className="help-text">
-                        Browser codec availability: AV1
-                        {browserCodecAvailability.av1 ? " yes" : " no"},
-                        H.265
-                        {browserCodecAvailability.h265 ? " yes" : " no"},
-                        VP9
-                        {browserCodecAvailability.vp9 ? " yes" : " no"},
-                        H.264
-                        {browserCodecAvailability.h264 ? " yes" : " no"}
-                      </Typography>
+                    {videoCompressionBlocked &&
+                      videoCompressionSupportMessage && (
+                        <Typography
+                          variant="caption"
+                          className="help-text"
+                          color="warning.main">
+                          {videoCompressionSupportMessage}
+                        </Typography>
+                      )}
+
+                    <Box className="compression-info">
+                      {compressionMode === "none" && (
+                        <Typography variant="body2">
+                          Uploads the original file without modification. The
+                          upload will fail if it exceeds your account's file
+                          size limit.
+                        </Typography>
+                      )}
+
+                      {compressionMode === "standard" && (
+                        <Typography variant="body2">
+                          {selectedInputIsVideo
+                            ? "Compresses the video to a maximum of 50MB to fit Nestling account limits."
+                            : "Compresses the image to a maximum of 25MB to fit Nestling and Fledgeling account limits."}
+                        </Typography>
+                      )}
+
+                      {compressionMode === "high" && (
+                        <Typography variant="body2">
+                          {selectedInputIsVideo
+                            ? "Compresses the video to a maximum of 100MB to fit Fledgeling and Bestling account limits."
+                            : "Compresses the image to a maximum of 50MB to fit Bestling account limits."}
+                        </Typography>
+                      )}
+                    </Box>
+                  </>
+                )}
+
+                <Button
+                  onClick={() =>
+                    setShowAdvancedOptions((previous) => !previous)
+                  }
+                  disabled={isLoading}
+                  variant="text"
+                  size="small"
+                  sx={{ alignSelf: "flex-start", px: 0.5 }}>
+                  {showAdvancedOptions
+                    ? "Hide advanced settings"
+                    : "Show advanced settings"}
+                </Button>
+
+                {showAdvancedOptions && (
+                  <Stack className="advanced-video-options" spacing={1}>
+                    {(hasMapWorkflowSources ||
+                      hasWallImportSources ||
+                      hasLightImportSources) && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Import content
+                        </Typography>
+                        <Box className="import-options-grid">
+                          {!isContextMenuMode && hasMapWorkflowSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeMapImages}
+                                  onChange={(e) =>
+                                    setIncludeMapImages(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Map image"
+                            />
+                          )}
+                          {hasWallImportSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeWallsWithMaps}
+                                  onChange={(e) =>
+                                    setIncludeWallsWithMaps(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Walls & doors"
+                            />
+                          )}
+                          {hasLightImportSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeImportedLights}
+                                  onChange={(e) =>
+                                    setIncludeImportedLights(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Lights"
+                            />
+                          )}
+                        </Box>
+                      </Box>
                     )}
 
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          size="small"
-                          checked={removeVideoAudio}
-                          onChange={(e) =>
-                            setRemoveVideoAudio(e.target.checked)
-                          }
-                          disabled={isLoading || videoCompressionBlocked}
-                        />
-                      }
-                      label="Remove audio track"
-                    />
+                    {!isContextMenuMode &&
+                      (shouldUseMultiMapSceneCreation ||
+                        shouldShowPlacementControl ||
+                        shouldShowLayoutControls ||
+                        (includeMapImages && hasMapWorkflowSources)) && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Map setup
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          {shouldUseMultiMapSceneCreation && (
+                            <TextField
+                              label="New Scene Name"
+                              value={multiSceneName}
+                              onChange={(e) =>
+                                setMultiSceneName(e.target.value)
+                              }
+                              size="small"
+                              fullWidth
+                              disabled={isLoading}
+                            />
+                          )}
+                          {shouldShowPlacementControl && (
+                            <FormControl fullWidth size="small">
+                              <InputLabel id="placement-mode-label">
+                                Map Placement
+                              </InputLabel>
+                              <Select
+                                labelId="placement-mode-label"
+                                label="Map Placement"
+                                value={mapPlacementMode}
+                                onChange={(e) =>
+                                  setMapPlacementMode(
+                                    e.target.value as MapPlacementMode,
+                                  )
+                                }
+                                disabled={isLoading}>
+                                <MenuItem value="RIGHT">
+                                  Place right of existing
+                                </MenuItem>
+                                <MenuItem value="BELOW">
+                                  Place below existing
+                                </MenuItem>
+                                <MenuItem value="ORIGIN">
+                                  Place at origin
+                                </MenuItem>
+                              </Select>
+                            </FormControl>
+                          )}
+                          {shouldShowLayoutControls && (
+                            <>
+                              <FormControl fullWidth size="small">
+                                <InputLabel id="layout-mode-label">
+                                  Layout
+                                </InputLabel>
+                                <Select
+                                  labelId="layout-mode-label"
+                                  label="Layout"
+                                  value={layoutMode}
+                                  onChange={(e) =>
+                                    setLayoutMode(
+                                      e.target.value as MapLayoutMode,
+                                    )
+                                  }
+                                  disabled={isLoading}>
+                                  <MenuItem value="GRID">
+                                    Grid (auto columns)
+                                  </MenuItem>
+                                  <MenuItem value="ROW">Single row</MenuItem>
+                                  <MenuItem value="COLUMN">
+                                    Single column
+                                  </MenuItem>
+                                  <MenuItem value="STACK">
+                                    Stacked on top of each other
+                                  </MenuItem>
+                                </Select>
+                              </FormControl>
+                              <TextField
+                                type="number"
+                                label="Minimum Spacing (px, optional)"
+                                value={layoutSpacing}
+                                onChange={(e) =>
+                                  setLayoutSpacing(e.target.value)
+                                }
+                                inputProps={{ min: 0, step: 1 }}
+                                placeholder="One grid size"
+                                helperText="Minimum free space between maps. Leave empty to default to one grid square."
+                                size="small"
+                                fullWidth
+                                disabled={isLoading}
+                              />
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={snapToGrid}
+                                    onChange={(e) =>
+                                      setSnapToGrid(e.target.checked)
+                                    }
+                                    disabled={isLoading}
+                                  />
+                                }
+                                label="Snap placement to grid"
+                              />
+                              <TextField
+                                type="number"
+                                label="Scale (%)"
+                                value={layoutScalePercent}
+                                onChange={(e) =>
+                                  setLayoutScalePercent(e.target.value)
+                                }
+                                inputProps={{ min: 10, step: 5 }}
+                                size="small"
+                                fullWidth
+                                disabled={isLoading}
+                              />
+                            </>
+                          )}
+                          {includeMapImages && hasMapWorkflowSources && (
+                            <FormControlLabel
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={lockImportedMaps}
+                                  onChange={(e) =>
+                                    setLockImportedMaps(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Lock placed maps"
+                            />
+                          )}
+                        </Stack>
+                      </Box>
+                    )}
 
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          size="small"
-                          checked={forceVideoTranscode}
-                          onChange={(e) =>
-                            setForceVideoTranscode(e.target.checked)
-                          }
-                          disabled={isLoading || videoCompressionBlocked}
-                        />
-                      }
-                      label="Transcode anyway when already under size limit"
-                    />
+                    {hasLightImportSources && includeImportedLights && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Lighting
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          <FormControl fullWidth size="small">
+                            <InputLabel id="light-visibility-type-label">
+                              Light behavior
+                            </InputLabel>
+                            <Select
+                              labelId="light-visibility-type-label"
+                              label="Light behavior"
+                              value={importedLightType}
+                              renderValue={(value) =>
+                                value === "AUTO"
+                                  ? "Auto (data, fallback Secondary)"
+                                  : value === "PRIMARY"
+                                  ? "Primary"
+                                  : value === "AUXILIARY"
+                                    ? "Auxiliary"
+                                    : "Secondary"
+                              }
+                              onChange={(e) =>
+                                setImportedLightType(
+                                  e.target.value as
+                                    | "AUTO"
+                                    | "PRIMARY"
+                                    | "SECONDARY"
+                                    | "AUXILIARY",
+                                )
+                              }
+                              disabled={isLoading}>
+                              <MenuItem value="AUTO">
+                                Auto: based on data, fallback Secondary
+                              </MenuItem>
+                              <MenuItem value="SECONDARY">
+                                Secondary: visible in line of sight
+                              </MenuItem>
+                              <MenuItem value="PRIMARY">
+                                Primary: reveals fog on its own
+                              </MenuItem>
+                              <MenuItem value="AUXILIARY">
+                                Auxiliary: won’t activate secondary lights
+                              </MenuItem>
+                            </Select>
+                          </FormControl>
+                          <FormControl fullWidth size="small">
+                            <InputLabel id="light-shadow-detail-label">
+                              Light shadow
+                            </InputLabel>
+                            <Select
+                              labelId="light-shadow-detail-label"
+                              label="Light shadow"
+                              value={lightShadowDetail}
+                              onChange={(e) =>
+                                setLightShadowDetail(
+                                  e.target.value as "fast" | "obr-default",
+                                )
+                              }
+                              disabled={isLoading}>
+                              <MenuItem value="fast">
+                                Hard (better performance)
+                              </MenuItem>
+                              <MenuItem value="obr-default">
+                                Soft (OBR default)
+                              </MenuItem>
+                            </Select>
+                          </FormControl>
+                          <FormControlLabel
+                            control={
+                              <Checkbox
+                                size="small"
+                                checked={useSoftEdgesForLights}
+                                onChange={(e) =>
+                                  setUseSoftEdgesForLights(e.target.checked)
+                                }
+                                disabled={isLoading}
+                              />
+                            }
+                            label="Soft light edge"
+                          />
+                        </Stack>
+                      </Box>
+                    )}
 
-                    <TextField
-                      type="number"
-                      label="Max video dimension (optional)"
-                      inputProps={{ min: 0, step: 1 }}
-                      value={maxVideoDimension}
-                      onChange={(e) => setMaxVideoDimension(e.target.value)}
-                      placeholder="e.g. 1920"
-                      disabled={isLoading || videoCompressionBlocked}
-                      size="small"
-                      fullWidth
-                    />
-
-                    <Typography variant="caption" className="help-text">
-                      Limits the longest side in pixels (for example 1920).
-                      Leave empty to keep original resolution.
-                    </Typography>
+                    {!isContextMenuMode && includeMapImages && hasImage && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Media
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          <TextField
+                            type="number"
+                            label="Max resolution (optional)"
+                            inputProps={{ min: 0, step: 1 }}
+                            value={maxResolutionDimension}
+                            onChange={(e) =>
+                              setMaxResolutionDimension(e.target.value)
+                            }
+                            placeholder="e.g. 1920"
+                            disabled={isLoading || videoCompressionBlocked}
+                            size="small"
+                            fullWidth
+                          />
+                          <Typography variant="caption" className="help-text">
+                            Limits the longest side in pixels for both images
+                            and videos. Leave empty to keep original resolution.
+                          </Typography>
+                          {selectedInputIsVideo && (
+                            <>
+                              <FormControl fullWidth size="small">
+                                <InputLabel id="video-codec-label">
+                                  Preferred Video Codec
+                                </InputLabel>
+                                <Select
+                                  labelId="video-codec-label"
+                                  label="Preferred Video Codec"
+                                  value={preferredVideoCodec}
+                                  onChange={(e) =>
+                                    setPreferredVideoCodec(
+                                      e.target.value as VideoCodecPreference,
+                                    )
+                                  }
+                                  disabled={
+                                    isLoading || videoCompressionBlocked
+                                  }>
+                                  <MenuItem value="auto">
+                                    Auto (AV1 - H.265 - VP9 - H.264)
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="vp9"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.vp9
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.vp9
+                                      ? "VP9/WebM (not available in current browser)"
+                                      : "VP9/WebM"}
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="av1"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.av1
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.av1
+                                      ? "AV1 (not available in current browser)"
+                                      : "AV1 (maximum compression)"}
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="h265"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.h265
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.h265
+                                      ? "H.265/HEVC (not available in current browser)"
+                                      : "H.265/HEVC (high efficiency)"}
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="h264"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.h264
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.h264
+                                      ? "H.264 (not available in current browser)"
+                                      : "H.264 (maximum compatibility)"}
+                                  </MenuItem>
+                                </Select>
+                              </FormControl>
+                              {browserCodecAvailability && (
+                                <Typography
+                                  variant="caption"
+                                  className="help-text">
+                                  Browser codec availability: AV1
+                                  {browserCodecAvailability.av1
+                                    ? " yes"
+                                    : " no"}
+                                  , H.265
+                                  {browserCodecAvailability.h265
+                                    ? " yes"
+                                    : " no"}
+                                  , VP9
+                                  {browserCodecAvailability.vp9
+                                    ? " yes"
+                                    : " no"}
+                                  , H.264
+                                  {browserCodecAvailability.h264
+                                    ? " yes"
+                                    : " no"}
+                                </Typography>
+                              )}
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={removeVideoAudio}
+                                    onChange={(e) =>
+                                      setRemoveVideoAudio(e.target.checked)
+                                    }
+                                    disabled={
+                                      isLoading || videoCompressionBlocked
+                                    }
+                                  />
+                                }
+                                label="Remove audio track"
+                              />
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={forceVideoTranscode}
+                                    onChange={(e) =>
+                                      setForceVideoTranscode(e.target.checked)
+                                    }
+                                    disabled={
+                                      isLoading || videoCompressionBlocked
+                                    }
+                                  />
+                                }
+                                label="Transcode anyway when already under size limit"
+                              />
+                            </>
+                          )}
+                        </Stack>
+                      </Box>
+                    )}
                   </Stack>
                 )}
               </Stack>
@@ -1541,6 +3268,13 @@ function App() {
 
           {uploadProgress !== null && (
             <Box className="compression-progress">
+              {mapFileProgress && mapFileProgress.totalFiles > 1 && (
+                <Typography
+                  className="compression-progress-label"
+                  variant="caption">
+                  {`File ${mapFileProgress.currentFile} of ${mapFileProgress.totalFiles} (${mapFileProgress.remainingFiles} remaining): ${mapFileProgress.fileName}`}
+                </Typography>
+              )}
               <Typography
                 className="compression-progress-label"
                 variant="caption">
@@ -1566,53 +3300,138 @@ function App() {
             </Box>
           )}
 
+          {(pendingMapSelection || mapSelectionToken) &&
+            includeMapImages &&
+            hasMapWorkflowSources &&
+            uploadProgress === null && (
+              <Box
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "flex-end",
+                  flexWrap: "wrap",
+                  gap: 0.5,
+                  mb: 0.5,
+                }}>
+                <Button
+                  variant="text"
+                  size="small"
+                  sx={{ minWidth: "auto", px: 1 }}
+                  onClick={() =>
+                    runMapWorkflowFromSelectionState({
+                      forceSelectionPrompt: true,
+                    })
+                  }
+                  disabled={isLoading || !mapSelectionToken}>
+                  Re-select
+                </Button>
+                <Button
+                  variant="text"
+                  size="small"
+                  sx={{ minWidth: "auto", px: 1 }}
+                  onClick={() =>
+                    runMapWorkflowFromSelectionState({
+                      resetSelectionCache: true,
+                    })
+                  }
+                  disabled={
+                    isLoading ||
+                    selectedSourceCount === 0 ||
+                    (availableScenes.length > 0 && !selectedSceneHasMap)
+                  }>
+                  Re-upload
+                </Button>
+                <Button
+                  variant="text"
+                  color="error"
+                  size="small"
+                  sx={{ minWidth: "auto", px: 1 }}
+                  onClick={resetMapWorkflowState}
+                  disabled={isLoading}>
+                  Clear
+                </Button>
+              </Box>
+            )}
+
           <Stack
             className="actions"
             direction={{ xs: "column", sm: "row" }}
             spacing={1}>
             {!isContextMenuMode && uploadProgress === null && (
               <Button
-                onClick={handleCreateNewScene}
+                onClick={handleCreateSceneDestination}
                 variant="contained"
                 disabled={
-                  (!selectedFile && availableScenes.length === 0) ||
-                  isLoading ||
-                  uploadProgress !== null ||
-                  (isFoundryFormat && availableScenes.length === 0) ||
-                  !hasImage
+                  isLoading || uploadProgress !== null || !canCreateNewScene
                 }>
-                {uploadProgress !== null
-                  ? `Compressing… ${uploadProgress}%`
-                  : isLoading
-                    ? "Uploading..."
-                    : isFoundryFormat && availableScenes.length === 0
-                      ? "Scene Creation Not Available (Foundry File)"
-                      : !hasImage
-                        ? "Scene Creation Not Available (No Image)"
-                        : "Create New Scene"}
+                {pendingMapSelection?.action === "multi-scene"
+                  ? "Continue Create New Scene"
+                  : "Create New Scene"}
               </Button>
             )}
 
-            {uploadProgress === null && (
+            {!isContextMenuMode && uploadProgress === null && (
               <Button
-                onClick={handleAddWallsToCurrentScene}
-                variant={isContextMenuMode ? "contained" : "outlined"}
-                fullWidth={isContextMenuMode}
+                onClick={handleImportToCurrentScene}
+                variant="outlined"
                 disabled={
-                  (!selectedFile && availableScenes.length === 0) ||
                   isLoading ||
                   uploadProgress !== null ||
-                  (availableScenes.length > 0 && !selectedSceneHasWallData)
+                  !canImportToCurrentScene
                 }>
                 {uploadProgress !== null
                   ? `Compressing… ${uploadProgress}%`
                   : isLoading
                     ? "Uploading..."
-                    : availableScenes.length > 0 && !selectedSceneHasWallData
-                      ? "No Walls In Selected Scene"
-                      : isContextMenuMode
-                        ? "Apply Walls to Selected Map"
-                        : "Add Walls to Current Scene"}
+                    : pendingMapSelection?.action === "add-current" &&
+                        includeMapImages &&
+                        wantsMapImport
+                      ? "Continue Import to Current Scene"
+                      : "Import to Current Scene"}
+              </Button>
+            )}
+
+            {isContextMenuMode && uploadProgress === null && (
+              <>
+                <Button
+                  onClick={handleAddWallsToCurrentScene}
+                  variant="contained"
+                  fullWidth
+                  disabled={
+                    (!selectedFile && availableScenes.length === 0) ||
+                    isLoading ||
+                    (!includeWallsWithMaps && !includeImportedLights) ||
+                    (availableScenes.length > 0 &&
+                      !selectedSceneHasEnabledFogData)
+                  }>
+                  {isLoading
+                    ? "Uploading..."
+                    : !includeWallsWithMaps && !includeImportedLights
+                      ? "Enable Walls/Doors or Lights"
+                      : availableScenes.length > 0 &&
+                          !selectedSceneHasEnabledFogData
+                        ? includeWallsWithMaps && includeImportedLights
+                          ? "No Fog Data In Selected Scene"
+                          : includeWallsWithMaps
+                            ? "No Walls/Doors In Selected Scene"
+                            : "No Lights In Selected Scene"
+                        : "Import to Selected Map"}
+                </Button>
+              </>
+            )}
+
+            {isLoading && uploadProgress === null && (
+              <Button
+                variant="text"
+                color="error"
+                size="small"
+                onClick={() => {
+                  compressionAbortRef.current?.abort();
+                  setIsLoading(false);
+                  setUploadProgress(null);
+                  setCompressionStage(null);
+                }}>
+                Cancel
               </Button>
             )}
           </Stack>
