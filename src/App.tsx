@@ -44,7 +44,7 @@ import Select from "@mui/material/Select";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
-import { extractScenesFromLevelDB } from "./leveldb";
+import { extractScenesFromFoundryZip } from "./foundryZip";
 import type { FoundryVTTData, VTTMapData } from "./vttTypes";
 
 type SceneData = (FoundryVTTData | VTTMapData) & {
@@ -886,209 +886,21 @@ function App() {
     if (textRgb) root.style.setProperty("--text-primary-rgb", textRgb);
   }, [theme]);
 
-  const normalizeZipPath = (path: string): string =>
-    path
-      .replace(/\\/g, "/")
-      .replace(/^\.\//, "")
-      .replace(/^\//, "")
-      .replace(/\/+/g, "/");
-
   const normalizeFileStem = (fileName: string): string =>
     fileName
       .toLowerCase()
       .replace(/\.[^/.]+$/, "")
       .trim();
 
-  const findLevelDbFilesForPack = (zip: JSZip, packPath: string): string[] => {
-    const allPaths = Object.keys(zip.files);
-    const normalizedPackPath = normalizeZipPath(packPath).replace(/\/+$/, "");
-    const candidateRoots = new Set<string>();
-
-    if (normalizedPackPath) {
-      candidateRoots.add(normalizedPackPath);
-
-      if (normalizedPackPath.toLowerCase().endsWith(".db")) {
-        candidateRoots.add(normalizedPackPath.slice(0, -3));
-      }
-
-      const lastSlash = normalizedPackPath.lastIndexOf("/");
-      const baseName =
-        lastSlash >= 0
-          ? normalizedPackPath.slice(lastSlash + 1)
-          : normalizedPackPath;
-      if (baseName.toLowerCase().endsWith(".db")) {
-        const trimmedBase = baseName.slice(0, -3);
-        candidateRoots.add(trimmedBase);
-        if (lastSlash >= 0) {
-          candidateRoots.add(
-            `${normalizedPackPath.slice(0, lastSlash + 1)}${trimmedBase}`,
-          );
-        }
-      }
-    }
-
-    const normalizedCandidates = Array.from(candidateRoots).map((candidate) =>
-      normalizeZipPath(candidate).replace(/\/+$/, "/").toLowerCase(),
-    );
-
-    const matches = allPaths.filter((path) => {
-      const normalizedPath = normalizeZipPath(path).toLowerCase();
-      if (!normalizedPath.endsWith(".ldb")) return false;
-
-      return normalizedCandidates.some(
-        (candidate) =>
-          normalizedPath.startsWith(candidate) ||
-          normalizedPath.includes(`/${candidate}`),
-      );
-    });
-
-    return Array.from(new Set(matches)).sort();
-  };
-
   const handleZipFile = async (fileOrBlob: Blob | File) => {
     setIsLoading(true);
     try {
       const zip = await JSZip.loadAsync(fileOrBlob);
       setZipObject(zip);
-
-      let moduleJsonFile = zip.file("module.json");
-      if (!moduleJsonFile) {
-        const match = Object.keys(zip.files).find((p) =>
-          p.endsWith("module.json"),
-        );
-        if (match) moduleJsonFile = zip.file(match);
-      }
-
-      let moduleJson = null;
-      if (moduleJsonFile) {
-        const content = await moduleJsonFile.async("string");
-        moduleJson = JSON.parse(content);
-      }
-
-      const scenes: SceneInfo[] = [];
-
-      if (moduleJson && Array.isArray(moduleJson.packs)) {
-        for (const pack of moduleJson.packs) {
-          if (pack.type === "Scene" && pack.path) {
-            let packPath = pack.path.replace(/\\/g, "/");
-            if (packPath.startsWith(".")) packPath = packPath.substring(1);
-            if (packPath.startsWith("/")) packPath = packPath.substring(1);
-
-            let packFile = zip.file(packPath);
-            if (!packFile) {
-              const match = Object.keys(zip.files).find(
-                (p) => p.endsWith(packPath) || packPath.endsWith(p),
-              );
-              if (match) packFile = zip.file(match);
-            }
-
-            if (packFile) {
-              const content = await packFile.async("string");
-              const lines = content
-                .split("\n")
-                .filter((l) => l.trim().length > 0);
-              for (const line of lines) {
-                try {
-                  const scene = JSON.parse(line);
-                  if (
-                    isFoundryVTTData(scene) &&
-                    typeof scene.name === "string"
-                  ) {
-                    scenes.push({
-                      name: scene.name,
-                      data: scene,
-                      fileSource:
-                        fileOrBlob instanceof File ? fileOrBlob.name : "module",
-                    });
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-            } else {
-              // Try LevelDB format (it might be a directory in the zip)
-              // Support both legacy `<pack>.db` paths and modern `<pack>/` ldb directories.
-              const ldbFiles = findLevelDbFilesForPack(zip, packPath);
-
-              if (ldbFiles.length > 0) {
-                const ldbBuffers: ArrayBuffer[] = [];
-                for (const f of ldbFiles) {
-                  ldbBuffers.push(await zip.file(f)!.async("arraybuffer"));
-                }
-                const ldbScenes = extractScenesFromLevelDB(ldbBuffers);
-                for (const scene of ldbScenes) {
-                  if (
-                    isFoundryVTTData(scene) &&
-                    typeof scene.name === "string"
-                  ) {
-                    scenes.push({
-                      name: scene.name,
-                      data: scene,
-                      fileSource:
-                        fileOrBlob instanceof File ? fileOrBlob.name : "module",
-                    });
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      if (scenes.length === 0) {
-        const allLdbFiles = Object.keys(zip.files)
-          .filter((path) => path.toLowerCase().endsWith(".ldb"))
-          .sort();
-
-        if (allLdbFiles.length > 0) {
-          const ldbBuffers: ArrayBuffer[] = [];
-          for (const ldbPath of allLdbFiles) {
-            ldbBuffers.push(await zip.file(ldbPath)!.async("arraybuffer"));
-          }
-
-          const ldbScenes = extractScenesFromLevelDB(ldbBuffers);
-          for (const scene of ldbScenes) {
-            if (isFoundryVTTData(scene) && typeof scene.name === "string") {
-              scenes.push({
-                name: scene.name,
-                data: scene,
-                fileSource:
-                  fileOrBlob instanceof File ? fileOrBlob.name : "module",
-              });
-            }
-          }
-        }
-
-        if (scenes.length === 0) {
-          for (const path of Object.keys(zip.files)) {
-            if (path.endsWith(".db") || path.endsWith(".json")) {
-              if (path.endsWith("module.json")) continue;
-              const content = await zip.file(path)!.async("string");
-              const lines = content
-                .split("\n")
-                .filter((l) => l.trim().length > 0);
-              for (const line of lines) {
-                try {
-                  const scene = JSON.parse(line);
-                  if (
-                    isFoundryVTTData(scene) &&
-                    typeof scene.name === "string"
-                  ) {
-                    scenes.push({
-                      name: scene.name,
-                      data: scene,
-                      fileSource:
-                        fileOrBlob instanceof File ? fileOrBlob.name : "module",
-                    });
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-            }
-          }
-        }
-      }
+      const scenes: SceneInfo[] = await extractScenesFromFoundryZip(
+        zip,
+        fileOrBlob instanceof File ? fileOrBlob.name : "module",
+      );
 
       if (scenes.length > 0) {
         // Pre-fetch thumbnails as object URLs

@@ -3059,68 +3059,163 @@ export async function extractImageFromZip(zip: JSZip, imgPath: string): Promise<
         throw new Error('Image path is empty.');
     }
 
-    // 1. Decode URL-encoded characters (like %20 -> space)
-    try {
-        imgPath = decodeURIComponent(imgPath);
-    } catch {
-        // Fallback to original if decoding fails
-    }
+    const normalizePath = (rawPath: string): string => {
+        let normalized = rawPath.trim();
 
-    // 2. Normalize slashes
-    imgPath = imgPath.replace(/\\/g, '/');
-
-    // 3. Handle specific replacement for Foundry internal paths
-    // Usually "modules/module-id/..."
-    if (imgPath.startsWith('modules/')) {
-        const parts = imgPath.split('/');
-        parts.shift(); // remove 'modules'
-        // Check if the next part matches any folder in the zip, if not, it's likely the module-id and can be stripped
-        const possibleModuleId = parts[0];
-        const allFiles = Object.keys(zip.files);
-        const foldersInZip = allFiles.filter(f => f.includes('/')).map(f => f.split('/')[0]);
-
-        if (!foldersInZip.includes(possibleModuleId)) {
-            parts.shift(); // remove module-id
+        try {
+            normalized = decodeURIComponent(normalized);
+        } catch {
+            // Keep original path if URI decoding fails
         }
-        imgPath = parts.join('/');
+
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(normalized)) {
+            try {
+                normalized = new URL(normalized).pathname;
+            } catch {
+                // Keep original path if URL parsing fails
+            }
+        }
+
+        normalized = normalized
+            .split(/[?#]/, 1)[0] ?? normalized;
+        normalized = normalized
+            .replace(/\\/g, '/')
+            .replace(/\/{2,}/g, '/')
+            .replace(/^\.\//, '')
+            .replace(/^\/+/, '');
+
+        return normalized;
+    };
+
+    const stripPackageScopePrefix = (path: string): string | null => {
+        const parts = path.split('/').filter(Boolean);
+        if (parts.length < 3) return null;
+        const scope = parts[0].toLowerCase();
+        if (scope !== 'modules' && scope !== 'systems' && scope !== 'worlds') return null;
+        return parts.slice(2).join('/');
+    };
+
+    const trailingSegmentScore = (targetPath: string, candidatePath: string): number => {
+        const targetParts = targetPath.toLowerCase().split('/').filter(Boolean);
+        const candidateParts = candidatePath.toLowerCase().split('/').filter(Boolean);
+        let matched = 0;
+        while (
+            matched < targetParts.length &&
+            matched < candidateParts.length &&
+            targetParts[targetParts.length - 1 - matched] === candidateParts[candidateParts.length - 1 - matched]
+        ) {
+            matched++;
+        }
+        return matched;
+    };
+
+    const normalizedRequestedPath = normalizePath(imgPath);
+    const allFiles = Object.keys(zip.files).filter((path) => !zip.files[path].dir);
+    const pathByLower = new Map<string, string>();
+    for (const path of allFiles) {
+        pathByLower.set(path.toLowerCase(), path);
     }
 
-    let resolvedPath = imgPath;
-    let file = zip.file(imgPath);
+    const topLevelFolders = new Set(
+        allFiles
+            .filter((path) => path.includes('/'))
+            .map((path) => path.split('/')[0])
+    );
+
+    const candidatePaths = new Set<string>();
+    const addCandidate = (candidate: string | null | undefined) => {
+        if (!candidate) return;
+        const normalized = normalizePath(candidate);
+        if (!normalized) return;
+        candidatePaths.add(normalized);
+    };
+
+    addCandidate(normalizedRequestedPath);
+    addCandidate(stripPackageScopePrefix(normalizedRequestedPath));
+
+    const baseCandidates = Array.from(candidatePaths);
+    for (const folder of topLevelFolders) {
+        for (const candidate of baseCandidates) {
+            addCandidate(`${folder}/${candidate}`);
+            if (candidate.toLowerCase().startsWith(`${folder.toLowerCase()}/`)) {
+                addCandidate(candidate.slice(folder.length + 1));
+            }
+        }
+    }
+
+    let resolvedPath = normalizedRequestedPath;
+    let file: JSZip.JSZipObject | null = null;
+
+    for (const candidate of candidatePaths) {
+        const direct = zip.file(candidate);
+        if (direct) {
+            resolvedPath = candidate;
+            file = direct;
+            break;
+        }
+        const caseInsensitive = pathByLower.get(candidate.toLowerCase());
+        if (caseInsensitive) {
+            resolvedPath = caseInsensitive;
+            file = zip.file(caseInsensitive);
+            break;
+        }
+    }
+
     if (!file) {
-        const allFiles = Object.keys(zip.files);
-        let match = allFiles.find(p => p.toLowerCase() === imgPath.toLowerCase());
-        if (!match) {
-            match = allFiles.find(p => p.endsWith(imgPath));
+        const suffixMatches = new Set<string>();
+        for (const candidate of candidatePaths) {
+            const lowerCandidate = candidate.toLowerCase();
+            for (const actualPath of allFiles) {
+                const lowerActualPath = actualPath.toLowerCase();
+                if (
+                    lowerActualPath === lowerCandidate ||
+                    lowerActualPath.endsWith(`/${lowerCandidate}`)
+                ) {
+                    suffixMatches.add(actualPath);
+                }
+            }
         }
-        if (!match) {
-            match = allFiles.find(p => imgPath.endsWith(p));
+
+        if (suffixMatches.size === 1) {
+            resolvedPath = Array.from(suffixMatches)[0];
+            file = zip.file(resolvedPath);
+        } else if (suffixMatches.size > 1) {
+            const ranked = Array.from(suffixMatches).sort((a, b) => {
+                const scoreA = trailingSegmentScore(normalizedRequestedPath, a);
+                const scoreB = trailingSegmentScore(normalizedRequestedPath, b);
+                if (scoreA !== scoreB) return scoreB - scoreA;
+                const depthA = a.split('/').length;
+                const depthB = b.split('/').length;
+                return depthA - depthB;
+            });
+            resolvedPath = ranked[0];
+            file = zip.file(resolvedPath);
         }
+    }
+
+    if (!file) {
         // Very aggressive fallback: if path contains '/', try just the filename,
         // but only if this yields exactly one candidate to avoid wrong matches.
-        if (!match && imgPath.includes('/')) {
-            const fileName = imgPath.split('/').pop()!.toLowerCase();
-            const basenameMatches = allFiles.filter((p) => {
-                const lower = p.toLowerCase();
+        if (normalizedRequestedPath.includes('/')) {
+            const fileName = normalizedRequestedPath.split('/').pop()!.toLowerCase();
+            const basenameMatches = allFiles.filter((path) => {
+                const lower = path.toLowerCase();
                 return lower === fileName || lower.endsWith(`/${fileName}`);
             });
 
             if (basenameMatches.length === 1) {
-                match = basenameMatches[0];
+                resolvedPath = basenameMatches[0];
+                file = zip.file(resolvedPath);
             } else if (basenameMatches.length > 1) {
                 console.warn(
-                    `Ambiguous filename fallback for ${imgPath}; found ${basenameMatches.length} candidates. Skipping basename fallback.`
+                    `Ambiguous filename fallback for ${normalizedRequestedPath}; found ${basenameMatches.length} candidates. Skipping basename fallback.`
                 );
             }
-        }
-        if (match) {
-            resolvedPath = match;
-            file = zip.file(match);
         }
     }
 
     if (!file) {
-        throw new Error(`Image not found in ZIP: ${imgPath}`);
+        throw new Error(`Image not found in ZIP: ${normalizedRequestedPath}`);
     }
 
     const arrayBuffer = await file.async('arraybuffer');
