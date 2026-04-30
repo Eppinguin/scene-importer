@@ -2,7 +2,7 @@
 
 Formerly: UVTT Importer.
 
-A Virtual Tabletop (VTT) map importer extension for [Owlbear Rodeo](https://www.owlbear.rodeo/). It imports maps, complete with walls and doors (where applicable), from:
+A Virtual Tabletop (VTT) map importer extension for [Owlbear Rodeo](https://www.owlbear.rodeo/). It imports maps, complete with walls, doors, and lights (where applicable), from:
 
 - Universal VTT (.uvtt) files
 - DD2VTT (.dd2vtt) files
@@ -10,23 +10,23 @@ A Virtual Tabletop (VTT) map importer extension for [Owlbear Rodeo](https://www.
 - FoundryVTT Module ZIPs and `module.json` manifest URLs (Includes map image & walls)
 - **Raw image and video files (to utilize the extension's compression features)**
 
-Designed for use with the [Dynamic Fog Extension](https://extensions.owlbear.rodeo/dynamic-fog) for basic wall and door functionality. For advanced features, consider the [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
+Designed for use with the [Dynamic Fog Extension](https://extensions.owlbear.rodeo/dynamic-fog) for basic wall, door, and light functionality. For advanced features, consider the [Smoke & Spectre Extension](https://extensions.owlbear.rodeo/smoke).
 
 ## Features
 
 - Import maps from UVTT/DD2VTT files, and complete FoundryVTT module ZIP archives
 - Import payloads dynamically via Web URLs or natively wrapped `module.json` configuration links
 - Upload raw image and video files to take advantage of the built-in file compression
-- Automatic wall and door creation from imported VTT data
+- Automatic wall, door, and light creation from imported VTT data
 - Image and video compression modes that target Owlbear Rodeo subscription limits
-- Support for placing walls and doors relative to selected items
+- Support for placing walls, doors, and lights relative to selected items
 - Automatic DPI adjustment based on grid size
 
 ## Usage
 
 ### Import a New Map or Scene
 
-This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls and doors.
+This will create a new scene using your VTT file or raw media file. If a VTT file is used, it will include walls, doors, and lights.
 
 1. Click the Scene Importer icon in the top left corner.
 2. Select your `.uvtt`, `.dd2vtt`, `.zip` module file, raw image, raw video, or paste a direct URL link. _(Note: Standalone FoundryVTT .json config files are not supported for new scene creation as they typically don't include an embedded map image. For full image support, upload a Foundry ZIP module instead)._
@@ -38,9 +38,9 @@ This will create a new scene using your VTT file or raw media file. If a VTT fil
 
 _Note: If your UVTT file does not contain a map image, you will not be able to use the "Create New Scene" option. In this case, you should first set up your scene with a map image manually, and then use the "Add Walls to Current Scene" feature._
 
-### Add Walls and Doors to an Existing Scene
+### Add Walls, Doors, and Lights to an Existing Scene
 
-You can add walls and doors to an existing scene in two ways:
+You can add walls, doors, and lights to an existing scene in two ways:
 
 ![add walls from menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-menu.gif)
 
@@ -57,7 +57,7 @@ You can add walls and doors to an existing scene in two ways:
 2. Right Click it
 3. Click "Import Walls"
 4. The extension will automatically open the Importer Selector so you can choose exactly which Wall structure you're casting onto your highlighted image.
-5. Wait for Walls and Doors to be added to the Map
+5. Wait for walls, doors, and lights to be added to the map
 
 ![add walls from context menu](https://raw.githubusercontent.com/Eppinguin/scene-importer/main/docs/import-walls-from-context-menu.gif)
 

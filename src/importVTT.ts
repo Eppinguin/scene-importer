@@ -7,12 +7,15 @@ import OBR, {
     type Item,
     type Vector2
 } from "@owlbear-rodeo/sdk";
-import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTWall } from "./vttTypes";
-import { createWallItems, createDoorItems } from "./vttItems";
+import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTWall, type FoundryVTTLight } from "./vttTypes";
+import { createWallItems, createDoorItems, createLightItems, type LightImportOptions } from "./vttItems";
+export type { LightImportOptions } from "./vttItems";
 
 type VTTData = VTTMapData;
 
 import JSZip from 'jszip';
+
+const DEFAULT_NEW_SCENE_GRID_DPI = 150;
 
 export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
     const d = data as Partial<FoundryVTTData>;
@@ -23,11 +26,16 @@ export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
         && d.walls.every((w: Partial<FoundryVTTWall>) =>
             Array.isArray(w.c) && w.c.length === 4)
     );
+    const hasValidLights = d.lights === undefined || (
+        Array.isArray(d.lights)
+        && d.lights.every((light: Partial<FoundryVTTLight>) => typeof light === 'object' && light !== null)
+    );
     return !!d
         && typeof d.width === 'number'
         && typeof d.height === 'number'
         && (hasNumericGrid || hasGridObject)
-        && hasValidWalls;
+        && hasValidWalls
+        && hasValidLights;
 }
 
 export function isUniversalVTTData(data: unknown): data is UniversalVTT {
@@ -35,7 +43,7 @@ export function isUniversalVTTData(data: unknown): data is UniversalVTT {
     return !!d
         && typeof d.format === 'number'
         && !!d.resolution
-        && (Array.isArray(d.line_of_sight) || Array.isArray(d.objects_line_of_sight));
+        && (Array.isArray(d.line_of_sight) || Array.isArray(d.objects_line_of_sight) || Array.isArray(d.lights));
 }
 
 // Helper function to detect if VTT data contains an image
@@ -47,9 +55,39 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
     let padX = 0;
     let padY = 0;
     const sourceWalls = Array.isArray(foundryData.walls) ? foundryData.walls : [];
+    const sourceLights = Array.isArray(foundryData.lights) ? foundryData.lights : [];
 
     // Resolve grid size handling for both Foundry V11 (numeric) and V12+ (object)
     const gridSize = typeof foundryData.grid === 'object' ? (foundryData.grid?.size || 100) : (Number(foundryData.grid) || 100);
+    // Foundry light radii are scene distance values in many exports (e.g. ft, m), not pixels.
+    // Convert those values to grid units expected by the VTTMapData pipeline.
+    const gridDistanceTopLevel = Number(foundryData.gridDistance);
+    const gridDistanceFromGridObject = typeof foundryData.grid === 'object'
+        ? Number(foundryData.grid?.distance)
+        : Number.NaN;
+
+    const gridUnits = (typeof foundryData.grid === 'object' ? foundryData.grid?.units : undefined) || foundryData.gridUnits;
+    const normalizedUnits = typeof gridUnits === 'string'
+        ? gridUnits.trim().toLowerCase().replace(/[^a-z]+$/, '')
+        : '';
+    const isFeet = normalizedUnits === 'ft' || normalizedUnits === 'feet';
+    const isMeters = normalizedUnits === 'm' || normalizedUnits === 'meter' || normalizedUnits === 'meters' || normalizedUnits === 'metre' || normalizedUnits === 'metres';
+    const fallbackDistance = isFeet ? 5 : isMeters ? 1.5 : 1;
+
+    const sceneDistancePerGrid = Number.isFinite(gridDistanceTopLevel) && gridDistanceTopLevel > 0
+        ? gridDistanceTopLevel
+        : (Number.isFinite(gridDistanceFromGridObject) && gridDistanceFromGridObject > 0
+            ? gridDistanceFromGridObject
+            : fallbackDistance);
+
+    const displayUnit = isFeet
+        ? 'ft'
+        : isMeters
+            ? 'm'
+            : typeof gridUnits === 'string' && gridUnits.trim()
+                ? gridUnits.trim()
+                : 'ft';
+    const gridScaleStr = `${sceneDistancePerGrid}${displayUnit}`;
 
     if (foundryData.padding !== undefined) {
         padX = Math.ceil((foundryData.width * foundryData.padding) / gridSize) * gridSize;
@@ -81,15 +119,65 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
             freestanding: false
         }));
 
+    const lights = sourceLights
+        .filter((light) => typeof light.x === 'number' && typeof light.y === 'number')
+        .map((light) => {
+            const config = light.config ?? {};
+            const brightDistance = Number(config.bright ?? light.bright ?? 0);
+            const dimDistance = Number(config.dim ?? light.dim ?? 0);
+            const brightRadius = Number.isFinite(brightDistance) && brightDistance > 0
+                ? brightDistance / sceneDistancePerGrid
+                : 0;
+            const dimRadius = Number.isFinite(dimDistance) && dimDistance > 0
+                ? dimDistance / sceneDistancePerGrid
+                : 0;
+            const range = Math.max(brightRadius, dimRadius);
+            const rawAngle = Number(config.angle ?? light.angle ?? 360);
+            const angle = Number.isFinite(rawAngle)
+                ? Math.min(360, Math.max(0, rawAngle))
+                : 360;
+            const rawRotation = Number(config.rotation ?? light.rotation ?? 0);
+            const rotation = Number.isFinite(rawRotation)
+                ? ((rawRotation % 360) + 360) % 360
+                : 0;
+            const rawColor = config.color ?? light.color;
+            const tintAlpha = Number(config.tintAlpha ?? light.tintAlpha ?? 1);
+            const rawTintColor = config.tintColor ?? light.tintColor;
+            const color = typeof rawColor === 'string'
+                ? rawColor
+                : (typeof rawTintColor === 'string' && tintAlpha > 0 ? rawTintColor : '#000000');
+
+            return {
+                position: {
+                    x: (light.x - offsetX) / gridSize,
+                    y: (light.y - offsetY) / gridSize,
+                },
+                range,
+                color,
+                angle,
+                rotation,
+                hidden: !!light.hidden,
+                vision:
+                    typeof light.vision === 'boolean'
+                        ? light.vision
+                        : typeof config.vision === 'boolean'
+                            ? config.vision
+                            : undefined,
+            };
+        })
+        .filter((light) => light.range > 0);
+
     return {
         resolution: {
             map_origin: { x: 0, y: 0 },
             map_size: { x: foundryData.width / gridSize, y: foundryData.height / gridSize },
             pixels_per_grid: gridSize
         },
+        gridScale: gridScaleStr,
         line_of_sight: walls,
         objects_line_of_sight: [],
-        portals: portals
+        portals: portals,
+        lights,
     };
 }
 
@@ -122,6 +210,11 @@ export type VideoCodecPreference = 'auto' | 'av1' | 'h265' | 'vp9' | 'h264';
 type TranscodeCodecPreference = Exclude<VideoCodecPreference, 'auto'>;
 export type MapLayoutMode = 'GRID' | 'ROW' | 'COLUMN' | 'STACK';
 export type MapPlacementMode = 'RIGHT' | 'BELOW' | 'ORIGIN';
+
+export interface FogImportOptions {
+    includeWalls?: boolean;
+    lightOptions?: LightImportOptions;
+}
 
 export interface MapImportSource {
     name: string;
@@ -183,6 +276,7 @@ export interface MultiMapImportOptions {
     scale?: number;
     placement?: MapPlacementMode;
     includeWalls?: boolean;
+    lightOptions?: LightImportOptions;
     lockMaps?: boolean;
     compressionMode?: CompressionMode;
     sceneName?: string;
@@ -2007,6 +2101,7 @@ export async function addMapsToCurrentScene(
     const targetDpi = await OBR.scene.grid.getDpi();
     const scale = clampPositiveNumber(options.scale, 1);
     const includeWalls = options.includeWalls ?? true;
+    const includeLights = options.lightOptions?.includeLights ?? true;
     const lockMaps = options.lockMaps ?? true;
     const prepared = await prepareMapSources(sources, targetDpi, options);
 
@@ -2057,7 +2152,7 @@ export async function addMapsToCurrentScene(
         .filter((entry) => !entry.metadataMatched)
         .map((entry) => entry.displayName);
 
-    if (!includeWalls) {
+    if (!includeWalls && !includeLights) {
         options.onProgress?.(100);
         return {
             importedMapCount: positionedPrepared.length,
@@ -2070,12 +2165,30 @@ export async function addMapsToCurrentScene(
     let wallsAppliedToMapCount = 0;
     for (const entry of positionedPrepared) {
         if (!entry.wallData) continue;
-        wallsAppliedToMapCount += 1;
-        const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
-        fogItems.push(...walls);
-        if (entry.wallData.portals && entry.wallData.portals.length > 0) {
-            const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
-            fogItems.push(...doors);
+        let addedFeaturesForMap = false;
+        if (includeWalls) {
+            const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+            if (walls.length > 0) {
+                fogItems.push(...walls);
+                addedFeaturesForMap = true;
+            }
+            if (entry.wallData.portals && entry.wallData.portals.length > 0) {
+                const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                if (doors.length > 0) {
+                    fogItems.push(...doors);
+                    addedFeaturesForMap = true;
+                }
+            }
+        }
+        if (includeLights && entry.wallData.lights && entry.wallData.lights.length > 0) {
+            const lights = await createLightItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi, options.lightOptions);
+            if (lights.length > 0) {
+                fogItems.push(...lights);
+                addedFeaturesForMap = true;
+            }
+        }
+        if (addedFeaturesForMap) {
+            wallsAppliedToMapCount += 1;
         }
     }
 
@@ -2107,6 +2220,8 @@ export async function addWallsToCurrentSceneWithLayout(
 
     const targetDpi = await OBR.scene.grid.getDpi();
     const scale = clampPositiveNumber(options.scale, 1);
+    const includeWalls = options.includeWalls ?? true;
+    const includeLights = options.lightOptions?.includeLights ?? true;
     const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
     const shouldSnapToGrid = options.snapToGrid ?? true;
     const layout = options.layout ?? 'GRID';
@@ -2199,13 +2314,31 @@ export async function addWallsToCurrentSceneWithLayout(
         };
         const sourceScale = { x: scale, y: scale };
 
-        wallsAppliedToMapCount += 1;
-        const walls = await createWallItems(wallData, position, sourceScale, targetDpi);
-        fogItems.push(...walls);
+        let addedFeaturesForMap = false;
+        if (includeWalls) {
+            const walls = await createWallItems(wallData, position, sourceScale, targetDpi);
+            if (walls.length > 0) {
+                fogItems.push(...walls);
+                addedFeaturesForMap = true;
+            }
 
-        if (wallData.portals && wallData.portals.length > 0) {
-            const doors = await createDoorItems(wallData, position, sourceScale, targetDpi);
-            fogItems.push(...doors);
+            if (wallData.portals && wallData.portals.length > 0) {
+                const doors = await createDoorItems(wallData, position, sourceScale, targetDpi);
+                if (doors.length > 0) {
+                    fogItems.push(...doors);
+                    addedFeaturesForMap = true;
+                }
+            }
+        }
+        if (includeLights && wallData.lights && wallData.lights.length > 0) {
+            const lights = await createLightItems(wallData, position, sourceScale, targetDpi, options.lightOptions);
+            if (lights.length > 0) {
+                fogItems.push(...lights);
+                addedFeaturesForMap = true;
+            }
+        }
+        if (addedFeaturesForMap) {
+            wallsAppliedToMapCount += 1;
         }
     }
 
@@ -2231,9 +2364,10 @@ export async function createSceneWithMultipleMaps(
         throw new Error('Please select at least one map to create a scene.');
     }
 
-    const targetDpi = 150;
+    const targetDpi = DEFAULT_NEW_SCENE_GRID_DPI;
     const scale = clampPositiveNumber(options.scale, 1);
     const includeWalls = options.includeWalls ?? true;
+    const includeLights = options.lightOptions?.includeLights ?? true;
     const lockMaps = options.lockMaps ?? true;
     const prepared = await prepareMapSources(sources, targetDpi, options);
 
@@ -2248,33 +2382,54 @@ export async function createSceneWithMultipleMaps(
             .build()
     );
 
-    let addedWallOrDoorItems = false;
+    let addedFogFeatureItems = false;
     let wallsAppliedToMapCount = 0;
-    if (includeWalls) {
+    if (includeWalls || includeLights) {
         for (const entry of prepared) {
             if (!entry.wallData) continue;
-            wallsAppliedToMapCount += 1;
-            const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
-            if (walls.length > 0) {
-                addedWallOrDoorItems = true;
-                sceneItems.push(...walls);
-            }
-            if (entry.wallData.portals && entry.wallData.portals.length > 0) {
-                const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
-                if (doors.length > 0) {
-                    addedWallOrDoorItems = true;
-                    sceneItems.push(...doors);
+            let addedFeaturesForMap = false;
+            if (includeWalls) {
+                const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                if (walls.length > 0) {
+                    addedFogFeatureItems = true;
+                    addedFeaturesForMap = true;
+                    sceneItems.push(...walls);
                 }
+                if (entry.wallData.portals && entry.wallData.portals.length > 0) {
+                    const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                    if (doors.length > 0) {
+                        addedFogFeatureItems = true;
+                        addedFeaturesForMap = true;
+                        sceneItems.push(...doors);
+                    }
+                }
+            }
+            if (includeLights && entry.wallData.lights && entry.wallData.lights.length > 0) {
+                const lights = await createLightItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi, options.lightOptions);
+                if (lights.length > 0) {
+                    addedFogFeatureItems = true;
+                    addedFeaturesForMap = true;
+                    sceneItems.push(...lights);
+                }
+            }
+            if (addedFeaturesForMap) {
+                wallsAppliedToMapCount += 1;
             }
         }
     }
 
-    const sceneUpload = buildSceneUpload()
+    const sceneBuilder = buildSceneUpload()
         .name(options.sceneName?.trim() || 'Multi Map Scene')
         .gridType('SQUARE')
         .items(sceneItems)
-        .fogFilled(addedWallOrDoorItems)
-        .build();
+        .fogFilled(addedFogFeatureItems);
+
+    const firstMapGridScale = sources.find(m => m.wallData?.gridScale)?.wallData?.gridScale;
+    if (firstMapGridScale) {
+        sceneBuilder.gridScale(firstMapGridScale);
+    }
+
+    const sceneUpload = sceneBuilder.build();
 
     options.onStage?.('Uploading scene');
     await OBR.assets.uploadScenes([sceneUpload]);
@@ -2282,7 +2437,7 @@ export async function createSceneWithMultipleMaps(
 
     return {
         importedMapCount: prepared.length,
-        wallsAppliedToMapCount: includeWalls ? wallsAppliedToMapCount : 0,
+        wallsAppliedToMapCount: (includeWalls || includeLights) ? wallsAppliedToMapCount : 0,
         unmatchedSelectionNames: prepared
             .filter((entry) => !entry.metadataMatched)
             .map((entry) => entry.displayName),
@@ -2411,6 +2566,8 @@ async function uploadRawMediaScene(
         .baseMap(imageUpload)
         .gridType('SQUARE');
 
+
+
     const sceneToUpload = sceneBuilder.build();
     await OBR.assets.uploadScenes([sceneToUpload]);
 }
@@ -2420,7 +2577,8 @@ export async function uploadSceneFromVTT(
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
     videoOptions?: VideoCompressionOptions,
-    onStage?: (stage: string) => void
+    onStage?: (stage: string) => void,
+    fogImportOptions: FogImportOptions = {}
 ): Promise<void> {
     if (isRawMediaFile(file)) {
         return uploadRawMediaScene(file, compressionMode, onProgress, videoOptions, onStage);
@@ -2483,18 +2641,30 @@ export async function uploadSceneFromVTT(
     const vttMapDataSource = data as VTTMapData; // data is UniversalVTT which is compatible
     const defaultPosition: Vector2 = { x: 0, y: 0 };
     const defaultScale: Vector2 = { x: 1, y: 1 };
+    const includeWalls = fogImportOptions.includeWalls ?? true;
+    const lightOptions = fogImportOptions.lightOptions;
 
-    const wallItems = await createWallItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    const wallItems = includeWalls
+        ? await createWallItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI)
+        : [];
     let doorItems: Item[] = [];
-    if (vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
-        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    let lightItems: Item[] = [];
+    if (includeWalls && vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
+        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
     }
-    const allItems = [...wallItems, ...doorItems];
+    if (vttMapDataSource.lights && vttMapDataSource.lights.length > 0) {
+        lightItems = await createLightItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI, lightOptions);
+    }
+    const allItems = [...wallItems, ...doorItems, ...lightItems];
 
     let sceneBuilder = buildSceneUpload()
         .name(file.name.replace(/\.[^/.]+$/, ""))
         .baseMap(imageUpload)
         .gridType("SQUARE");
+
+    if (vttMapDataSource.gridScale) {
+        sceneBuilder.gridScale(vttMapDataSource.gridScale);
+    }
 
     if (allItems.length > 0) {
         sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
@@ -2511,7 +2681,8 @@ export async function uploadFoundryScene(
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
     videoOptions?: VideoCompressionOptions,
-    onStage?: (stage: string) => void
+    onStage?: (stage: string) => void,
+    fogImportOptions: FogImportOptions = {}
 ): Promise<void> {
     const vttMapDataSource = convertFoundryToVTTData(foundryData);
 
@@ -2560,18 +2731,30 @@ export async function uploadFoundryScene(
 
     const defaultPosition: Vector2 = { x: 0, y: 0 };
     const defaultScale: Vector2 = { x: 1, y: 1 };
+    const includeWalls = fogImportOptions.includeWalls ?? true;
+    const lightOptions = fogImportOptions.lightOptions;
 
-    const wallItems = await createWallItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    const wallItems = includeWalls
+        ? await createWallItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI)
+        : [];
     let doorItems: Item[] = [];
-    if (vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
-        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    let lightItems: Item[] = [];
+    if (includeWalls && vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
+        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
     }
-    const allItems = [...wallItems, ...doorItems];
+    if (vttMapDataSource.lights && vttMapDataSource.lights.length > 0) {
+        lightItems = await createLightItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI, lightOptions);
+    }
+    const allItems = [...wallItems, ...doorItems, ...lightItems];
 
     let sceneBuilder = buildSceneUpload()
         .name(name)
         .baseMap(imageUpload)
         .gridType("SQUARE");
+
+    if (vttMapDataSource.gridScale) {
+        sceneBuilder.gridScale(vttMapDataSource.gridScale);
+    }
 
     if (allItems.length > 0) {
         sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
@@ -2588,7 +2771,8 @@ export async function uploadMediaSceneWithWallData(
     compressionMode: CompressionMode = 'standard',
     onProgress?: (progress: number) => void,
     videoOptions?: VideoCompressionOptions,
-    onStage?: (stage: string) => void
+    onStage?: (stage: string) => void,
+    fogImportOptions: FogImportOptions = {}
 ): Promise<void> {
     if (!isRawMediaFile(mediaFile)) {
         throw new Error('Wall-data scene creation requires an image or video file.');
@@ -2651,17 +2835,29 @@ export async function uploadMediaSceneWithWallData(
 
     const defaultPosition: Vector2 = { x: 0, y: 0 };
     const defaultScale: Vector2 = { x: 1, y: 1 };
-    const wallItems = await createWallItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    const includeWalls = fogImportOptions.includeWalls ?? true;
+    const lightOptions = fogImportOptions.lightOptions;
+    const wallItems = includeWalls
+        ? await createWallItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI)
+        : [];
     let doorItems: Item[] = [];
-    if (vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
-        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, 150);
+    let lightItems: Item[] = [];
+    if (includeWalls && vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
+        doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
     }
-    const allItems = [...wallItems, ...doorItems];
+    if (vttMapDataSource.lights && vttMapDataSource.lights.length > 0) {
+        lightItems = await createLightItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI, lightOptions);
+    }
+    const allItems = [...wallItems, ...doorItems, ...lightItems];
 
     let sceneBuilder = buildSceneUpload()
         .name(normalizedName)
         .baseMap(imageUpload)
         .gridType('SQUARE');
+
+    if (vttMapDataSource.gridScale) {
+        sceneBuilder.gridScale(vttMapDataSource.gridScale);
+    }
 
     if (allItems.length > 0) {
         sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
@@ -2688,7 +2884,14 @@ async function addItemsInBatches(items: Item[], batchSize: number): Promise<void
     }
 }
 
-export async function addItemsFromData(processedData: VTTMapData, context: boolean): Promise<void> {
+export async function addItemsFromData(
+    processedData: VTTMapData,
+    context: boolean,
+    options: {
+        includeWalls?: boolean;
+        lightOptions?: LightImportOptions;
+    } = {}
+): Promise<void> {
     if (!await OBR.scene.isReady()) {
         console.error("Scene is not ready. Please wait until the scene is fully loaded.");
         return;
@@ -2768,23 +2971,56 @@ export async function addItemsFromData(processedData: VTTMapData, context: boole
         }
     }
 
-    const walls = await createWallItems(processedData, position, scale, dpi);
-    if (walls.length > 0) {
-        await addItemsInBatches(walls, BATCH_SIZE);
-    }
+    const includeWalls = options.includeWalls ?? true;
+    const includeLights = options.lightOptions?.includeLights ?? true;
+    let addedAnyFogItems = false;
 
-    if (processedData.portals && processedData.portals.length > 0) {
-        const doors = await createDoorItems(processedData, position, scale, dpi);
-        if (doors.length > 0) {
-            await addItemsInBatches(doors, BATCH_SIZE);
+    if (includeWalls) {
+        const walls = await createWallItems(processedData, position, scale, dpi);
+        if (walls.length > 0) {
+            await addItemsInBatches(walls, BATCH_SIZE);
+            addedAnyFogItems = true;
+        }
+
+        if (processedData.portals && processedData.portals.length > 0) {
+            const doors = await createDoorItems(processedData, position, scale, dpi);
+            if (doors.length > 0) {
+                await addItemsInBatches(doors, BATCH_SIZE);
+                addedAnyFogItems = true;
+            }
         }
     }
 
-    await OBR.scene.fog.setFilled(true);
-    await OBR.notification.show("Import complete!", "SUCCESS");
+    if (includeLights && processedData.lights && processedData.lights.length > 0) {
+        const lights = await createLightItems(processedData, position, scale, dpi, options.lightOptions);
+        if (lights.length > 0) {
+            await addItemsInBatches(lights, BATCH_SIZE);
+            addedAnyFogItems = true;
+        }
+    }
+
+    if (addedAnyFogItems) {
+        await OBR.scene.fog.setFilled(true);
+        await OBR.notification.show("Import complete!", "SUCCESS");
+        return;
+    }
+
+    const noDataMessage = includeWalls && includeLights
+        ? "No walls, doors, or lights were found for the selected import options."
+        : includeWalls
+            ? "No walls or doors were found for the selected import options."
+            : "No lights were found for the selected import options.";
+    await OBR.notification.show(noDataMessage, "INFO");
 }
 
-export async function addItemsFromVTT(file: File, context: boolean): Promise<void> {
+export async function addItemsFromVTT(
+    file: File,
+    context: boolean,
+    options: {
+        includeWalls?: boolean;
+        lightOptions?: LightImportOptions;
+    } = {}
+): Promise<void> {
     const text = await readFileAsText(file);
     const fileData = JSON.parse(text);
 
@@ -2805,7 +3041,7 @@ export async function addItemsFromVTT(file: File, context: boolean): Promise<voi
         throw new Error("Failed to process the file. Make sure it's a valid UVTT, DD2VTT, or FoundryVTT JSON file.");
     }
 
-    await addItemsFromData(processedData, context);
+    await addItemsFromData(processedData, context, options);
 }
 
 // Helper function to read file as text

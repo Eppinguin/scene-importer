@@ -22,6 +22,7 @@ import {
   type VideoCompressionErrorCode,
   type VideoCodecPreference,
   type VideoCompressionOptions,
+  type LightImportOptions,
   preflightVideoCompression,
   type BrowserVideoCodecAvailability,
   getBrowserVideoCodecAvailability,
@@ -85,7 +86,11 @@ const PREVIEW_HOVER_OPEN_DELAY_MS = 500;
 const PREVIEW_TOUCH_OPEN_DELAY_MS = 240;
 const PREVIEW_TOUCH_RELEASE_THRESHOLD_MS = 120;
 
-const showMapWorkflowMismatchWarning = async (result: MapWorkflowResult) => {
+const showMapWorkflowMismatchWarning = async (
+  result: MapWorkflowResult,
+  options: { includeWalls: boolean; includeLights: boolean },
+) => {
+  if (!options.includeWalls && !options.includeLights) return;
   if (result.unmatchedSelectionNames.length === 0) return;
 
   const unmatchedCount = result.unmatchedSelectionNames.length;
@@ -93,7 +98,7 @@ const showMapWorkflowMismatchWarning = async (result: MapWorkflowResult) => {
   const moreSuffix = unmatchedCount > 3 ? ` (+${unmatchedCount - 3} more)` : "";
 
   await OBR.notification.show(
-    `${unmatchedCount} selected map(s) did not match uploaded metadata, so walls/doors were skipped for those maps. ${preview}${moreSuffix}`,
+    `${unmatchedCount} selected map(s) did not match uploaded metadata, so walls/doors/lights were skipped for those maps. ${preview}${moreSuffix}`,
     "WARNING",
   );
 };
@@ -108,7 +113,7 @@ const hexToRgbChannels = (color: string): string | null => {
   return `${r}, ${g}, ${b}`;
 };
 
-const sceneHasWallData = (sceneData: SceneData): boolean => {
+const sceneHasWallsOrDoors = (sceneData: SceneData): boolean => {
   if (isFoundryVTTData(sceneData)) {
     return Array.isArray(sceneData.walls) && sceneData.walls.length > 0;
   }
@@ -120,6 +125,41 @@ const sceneHasWallData = (sceneData: SceneData): boolean => {
     (Array.isArray(vttData.objects_line_of_sight) &&
       vttData.objects_line_of_sight.length > 0) ||
     (Array.isArray(vttData.portals) && vttData.portals.length > 0)
+  );
+};
+
+const sceneHasLightData = (sceneData: SceneData): boolean => {
+  if (isFoundryVTTData(sceneData)) {
+    const foundryLights = (sceneData as { lights?: unknown[] }).lights;
+    return Array.isArray(foundryLights) && foundryLights.length > 0;
+  }
+
+  const vttData = sceneData as Partial<VTTMapData>;
+  return Array.isArray(vttData.lights) && vttData.lights.length > 0;
+};
+
+const wallDataHasLights = (wallData: CompanionWallData | null): boolean => {
+  if (!wallData) return false;
+  if (isFoundryVTTData(wallData)) {
+    const foundryLights = (wallData as { lights?: unknown[] }).lights;
+    return Array.isArray(foundryLights) && foundryLights.length > 0;
+  }
+  return Array.isArray(wallData.lights) && wallData.lights.length > 0;
+};
+
+const wallDataHasWallsOrDoors = (
+  wallData: CompanionWallData | null,
+): boolean => {
+  if (!wallData) return false;
+  if (isFoundryVTTData(wallData)) {
+    return Array.isArray(wallData.walls) && wallData.walls.length > 0;
+  }
+  return (
+    (Array.isArray(wallData.line_of_sight) &&
+      wallData.line_of_sight.length > 0) ||
+    (Array.isArray(wallData.objects_line_of_sight) &&
+      wallData.objects_line_of_sight.length > 0) ||
+    (Array.isArray(wallData.portals) && wallData.portals.length > 0)
   );
 };
 
@@ -226,10 +266,18 @@ function App() {
   const [layoutSpacing, setLayoutSpacing] = useState("");
   const [snapToGrid, setSnapToGrid] = useState(true);
   const [layoutScalePercent, setLayoutScalePercent] = useState("100");
+  const [includeMapImages, setIncludeMapImages] = useState(true);
   const [includeWallsWithMaps, setIncludeWallsWithMaps] = useState(true);
+  const [includeImportedLights, setIncludeImportedLights] = useState(true);
+  const [importedLightType, setImportedLightType] = useState<
+    "AUTO" | "PRIMARY" | "SECONDARY" | "AUXILIARY"
+  >("AUTO");
+  const [useSoftEdgesForLights, setUseSoftEdgesForLights] = useState(true);
+  const [lightShadowDetail, setLightShadowDetail] = useState<
+    "fast" | "obr-default"
+  >("fast");
   const [lockImportedMaps, setLockImportedMaps] = useState(true);
   const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
-  const [importWallsOnlyMode, setImportWallsOnlyMode] = useState(false);
   const [multiSceneName, setMultiSceneName] = useState("Multi Map Scene");
   const [pendingMapSelection, setPendingMapSelection] = useState<{
     token: string;
@@ -254,6 +302,9 @@ function App() {
 
   const [isFoundryFormat, setIsFoundryFormat] = useState(false);
   const [hasImage, setHasImage] = useState(false);
+  const [selectedFileHasWallsOrDoors, setSelectedFileHasWallsOrDoors] =
+    useState(false);
+  const [selectedFileHasLights, setSelectedFileHasLights] = useState(false);
   const [compressionMode, setCompressionMode] =
     useState<CompressionMode>("standard");
   const [preferredVideoCodec, setPreferredVideoCodec] =
@@ -351,15 +402,45 @@ function App() {
     selectedScenes.some(
       (scene) => !!(scene.data.img || scene.data.background?.src),
     );
-  const hasCompanionWallData = !!selectedWallData;
+  const hasArchiveLightSources =
+    availableScenes.length > 0 &&
+    selectedScenes.some((scene) => sceneHasLightData(scene.data));
+  const hasCompanionWallData = wallDataHasWallsOrDoors(selectedWallData);
+  const hasCompanionLightData = wallDataHasLights(selectedWallData);
+  const hasPairedImportWallData = selectedPairedImports.some((selection) =>
+    wallDataHasWallsOrDoors(selection.wallData),
+  );
+  const hasPairedImportLightData = selectedPairedImports.some(
+    (selection) =>
+      Array.isArray(selection.wallData.lights) &&
+      selection.wallData.lights.length > 0,
+  );
+  const hasStandaloneFileLightData =
+    !!selectedFile && !isRawMediaFile(selectedFile) && selectedFileHasLights;
+  const hasStandaloneFileWallData =
+    !!selectedFile &&
+    !isRawMediaFile(selectedFile) &&
+    selectedFileHasWallsOrDoors;
+  const hasLightImportSources =
+    hasArchiveLightSources ||
+    hasCompanionLightData ||
+    hasPairedImportLightData ||
+    hasStandaloneFileLightData;
   const hasMapWorkflowSources =
     hasArchiveMapSources ||
     hasRawMediaSources ||
     hasEmbeddedMapDataSource ||
     hasPairedMapSources;
-  const selectedSceneHasWallData =
+  const selectedSceneHasWallsOrDoors =
     availableScenes.length === 0 ||
-    selectedScenes.some((scene) => sceneHasWallData(scene.data));
+    selectedScenes.some((scene) => sceneHasWallsOrDoors(scene.data));
+  const selectedSceneHasEnabledFogData =
+    availableScenes.length === 0 ||
+    selectedScenes.some(
+      (scene) =>
+        (includeWallsWithMaps && sceneHasWallsOrDoors(scene.data)) ||
+        (includeImportedLights && sceneHasLightData(scene.data)),
+    );
   const selectedSceneHasMap =
     availableScenes.length === 0 ||
     selectedScenes.some(
@@ -397,31 +478,45 @@ function App() {
             ? 1
             : 0;
   const hasWallImportSources =
-    (availableScenes.length > 0 && selectedSceneHasWallData) ||
-    !!selectedWallData ||
-    (!!selectedFile && !isRawMediaFile(selectedFile));
-  const canImportToCurrentScene = hasMapWorkflowSources || hasWallImportSources;
+    (availableScenes.length > 0 && selectedSceneHasWallsOrDoors) ||
+    hasCompanionWallData ||
+    hasPairedImportWallData ||
+    hasStandaloneFileWallData;
+  const wantsMapImport = includeMapImages && hasMapWorkflowSources;
+  const wantsWallDoorImport = includeWallsWithMaps && hasWallImportSources;
+  const wantsLightImport = includeImportedLights && hasLightImportSources;
+  const wantsFogFeatureImport = wantsWallDoorImport || wantsLightImport;
+  const canImportToCurrentScene = wantsMapImport || wantsFogFeatureImport;
   const canCreateNewScene =
     !isContextMenuMode &&
     selectedSourceCount > 0 &&
-    (hasImage || (!!selectedFile && selectedWallData));
+    includeMapImages &&
+    hasMapWorkflowSources;
   const shouldUseMultiMapSceneCreation =
-    !isContextMenuMode && hasMapWorkflowSources && selectedSourceCount > 1;
+    !isContextMenuMode &&
+    includeMapImages &&
+    hasMapWorkflowSources &&
+    selectedSourceCount > 1;
   const shouldShowLayoutControls =
-    !isContextMenuMode && hasMapWorkflowSources && selectedSourceCount > 1;
+    !isContextMenuMode &&
+    includeMapImages &&
+    hasMapWorkflowSources &&
+    selectedSourceCount > 1;
   const shouldShowPlacementControl =
-    !isContextMenuMode && hasMapWorkflowSources;
-  const hasMixedMapAndWallSources =
-    hasMapWorkflowSources && hasWallImportSources;
-  const canUseWallsOnlyMode = !isContextMenuMode && hasMixedMapAndWallSources;
+    !isContextMenuMode && includeMapImages && hasMapWorkflowSources;
   const useMultiSceneSelectionLabel =
     !isContextMenuMode && selectedSceneIndices.length > 1;
-  const shouldPreferWallImportForCurrent =
-    (hasCompanionWallData && !hasRawMediaSources) || !hasMapWorkflowSources;
-  const showWallsOnlyActionButton =
-    !isContextMenuMode && hasWallImportSources && !hasMapWorkflowSources;
   const videoCompressionBlocked =
     selectedInputIsVideo && !isVideoCompressionSupported;
+  const shouldShowImportOptionsPanel = isContextMenuMode
+    ? hasWallImportSources || hasLightImportSources
+    : hasImage || hasWallImportSources || hasLightImportSources;
+  const hasQuickImportOptions = includeMapImages && hasImage;
+  const hasAdvancedOptionContent =
+    hasMapWorkflowSources ||
+    hasWallImportSources ||
+    hasLightImportSources ||
+    hasImage;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
 
   useEffect(
@@ -748,18 +843,10 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (!hasMapWorkflowSources && showAdvancedOptions) {
+    if (!hasAdvancedOptionContent && showAdvancedOptions) {
       setShowAdvancedOptions(false);
     }
-    if (!canUseWallsOnlyMode && importWallsOnlyMode) {
-      setImportWallsOnlyMode(false);
-    }
-  }, [
-    hasMapWorkflowSources,
-    showAdvancedOptions,
-    canUseWallsOnlyMode,
-    importWallsOnlyMode,
-  ]);
+  }, [hasAdvancedOptionContent, showAdvancedOptions]);
 
   // Set theme CSS variables when theme changes
   useEffect(() => {
@@ -1045,6 +1132,8 @@ function App() {
         setSelectedPairedImports([]);
         resetMapWorkflowState();
         setIsFoundryFormat(true);
+        setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasLights(false);
         const firstScene = scenes[0].data;
         setHasImage(!!(firstScene.img || firstScene.background?.src));
       } else {
@@ -1056,6 +1145,8 @@ function App() {
         setSelectedWallData(null);
         setSelectedPairedImports([]);
         resetMapWorkflowState();
+        setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasLights(false);
       }
     } catch (e) {
       console.error(e);
@@ -1067,6 +1158,8 @@ function App() {
       setSelectedWallData(null);
       setSelectedPairedImports([]);
       resetMapWorkflowState();
+      setSelectedFileHasWallsOrDoors(false);
+      setSelectedFileHasLights(false);
     }
     setIsLoading(false);
   };
@@ -1143,8 +1236,27 @@ function App() {
     // Otherwise, it's a standard VTT scene or regular Foundry config map
     const foundryFormat = isFoundryVTTData(fileData);
     const imageExists = hasMapImage(fileData);
+    const fileHasWallsOrDoors = foundryFormat
+      ? Array.isArray((fileData as { walls?: unknown[] }).walls) &&
+        ((fileData as { walls?: unknown[] }).walls?.length ?? 0) > 0
+      : (Array.isArray((fileData as Partial<VTTMapData>).line_of_sight) &&
+          ((fileData as Partial<VTTMapData>).line_of_sight?.length ?? 0) > 0) ||
+        (Array.isArray(
+          (fileData as Partial<VTTMapData>).objects_line_of_sight,
+        ) &&
+          ((fileData as Partial<VTTMapData>).objects_line_of_sight?.length ??
+            0) > 0) ||
+        (Array.isArray((fileData as Partial<VTTMapData>).portals) &&
+          ((fileData as Partial<VTTMapData>).portals?.length ?? 0) > 0);
+    const fileHasLights = foundryFormat
+      ? Array.isArray((fileData as { lights?: unknown[] }).lights) &&
+        ((fileData as { lights?: unknown[] }).lights?.length ?? 0) > 0
+      : Array.isArray((fileData as Partial<VTTMapData>).lights) &&
+        ((fileData as Partial<VTTMapData>).lights?.length ?? 0) > 0;
     setIsFoundryFormat(foundryFormat);
     setHasImage(imageExists);
+    setSelectedFileHasWallsOrDoors(fileHasWallsOrDoors);
+    setSelectedFileHasLights(fileHasLights);
 
     const fileObj =
       originalBlob instanceof File
@@ -1283,11 +1395,13 @@ function App() {
       ? source.objects_line_of_sight
       : [];
     const portals = Array.isArray(source.portals) ? source.portals : [];
+    const lights = Array.isArray(source.lights) ? source.lights : [];
 
     if (
       lineOfSight.length === 0 &&
       objectLineOfSight.length === 0 &&
-      portals.length === 0
+      portals.length === 0 &&
+      lights.length === 0
     ) {
       return null;
     }
@@ -1296,6 +1410,7 @@ function App() {
       line_of_sight: lineOfSight,
       objects_line_of_sight: objectLineOfSight,
       portals,
+      lights,
       resolution: {
         map_origin: { x: mapOriginX, y: mapOriginY },
         map_size: { x: mapSizeX, y: mapSizeY },
@@ -1317,7 +1432,7 @@ function App() {
     }
 
     throw new Error(
-      "Wall data JSON must be Foundry scene wall data or UVTT-style wall data with a valid resolution block.",
+      "Wall data JSON must be Foundry scene wall data or UVTT-style wall/light data with a valid resolution block.",
     );
   };
 
@@ -1329,6 +1444,8 @@ function App() {
     setSelectedPairedImports([]);
     setIsFoundryFormat(false);
     setHasImage(true);
+    setSelectedFileHasWallsOrDoors(false);
+    setSelectedFileHasLights(false);
     setAvailableScenes([]);
     setSelectedSceneIndices([]);
     setZipObject(null);
@@ -1498,6 +1615,8 @@ function App() {
           setZipObject(null);
           setIsFoundryFormat(false);
           setHasImage(true);
+          setSelectedFileHasWallsOrDoors(false);
+          setSelectedFileHasLights(false);
           return;
         } catch (error) {
           const message =
@@ -1533,6 +1652,8 @@ function App() {
       setZipObject(null);
       setIsFoundryFormat(false);
       setHasImage(true);
+      setSelectedFileHasWallsOrDoors(false);
+      setSelectedFileHasLights(false);
       return;
     }
 
@@ -1603,6 +1724,8 @@ function App() {
           setSelectedPairedImports([]);
           setIsFoundryFormat(false);
           setHasImage(false);
+          setSelectedFileHasWallsOrDoors(false);
+          setSelectedFileHasLights(false);
         }
       } else {
         await OBR.notification.show(
@@ -1618,6 +1741,8 @@ function App() {
         setSelectedPairedImports([]);
         setIsFoundryFormat(false);
         setHasImage(false);
+        setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasLights(false);
       }
     }
   };
@@ -1634,6 +1759,15 @@ function App() {
       ...(Number.isFinite(parsedMaxDimension) && parsedMaxDimension > 0
         ? { maxDimension: parsedMaxDimension }
         : {}),
+    };
+  };
+
+  const buildLightImportOptions = (): LightImportOptions => {
+    return {
+      includeLights: includeImportedLights,
+      sourceRadius: lightShadowDetail === "obr-default" ? 25 : 0,
+      falloff: useSoftEdgesForLights ? 1.5 : 0.2,
+      lightType: importedLightType,
     };
   };
 
@@ -1692,6 +1826,12 @@ function App() {
       forceVideoTranscode,
       maxResolutionDimension,
       snapToGrid,
+      includeMapImages,
+      includeWallsWithMaps,
+      includeImportedLights,
+      importedLightType,
+      lightShadowDetail,
+      useSoftEdgesForLights,
     });
   };
 
@@ -1834,6 +1974,7 @@ function App() {
         scale: getLayoutScale(),
         placement: mapPlacementMode,
         includeWalls: includeWallsWithMaps,
+        lightOptions: buildLightImportOptions(),
         lockMaps: lockImportedMaps,
         compressionMode,
         selectionToken: activeSelectionToken,
@@ -1844,7 +1985,10 @@ function App() {
         onFileProgress: setMapFileProgress,
       });
 
-      await showMapWorkflowMismatchWarning(result);
+      await showMapWorkflowMismatchWarning(result, {
+        includeWalls: includeWallsWithMaps,
+        includeLights: includeImportedLights,
+      });
 
       setMapSelectionToken(activeSelectionToken);
       setPendingMapSelection(null);
@@ -1923,6 +2067,7 @@ function App() {
         snapToGrid,
         scale: getLayoutScale(),
         includeWalls: includeWallsWithMaps,
+        lightOptions: buildLightImportOptions(),
         lockMaps: lockImportedMaps,
         compressionMode,
         sceneName: multiSceneName,
@@ -1934,7 +2079,10 @@ function App() {
         onFileProgress: setMapFileProgress,
       });
 
-      await showMapWorkflowMismatchWarning(result);
+      await showMapWorkflowMismatchWarning(result, {
+        includeWalls: includeWallsWithMaps,
+        includeLights: includeImportedLights,
+      });
 
       setMapSelectionToken(activeSelectionToken);
       setPendingMapSelection(null);
@@ -1986,16 +2134,18 @@ function App() {
   };
 
   const handleImportToCurrentScene = () => {
-    if (importWallsOnlyMode && canUseWallsOnlyMode) {
+    if (wantsMapImport) {
+      runMapWorkflowByAction("add-current");
+      return;
+    }
+    if (wantsFogFeatureImport) {
       void handleAddWallsToCurrentScene();
       return;
     }
-
-    if (shouldPreferWallImportForCurrent && hasWallImportSources) {
-      void handleAddWallsToCurrentScene();
-      return;
-    }
-    runMapWorkflowByAction("add-current");
+    void OBR.notification.show(
+      "Enable at least one import option (image, walls/doors, lights).",
+      "INFO",
+    );
   };
 
   const handleCreateSceneDestination = () => {
@@ -2036,6 +2186,10 @@ function App() {
       const videoCompressionOptions = buildVideoCompressionOptions(
         abortController.signal,
       );
+      const fogImportOptions = {
+        includeWalls: includeWallsWithMaps,
+        lightOptions: buildLightImportOptions(),
+      };
 
       if (selectedPairedImports.length > 0) {
         const pairedImport = selectedPairedImports[0];
@@ -2051,6 +2205,7 @@ function App() {
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
           (stage) => setCompressionStage(stage),
+          fogImportOptions,
         );
       } else if (availableScenes.length > 0 && zipObject) {
         const scene = availableScenes[selectedSceneIndex].data;
@@ -2069,6 +2224,7 @@ function App() {
           (progress) => setUploadProgress(progress),
           videoCompressionOptions,
           (stage) => setCompressionStage(stage),
+          fogImportOptions,
         );
         // Compression done — clear progress bar, show uploading state
         setUploadProgress(null);
@@ -2091,6 +2247,7 @@ function App() {
             (progress) => setUploadProgress(progress),
             videoCompressionOptions,
             (stage) => setCompressionStage(stage),
+            fogImportOptions,
           );
         } else {
           await uploadSceneFromVTT(
@@ -2099,6 +2256,7 @@ function App() {
             (progress) => setUploadProgress(progress),
             videoCompressionOptions,
             (stage) => setCompressionStage(stage),
+            fogImportOptions,
           );
         }
       }
@@ -2189,12 +2347,30 @@ function App() {
   };
 
   const handleAddWallsToCurrentScene = async () => {
-    if (!selectedFile && availableScenes.length === 0) return;
-    if (availableScenes.length > 0 && !selectedSceneHasWallData) {
+    if (!includeWallsWithMaps && !includeImportedLights) {
       await OBR.notification.show(
-        "Selected scene has no walls or doors to import.",
+        "Enable walls/doors or lights to import fog data.",
         "INFO",
       );
+      return;
+    }
+
+    if (
+      !selectedFile &&
+      availableScenes.length === 0 &&
+      selectedPairedImports.length === 0 &&
+      selectedRawFiles.length === 0
+    ) {
+      return;
+    }
+    if (availableScenes.length > 0 && !selectedSceneHasEnabledFogData) {
+      const noFogDataMessage =
+        includeWallsWithMaps && includeImportedLights
+          ? "Selected scene has no walls, doors, or lights to import."
+          : includeWallsWithMaps
+            ? "Selected scene has no walls or doors to import."
+            : "Selected scene has no lights to import.";
+      await OBR.notification.show(noFogDataMessage, "INFO");
       return;
     }
 
@@ -2208,18 +2384,23 @@ function App() {
           snapToGrid,
           scale: getLayoutScale(),
           placement: "ORIGIN",
+          includeWalls: includeWallsWithMaps,
+          lightOptions: buildLightImportOptions(),
         });
 
-        await showMapWorkflowMismatchWarning(result);
+        await showMapWorkflowMismatchWarning(result, {
+          includeWalls: includeWallsWithMaps,
+          includeLights: includeImportedLights,
+        });
 
         if (result.wallsAppliedToMapCount === 0) {
           await OBR.notification.show(
-            "No walls or doors were found for the selected maps.",
+            "No walls, doors, or lights were found for the selected maps.",
             "INFO",
           );
         } else {
           await OBR.notification.show(
-            `Imported walls/doors for ${result.wallsAppliedToMapCount} map(s).`,
+            `Imported walls/doors/lights for ${result.wallsAppliedToMapCount} map(s).`,
             "SUCCESS",
           );
         }
@@ -2229,6 +2410,10 @@ function App() {
             ? convertFoundryToVTTData(selectedWallData)
             : selectedWallData,
           isContextMenuMode,
+          {
+            includeWalls: includeWallsWithMaps,
+            lightOptions: buildLightImportOptions(),
+          },
         );
       } else if (availableScenes.length > 0) {
         const s = availableScenes[selectedSceneIndex];
@@ -2236,10 +2421,16 @@ function App() {
           const wallData = isFoundryVTTData(s.data)
             ? convertFoundryToVTTData(s.data)
             : (s.data as VTTMapData);
-          await addItemsFromData(wallData, isContextMenuMode);
+          await addItemsFromData(wallData, isContextMenuMode, {
+            includeWalls: includeWallsWithMaps,
+            lightOptions: buildLightImportOptions(),
+          });
         }
       } else if (selectedFile) {
-        await addItemsFromVTT(selectedFile, isContextMenuMode);
+        await addItemsFromVTT(selectedFile, isContextMenuMode, {
+          includeWalls: includeWallsWithMaps,
+          lightOptions: buildLightImportOptions(),
+        });
       }
 
       if (isContextMenuMode) {
@@ -2351,7 +2542,7 @@ function App() {
                 </Typography>
                 <Typography className="file-info" variant="caption">
                   {(isFoundryFormat || !hasImage) &&
-                    "No map image found (walls and doors only)"}
+                    "No map image found (walls, doors, and lights only)"}
                 </Typography>
                 {selectedWallDataFile && (
                   <Typography className="file-info" variant="caption">
@@ -2726,73 +2917,83 @@ function App() {
             </div>
           )}
 
-          {hasImage && !isContextMenuMode && (
+          {shouldShowImportOptionsPanel && (
             <Box className="options">
-              <Typography variant="subtitle2" sx={{ mb: 1 }}>
-                Import Options
-              </Typography>
+              {!isContextMenuMode && hasQuickImportOptions && (
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Import Options
+                </Typography>
+              )}
               <Stack className="compression-options" spacing={1}>
-                <FormControl fullWidth size="small">
-                  <InputLabel id="compression-mode-label">
-                    Compression Mode
-                  </InputLabel>
-                  <Select
-                    labelId="compression-mode-label"
-                    label="Compression Mode"
-                    value={compressionMode}
-                    onChange={(e) =>
-                      setCompressionMode(e.target.value as CompressionMode)
-                    }
-                    disabled={isLoading}>
-                    <MenuItem value="none">No Compression</MenuItem>
-                    <MenuItem
-                      value="standard"
-                      disabled={videoCompressionBlocked}>
-                      {selectedInputIsVideo
-                        ? "Nestling (Max 50MB)"
-                        : "Nestling / Fledgeling (Max 25MB)"}
-                    </MenuItem>
-                    <MenuItem value="high" disabled={videoCompressionBlocked}>
-                      {selectedInputIsVideo
-                        ? "Fledgeling / Bestling (Max 100MB)"
-                        : "Bestling Tier (Max 50MB)"}
-                    </MenuItem>
-                  </Select>
-                </FormControl>
+                {!isContextMenuMode && includeMapImages && hasImage && (
+                  <>
+                    <FormControl fullWidth size="small">
+                      <InputLabel id="compression-mode-label">
+                        Compression Mode
+                      </InputLabel>
+                      <Select
+                        labelId="compression-mode-label"
+                        label="Compression Mode"
+                        value={compressionMode}
+                        onChange={(e) =>
+                          setCompressionMode(e.target.value as CompressionMode)
+                        }
+                        disabled={isLoading}>
+                        <MenuItem value="none">No Compression</MenuItem>
+                        <MenuItem
+                          value="standard"
+                          disabled={videoCompressionBlocked}>
+                          {selectedInputIsVideo
+                            ? "Nestling (Max 50MB)"
+                            : "Nestling / Fledgeling (Max 25MB)"}
+                        </MenuItem>
+                        <MenuItem
+                          value="high"
+                          disabled={videoCompressionBlocked}>
+                          {selectedInputIsVideo
+                            ? "Fledgeling / Bestling (Max 100MB)"
+                            : "Bestling Tier (Max 50MB)"}
+                        </MenuItem>
+                      </Select>
+                    </FormControl>
 
-                {videoCompressionBlocked && videoCompressionSupportMessage && (
-                  <Typography
-                    variant="caption"
-                    className="help-text"
-                    color="warning.main">
-                    {videoCompressionSupportMessage}
-                  </Typography>
+                    {videoCompressionBlocked &&
+                      videoCompressionSupportMessage && (
+                        <Typography
+                          variant="caption"
+                          className="help-text"
+                          color="warning.main">
+                          {videoCompressionSupportMessage}
+                        </Typography>
+                      )}
+
+                    <Box className="compression-info">
+                      {compressionMode === "none" && (
+                        <Typography variant="body2">
+                          Uploads the original file without modification. The
+                          upload will fail if it exceeds your account's file
+                          size limit.
+                        </Typography>
+                      )}
+
+                      {compressionMode === "standard" && (
+                        <Typography variant="body2">
+                          {selectedInputIsVideo
+                            ? "Compresses the video to a maximum of 50MB to fit Nestling account limits."
+                            : "Compresses the image to a maximum of 25MB to fit Nestling and Fledgeling account limits."}
+                        </Typography>
+                      )}
+
+                      {compressionMode === "high" && (
+                        <Typography variant="body2">
+                          {selectedInputIsVideo
+                            ? "Compresses the video to a maximum of 100MB to fit Fledgeling and Bestling account limits."
+                            : "Compresses the image to a maximum of 50MB to fit Bestling account limits."}
+                        </Typography>
+                      )}
+                    </Box>
+                  </>
                 )}
-
-                <Box className="compression-info">
-                  {compressionMode === "none" && (
-                    <Typography variant="body2">
-                      Uploads the original file without modification. The upload
-                      will fail if it exceeds your account's file size limit.
-                    </Typography>
-                  )}
-
-                  {compressionMode === "standard" && (
-                    <Typography variant="body2">
-                      {selectedInputIsVideo
-                        ? "Compresses the video to a maximum of 50MB to fit Nestling account limits."
-                        : "Compresses the image to a maximum of 25MB to fit Nestling and Fledgeling account limits."}
-                    </Typography>
-                  )}
-
-                  {compressionMode === "high" && (
-                    <Typography variant="body2">
-                      {selectedInputIsVideo
-                        ? "Compresses the video to a maximum of 100MB to fit Fledgeling and Bestling account limits."
-                        : "Compresses the image to a maximum of 50MB to fit Bestling account limits."}
-                    </Typography>
-                  )}
-                </Box>
 
                 <Button
                   onClick={() =>
@@ -2809,285 +3010,443 @@ function App() {
 
                 {showAdvancedOptions && (
                   <Stack className="advanced-video-options" spacing={1}>
-                    <Typography variant="caption" className="help-text">
-                      Selected sources: {selectedSourceCount}
-                      {pendingMapSelection ? " - selection pending" : ""}
-                    </Typography>
-
-                    {shouldUseMultiMapSceneCreation && (
-                      <TextField
-                        label="New Scene Name"
-                        value={multiSceneName}
-                        onChange={(e) => setMultiSceneName(e.target.value)}
-                        size="small"
-                        fullWidth
-                        disabled={isLoading}
-                      />
-                    )}
-
-                    {shouldShowPlacementControl && (
-                      <FormControl fullWidth size="small">
-                        <InputLabel id="placement-mode-label">
-                          Map Placement
-                        </InputLabel>
-                        <Select
-                          labelId="placement-mode-label"
-                          label="Map Placement"
-                          value={mapPlacementMode}
-                          onChange={(e) =>
-                            setMapPlacementMode(
-                              e.target.value as MapPlacementMode,
-                            )
-                          }
-                          disabled={isLoading}>
-                          <MenuItem value="RIGHT">
-                            Place right of existing
-                          </MenuItem>
-                          <MenuItem value="BELOW">
-                            Place below existing
-                          </MenuItem>
-                          <MenuItem value="ORIGIN">Place at origin</MenuItem>
-                        </Select>
-                      </FormControl>
-                    )}
-
-                    {shouldShowLayoutControls && (
-                      <>
-                        <FormControl fullWidth size="small">
-                          <InputLabel id="layout-mode-label">Layout</InputLabel>
-                          <Select
-                            labelId="layout-mode-label"
-                            label="Layout"
-                            value={layoutMode}
-                            onChange={(e) =>
-                              setLayoutMode(e.target.value as MapLayoutMode)
-                            }
-                            disabled={isLoading}>
-                            <MenuItem value="GRID">
-                              Grid (auto columns)
-                            </MenuItem>
-                            <MenuItem value="ROW">Single row</MenuItem>
-                            <MenuItem value="COLUMN">Single column</MenuItem>
-                            <MenuItem value="STACK">
-                              Stacked on top of each other
-                            </MenuItem>
-                          </Select>
-                        </FormControl>
-
-                        <TextField
-                          type="number"
-                          label="Minimum Spacing (px, optional)"
-                          value={layoutSpacing}
-                          onChange={(e) => setLayoutSpacing(e.target.value)}
-                          inputProps={{ min: 0, step: 1 }}
-                          placeholder="One grid size"
-                          helperText="Minimum free space between maps. Leave empty to default to one grid square."
-                          size="small"
-                          fullWidth
-                          disabled={isLoading}
-                        />
-
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              size="small"
-                              checked={snapToGrid}
-                              onChange={(e) => setSnapToGrid(e.target.checked)}
-                              disabled={isLoading}
-                            />
-                          }
-                          label="Snap placement to grid"
-                        />
-
-                        <TextField
-                          type="number"
-                          label="Scale (%)"
-                          value={layoutScalePercent}
-                          onChange={(e) =>
-                            setLayoutScalePercent(e.target.value)
-                          }
-                          inputProps={{ min: 10, step: 5 }}
-                          size="small"
-                          fullWidth
-                          disabled={isLoading}
-                        />
-                      </>
-                    )}
-
-                    {hasMapWorkflowSources && (
-                      <>
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              size="small"
-                              checked={includeWallsWithMaps}
-                              onChange={(e) =>
-                                setIncludeWallsWithMaps(e.target.checked)
+                    {(hasMapWorkflowSources ||
+                      hasWallImportSources ||
+                      hasLightImportSources) && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Import content
+                        </Typography>
+                        <Box className="import-options-grid">
+                          {!isContextMenuMode && hasMapWorkflowSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeMapImages}
+                                  onChange={(e) =>
+                                    setIncludeMapImages(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
                               }
-                              disabled={isLoading}
+                              label="Map image"
                             />
-                          }
-                          label="Include walls/doors when available"
-                        />
-
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              size="small"
-                              checked={lockImportedMaps}
-                              onChange={(e) =>
-                                setLockImportedMaps(e.target.checked)
+                          )}
+                          {hasWallImportSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeWallsWithMaps}
+                                  onChange={(e) =>
+                                    setIncludeWallsWithMaps(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
                               }
-                              disabled={isLoading}
+                              label="Walls & doors"
                             />
-                          }
-                          label="Lock placed maps"
-                        />
-                      </>
+                          )}
+                          {hasLightImportSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeImportedLights}
+                                  onChange={(e) =>
+                                    setIncludeImportedLights(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Lights"
+                            />
+                          )}
+                        </Box>
+                      </Box>
                     )}
 
-                    {canUseWallsOnlyMode && (
-                      <FormControlLabel
-                        control={
-                          <Checkbox
-                            size="small"
-                            checked={importWallsOnlyMode}
-                            onChange={(e) =>
-                              setImportWallsOnlyMode(e.target.checked)
+                    {!isContextMenuMode &&
+                      (shouldUseMultiMapSceneCreation ||
+                        shouldShowPlacementControl ||
+                        shouldShowLayoutControls ||
+                        (includeMapImages && hasMapWorkflowSources)) && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Map setup
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          {shouldUseMultiMapSceneCreation && (
+                            <TextField
+                              label="New Scene Name"
+                              value={multiSceneName}
+                              onChange={(e) =>
+                                setMultiSceneName(e.target.value)
+                              }
+                              size="small"
+                              fullWidth
+                              disabled={isLoading}
+                            />
+                          )}
+                          {shouldShowPlacementControl && (
+                            <FormControl fullWidth size="small">
+                              <InputLabel id="placement-mode-label">
+                                Map Placement
+                              </InputLabel>
+                              <Select
+                                labelId="placement-mode-label"
+                                label="Map Placement"
+                                value={mapPlacementMode}
+                                onChange={(e) =>
+                                  setMapPlacementMode(
+                                    e.target.value as MapPlacementMode,
+                                  )
+                                }
+                                disabled={isLoading}>
+                                <MenuItem value="RIGHT">
+                                  Place right of existing
+                                </MenuItem>
+                                <MenuItem value="BELOW">
+                                  Place below existing
+                                </MenuItem>
+                                <MenuItem value="ORIGIN">
+                                  Place at origin
+                                </MenuItem>
+                              </Select>
+                            </FormControl>
+                          )}
+                          {shouldShowLayoutControls && (
+                            <>
+                              <FormControl fullWidth size="small">
+                                <InputLabel id="layout-mode-label">
+                                  Layout
+                                </InputLabel>
+                                <Select
+                                  labelId="layout-mode-label"
+                                  label="Layout"
+                                  value={layoutMode}
+                                  onChange={(e) =>
+                                    setLayoutMode(
+                                      e.target.value as MapLayoutMode,
+                                    )
+                                  }
+                                  disabled={isLoading}>
+                                  <MenuItem value="GRID">
+                                    Grid (auto columns)
+                                  </MenuItem>
+                                  <MenuItem value="ROW">Single row</MenuItem>
+                                  <MenuItem value="COLUMN">
+                                    Single column
+                                  </MenuItem>
+                                  <MenuItem value="STACK">
+                                    Stacked on top of each other
+                                  </MenuItem>
+                                </Select>
+                              </FormControl>
+                              <TextField
+                                type="number"
+                                label="Minimum Spacing (px, optional)"
+                                value={layoutSpacing}
+                                onChange={(e) =>
+                                  setLayoutSpacing(e.target.value)
+                                }
+                                inputProps={{ min: 0, step: 1 }}
+                                placeholder="One grid size"
+                                helperText="Minimum free space between maps. Leave empty to default to one grid square."
+                                size="small"
+                                fullWidth
+                                disabled={isLoading}
+                              />
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={snapToGrid}
+                                    onChange={(e) =>
+                                      setSnapToGrid(e.target.checked)
+                                    }
+                                    disabled={isLoading}
+                                  />
+                                }
+                                label="Snap placement to grid"
+                              />
+                              <TextField
+                                type="number"
+                                label="Scale (%)"
+                                value={layoutScalePercent}
+                                onChange={(e) =>
+                                  setLayoutScalePercent(e.target.value)
+                                }
+                                inputProps={{ min: 10, step: 5 }}
+                                size="small"
+                                fullWidth
+                                disabled={isLoading}
+                              />
+                            </>
+                          )}
+                          {includeMapImages && hasMapWorkflowSources && (
+                            <FormControlLabel
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={lockImportedMaps}
+                                  onChange={(e) =>
+                                    setLockImportedMaps(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Lock placed maps"
+                            />
+                          )}
+                        </Stack>
+                      </Box>
+                    )}
+
+                    {hasLightImportSources && includeImportedLights && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Lighting
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          <FormControl fullWidth size="small">
+                            <InputLabel id="light-visibility-type-label">
+                              Light behavior
+                            </InputLabel>
+                            <Select
+                              labelId="light-visibility-type-label"
+                              label="Light behavior"
+                              value={importedLightType}
+                              renderValue={(value) =>
+                                value === "AUTO"
+                                  ? "Auto (data, fallback Secondary)"
+                                  : value === "PRIMARY"
+                                  ? "Primary"
+                                  : value === "AUXILIARY"
+                                    ? "Auxiliary"
+                                    : "Secondary"
+                              }
+                              onChange={(e) =>
+                                setImportedLightType(
+                                  e.target.value as
+                                    | "AUTO"
+                                    | "PRIMARY"
+                                    | "SECONDARY"
+                                    | "AUXILIARY",
+                                )
+                              }
+                              disabled={isLoading}>
+                              <MenuItem value="AUTO">
+                                Auto: based on data, fallback Secondary
+                              </MenuItem>
+                              <MenuItem value="SECONDARY">
+                                Secondary: visible in line of sight
+                              </MenuItem>
+                              <MenuItem value="PRIMARY">
+                                Primary: reveals fog on its own
+                              </MenuItem>
+                              <MenuItem value="AUXILIARY">
+                                Auxiliary: won’t activate secondary lights
+                              </MenuItem>
+                            </Select>
+                          </FormControl>
+                          <FormControl fullWidth size="small">
+                            <InputLabel id="light-shadow-detail-label">
+                              Light shadow
+                            </InputLabel>
+                            <Select
+                              labelId="light-shadow-detail-label"
+                              label="Light shadow"
+                              value={lightShadowDetail}
+                              onChange={(e) =>
+                                setLightShadowDetail(
+                                  e.target.value as "fast" | "obr-default",
+                                )
+                              }
+                              disabled={isLoading}>
+                              <MenuItem value="fast">
+                                Hard (better performance)
+                              </MenuItem>
+                              <MenuItem value="obr-default">
+                                Soft (OBR default)
+                              </MenuItem>
+                            </Select>
+                          </FormControl>
+                          <FormControlLabel
+                            control={
+                              <Checkbox
+                                size="small"
+                                checked={useSoftEdgesForLights}
+                                onChange={(e) =>
+                                  setUseSoftEdgesForLights(e.target.checked)
+                                }
+                                disabled={isLoading}
+                              />
                             }
-                            disabled={isLoading}
+                            label="Soft light edge"
                           />
-                        }
-                        label="Import walls only (skip map upload)"
-                      />
+                        </Stack>
+                      </Box>
                     )}
 
-                    <TextField
-                      type="number"
-                      label="Max resolution (optional)"
-                      inputProps={{ min: 0, step: 1 }}
-                      value={maxResolutionDimension}
-                      onChange={(e) =>
-                        setMaxResolutionDimension(e.target.value)
-                      }
-                      placeholder="e.g. 1920"
-                      disabled={isLoading || videoCompressionBlocked}
-                      size="small"
-                      fullWidth
-                    />
-
-                    <Typography variant="caption" className="help-text">
-                      Limits the longest side in pixels for both images and
-                      videos. Leave empty to keep original resolution.
-                    </Typography>
-
-                    {selectedInputIsVideo && (
-                      <>
-                        <FormControl fullWidth size="small">
-                          <InputLabel id="video-codec-label">
-                            Preferred Video Codec
-                          </InputLabel>
-                          <Select
-                            labelId="video-codec-label"
-                            label="Preferred Video Codec"
-                            value={preferredVideoCodec}
+                    {!isContextMenuMode && includeMapImages && hasImage && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Media
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          <TextField
+                            type="number"
+                            label="Max resolution (optional)"
+                            inputProps={{ min: 0, step: 1 }}
+                            value={maxResolutionDimension}
                             onChange={(e) =>
-                              setPreferredVideoCodec(
-                                e.target.value as VideoCodecPreference,
-                              )
+                              setMaxResolutionDimension(e.target.value)
                             }
-                            disabled={isLoading || videoCompressionBlocked}>
-                            <MenuItem value="auto">
-                              Auto (AV1 - H.265 - VP9 - H.264)
-                            </MenuItem>
-                            <MenuItem
-                              value="vp9"
-                              disabled={
-                                !!browserCodecAvailability &&
-                                !browserCodecAvailability.vp9
-                              }>
-                              {browserCodecAvailability &&
-                              !browserCodecAvailability.vp9
-                                ? "VP9/WebM (not available in current browser)"
-                                : "VP9/WebM"}
-                            </MenuItem>
-                            <MenuItem
-                              value="av1"
-                              disabled={
-                                !!browserCodecAvailability &&
-                                !browserCodecAvailability.av1
-                              }>
-                              {browserCodecAvailability &&
-                              !browserCodecAvailability.av1
-                                ? "AV1 (not available in current browser)"
-                                : "AV1 (maximum compression)"}
-                            </MenuItem>
-                            <MenuItem
-                              value="h265"
-                              disabled={
-                                !!browserCodecAvailability &&
-                                !browserCodecAvailability.h265
-                              }>
-                              {browserCodecAvailability &&
-                              !browserCodecAvailability.h265
-                                ? "H.265/HEVC (not available in current browser)"
-                                : "H.265/HEVC (high efficiency)"}
-                            </MenuItem>
-                            <MenuItem
-                              value="h264"
-                              disabled={
-                                !!browserCodecAvailability &&
-                                !browserCodecAvailability.h264
-                              }>
-                              {browserCodecAvailability &&
-                              !browserCodecAvailability.h264
-                                ? "H.264 (not available in current browser)"
-                                : "H.264 (maximum compatibility)"}
-                            </MenuItem>
-                          </Select>
-                        </FormControl>
-
-                        {browserCodecAvailability && (
+                            placeholder="e.g. 1920"
+                            disabled={isLoading || videoCompressionBlocked}
+                            size="small"
+                            fullWidth
+                          />
                           <Typography variant="caption" className="help-text">
-                            Browser codec availability: AV1
-                            {browserCodecAvailability.av1 ? " yes" : " no"},
-                            H.265
-                            {browserCodecAvailability.h265 ? " yes" : " no"},
-                            VP9
-                            {browserCodecAvailability.vp9 ? " yes" : " no"},
-                            H.264
-                            {browserCodecAvailability.h264 ? " yes" : " no"}
+                            Limits the longest side in pixels for both images
+                            and videos. Leave empty to keep original resolution.
                           </Typography>
-                        )}
-
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              size="small"
-                              checked={removeVideoAudio}
-                              onChange={(e) =>
-                                setRemoveVideoAudio(e.target.checked)
-                              }
-                              disabled={isLoading || videoCompressionBlocked}
-                            />
-                          }
-                          label="Remove audio track"
-                        />
-
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              size="small"
-                              checked={forceVideoTranscode}
-                              onChange={(e) =>
-                                setForceVideoTranscode(e.target.checked)
-                              }
-                              disabled={isLoading || videoCompressionBlocked}
-                            />
-                          }
-                          label="Transcode anyway when already under size limit"
-                        />
-                      </>
+                          {selectedInputIsVideo && (
+                            <>
+                              <FormControl fullWidth size="small">
+                                <InputLabel id="video-codec-label">
+                                  Preferred Video Codec
+                                </InputLabel>
+                                <Select
+                                  labelId="video-codec-label"
+                                  label="Preferred Video Codec"
+                                  value={preferredVideoCodec}
+                                  onChange={(e) =>
+                                    setPreferredVideoCodec(
+                                      e.target.value as VideoCodecPreference,
+                                    )
+                                  }
+                                  disabled={
+                                    isLoading || videoCompressionBlocked
+                                  }>
+                                  <MenuItem value="auto">
+                                    Auto (AV1 - H.265 - VP9 - H.264)
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="vp9"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.vp9
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.vp9
+                                      ? "VP9/WebM (not available in current browser)"
+                                      : "VP9/WebM"}
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="av1"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.av1
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.av1
+                                      ? "AV1 (not available in current browser)"
+                                      : "AV1 (maximum compression)"}
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="h265"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.h265
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.h265
+                                      ? "H.265/HEVC (not available in current browser)"
+                                      : "H.265/HEVC (high efficiency)"}
+                                  </MenuItem>
+                                  <MenuItem
+                                    value="h264"
+                                    disabled={
+                                      !!browserCodecAvailability &&
+                                      !browserCodecAvailability.h264
+                                    }>
+                                    {browserCodecAvailability &&
+                                    !browserCodecAvailability.h264
+                                      ? "H.264 (not available in current browser)"
+                                      : "H.264 (maximum compatibility)"}
+                                  </MenuItem>
+                                </Select>
+                              </FormControl>
+                              {browserCodecAvailability && (
+                                <Typography
+                                  variant="caption"
+                                  className="help-text">
+                                  Browser codec availability: AV1
+                                  {browserCodecAvailability.av1
+                                    ? " yes"
+                                    : " no"}
+                                  , H.265
+                                  {browserCodecAvailability.h265
+                                    ? " yes"
+                                    : " no"}
+                                  , VP9
+                                  {browserCodecAvailability.vp9
+                                    ? " yes"
+                                    : " no"}
+                                  , H.264
+                                  {browserCodecAvailability.h264
+                                    ? " yes"
+                                    : " no"}
+                                </Typography>
+                              )}
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={removeVideoAudio}
+                                    onChange={(e) =>
+                                      setRemoveVideoAudio(e.target.checked)
+                                    }
+                                    disabled={
+                                      isLoading || videoCompressionBlocked
+                                    }
+                                  />
+                                }
+                                label="Remove audio track"
+                              />
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={forceVideoTranscode}
+                                    onChange={(e) =>
+                                      setForceVideoTranscode(e.target.checked)
+                                    }
+                                    disabled={
+                                      isLoading || videoCompressionBlocked
+                                    }
+                                  />
+                                }
+                                label="Transcode anyway when already under size limit"
+                              />
+                            </>
+                          )}
+                        </Stack>
+                      </Box>
                     )}
                   </Stack>
                 )}
@@ -3130,6 +3489,7 @@ function App() {
           )}
 
           {(pendingMapSelection || mapSelectionToken) &&
+            includeMapImages &&
             hasMapWorkflowSources &&
             uploadProgress === null && (
               <Box
@@ -3192,11 +3552,9 @@ function App() {
                 disabled={
                   isLoading || uploadProgress !== null || !canCreateNewScene
                 }>
-                {!hasImage
-                  ? "Create New Scene (No Map Image)"
-                  : pendingMapSelection?.action === "multi-scene"
-                    ? "Continue Create New Scene"
-                    : "Create New Scene"}
+                {pendingMapSelection?.action === "multi-scene"
+                  ? "Continue Create New Scene"
+                  : "Create New Scene"}
               </Button>
             )}
 
@@ -3213,32 +3571,13 @@ function App() {
                   ? `Compressing… ${uploadProgress}%`
                   : isLoading
                     ? "Uploading..."
-                    : importWallsOnlyMode && canUseWallsOnlyMode
-                      ? "Import Walls Only to Current Scene"
-                      : pendingMapSelection?.action === "add-current"
-                        ? "Continue Import to Current Scene"
-                        : "Import to Current Scene"}
+                    : pendingMapSelection?.action === "add-current" &&
+                        includeMapImages &&
+                        wantsMapImport
+                      ? "Continue Import to Current Scene"
+                      : "Import to Current Scene"}
               </Button>
             )}
-
-            {!isContextMenuMode &&
-              uploadProgress === null &&
-              showWallsOnlyActionButton && (
-                <Button
-                  onClick={handleAddWallsToCurrentScene}
-                  variant="text"
-                  disabled={
-                    isLoading ||
-                    uploadProgress !== null ||
-                    (availableScenes.length > 0 && !selectedSceneHasWallData)
-                  }>
-                  {isLoading
-                    ? "Uploading..."
-                    : availableScenes.length > 0 && !selectedSceneHasWallData
-                      ? "No Walls In Selected Scene"
-                      : "Import Walls Only"}
-                </Button>
-              )}
 
             {isContextMenuMode && uploadProgress === null && (
               <>
@@ -3249,13 +3588,22 @@ function App() {
                   disabled={
                     (!selectedFile && availableScenes.length === 0) ||
                     isLoading ||
-                    (availableScenes.length > 0 && !selectedSceneHasWallData)
+                    (!includeWallsWithMaps && !includeImportedLights) ||
+                    (availableScenes.length > 0 &&
+                      !selectedSceneHasEnabledFogData)
                   }>
                   {isLoading
                     ? "Uploading..."
-                    : availableScenes.length > 0 && !selectedSceneHasWallData
-                      ? "No Walls In Selected Scene"
-                      : "Import Walls to Selected Map"}
+                    : !includeWallsWithMaps && !includeImportedLights
+                      ? "Enable Walls/Doors or Lights"
+                      : availableScenes.length > 0 &&
+                          !selectedSceneHasEnabledFogData
+                        ? includeWallsWithMaps && includeImportedLights
+                          ? "No Fog Data In Selected Scene"
+                          : includeWallsWithMaps
+                            ? "No Walls/Doors In Selected Scene"
+                            : "No Lights In Selected Scene"
+                        : "Import to Selected Map"}
                 </Button>
               </>
             )}
