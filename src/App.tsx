@@ -44,7 +44,11 @@ import Select from "@mui/material/Select";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
-import { extractScenesFromFoundryZip } from "./foundryZip";
+import {
+  extractScenesFromFoundryZip,
+  getFoundrySceneMapImagePaths,
+  getFoundrySceneMapSources,
+} from "./foundryZip";
 import type { FoundryVTTData, VTTMapData } from "./vttTypes";
 
 type SceneData = (FoundryVTTData | VTTMapData) & {
@@ -111,6 +115,22 @@ const hexToRgbChannels = (color: string): string | null => {
   const g = parseInt(hex.length === 3 ? hex[1].repeat(2) : hex.slice(2, 4), 16);
   const b = parseInt(hex.length === 3 ? hex[2].repeat(2) : hex.slice(4, 6), 16);
   return `${r}, ${g}, ${b}`;
+};
+
+const getSceneMapImagePaths = (sceneData: SceneData): string[] => {
+  if (!isFoundryVTTData(sceneData)) {
+    return [];
+  }
+  return getFoundrySceneMapImagePaths(sceneData);
+};
+
+const getSceneMapSources = (
+  sceneData: SceneData,
+): ReturnType<typeof getFoundrySceneMapSources> => {
+  if (!isFoundryVTTData(sceneData)) {
+    return [];
+  }
+  return getFoundrySceneMapSources(sceneData);
 };
 
 const sceneHasWallsOrDoors = (sceneData: SceneData): boolean => {
@@ -399,9 +419,7 @@ function App() {
     hasImage;
   const hasArchiveMapSources =
     availableScenes.length > 0 &&
-    selectedScenes.some(
-      (scene) => !!(scene.data.img || scene.data.background?.src),
-    );
+    selectedScenes.some((scene) => getSceneMapImagePaths(scene.data).length > 0);
   const hasArchiveLightSources =
     availableScenes.length > 0 &&
     selectedScenes.some((scene) => sceneHasLightData(scene.data));
@@ -443,9 +461,7 @@ function App() {
     );
   const selectedSceneHasMap =
     availableScenes.length === 0 ||
-    selectedScenes.some(
-      (scene) => !!(scene.data.img || scene.data.background?.src),
-    );
+    selectedScenes.some((scene) => getSceneMapImagePaths(scene.data).length > 0);
   const selectedSceneIsVideo = selectedScenes.some((scene) => !!scene.isVideo);
   const selectedPairedImportsContainVideo = selectedPairedImports.some(
     (selection) => selection.isVideo,
@@ -467,9 +483,16 @@ function App() {
         : selectedRawFiles.length > 0
           ? selectedRawFilesContainVideo
           : selectedFileIsVideo;
+  const selectedArchiveMapSourceCount =
+    availableScenes.length > 0
+      ? selectedScenes.reduce(
+          (count, scene) => count + getSceneMapImagePaths(scene.data).length,
+          0,
+        )
+      : 0;
   const selectedSourceCount =
     availableScenes.length > 0
-      ? selectedScenes.length
+      ? selectedArchiveMapSourceCount
       : selectedPairedImports.length > 0
         ? selectedPairedImports.length
         : selectedRawFiles.length > 0
@@ -622,25 +645,37 @@ function App() {
       }
 
       if (availableScenes.length > 0) {
-        const scene = selectedScenes.find((candidate) => candidate.isVideo);
-        if (
-          !scene ||
-          !scene.isVideo ||
-          !zipObject ||
-          !isFoundryVTTData(scene.data)
-        ) {
+        if (!zipObject) {
           setSupported();
           return;
         }
 
-        const imgPath = scene.data.img || scene.data.background?.src;
-        if (!imgPath) {
+        const seenVideoPaths = new Set<string>();
+        const videoBlobs: Blob[] = [];
+        for (const scene of selectedScenes) {
+          if (!scene.isVideo || !isFoundryVTTData(scene.data)) continue;
+          const mapPaths = getSceneMapImagePaths(scene.data);
+          for (const mapPath of mapPaths) {
+            if (!mapPath || seenVideoPaths.has(mapPath)) continue;
+            seenVideoPaths.add(mapPath);
+            try {
+              const mediaBlob = await extractImageFromZip(zipObject, mapPath);
+              if (!isMounted) return;
+              if (mediaBlob.type.startsWith("video/")) {
+                videoBlobs.push(mediaBlob);
+              }
+            } catch {
+              // If we cannot access a media blob here, do not block compression preemptively.
+            }
+          }
+        }
+
+        if (videoBlobs.length === 0) {
           setSupported();
           return;
         }
 
-        try {
-          const mediaBlob = await extractImageFromZip(zipObject, imgPath);
+        for (const mediaBlob of videoBlobs) {
           const probe = await probeBrowserVideoReadability(mediaBlob);
           if (!isMounted) return;
 
@@ -648,26 +683,24 @@ function App() {
             setUnsupported(
               "Compression for this video is not supported by this browser. No Compression has been selected automatically.",
             );
-          } else {
-            const preflight = await preflightVideoCompression(
-              mediaBlob,
-              preflightOptions,
-            );
-            if (!isMounted) return;
-            if (!preflight.supported) {
-              setUnsupported(
-                preflight.reason
-                  ? `Compression for this file is not supported by this browser (${preflight.reason}). No Compression has been selected automatically.`
-                  : "Compression for this file is not supported by this browser. No Compression has been selected automatically.",
-              );
-            } else {
-              setSupported();
-            }
+            return;
           }
-        } catch {
-          // If we cannot access the media blob here, do not block compression preemptively.
-          setSupported();
+
+          const preflight = await preflightVideoCompression(
+            mediaBlob,
+            preflightOptions,
+          );
+          if (!isMounted) return;
+          if (!preflight.supported) {
+            setUnsupported(
+              preflight.reason
+                ? `Compression for this file is not supported by this browser (${preflight.reason}). No Compression has been selected automatically.`
+                : "Compression for this file is not supported by this browser. No Compression has been selected automatically.",
+            );
+            return;
+          }
         }
+        setSupported();
         return;
       }
 
@@ -830,7 +863,7 @@ function App() {
     if (availableScenes.length > 0) {
       setHasImage(
         selectedScenes.some(
-          (scene) => !!(scene.data.img || scene.data.background?.src),
+          (scene) => getSceneMapImagePaths(scene.data).length > 0,
         ),
       );
     }
@@ -910,12 +943,12 @@ function App() {
           const v11ThumbPath = sceneId
             ? `assets/scenes/${sceneId}-thumb.webp`
             : null;
+          const mapPaths = getSceneMapImagePaths(s.data);
 
           const possiblePaths = [
             v11ThumbPath,
             s.data.thumb,
-            s.data.background?.src,
-            s.data.img,
+            ...mapPaths,
           ].filter(Boolean) as string[];
           for (const imgPath of possiblePaths) {
             try {
@@ -947,7 +980,8 @@ function App() {
         setSelectedFileHasWallsOrDoors(false);
         setSelectedFileHasLights(false);
         const firstScene = scenes[0].data;
-        setHasImage(!!(firstScene.img || firstScene.background?.src));
+        setHasImage(getSceneMapImagePaths(firstScene).length > 0);
+        setMultiSceneName((scenes[0].name || "Scene").trim() || "Scene");
       } else {
         OBR.notification.show("No scenes found in this ZIP.", "WARNING");
         setZipObject(null);
@@ -1647,6 +1681,54 @@ function App() {
     });
   };
 
+  const buildArchiveSceneMapImportSources = async (
+    scenesToImport: SceneInfo[],
+  ): Promise<MapImportSource[]> => {
+    if (!zipObject) {
+      throw new Error("Scene archive is not loaded.");
+    }
+
+    const sources: MapImportSource[] = [];
+    const mediaBlobByPath = new Map<string, Blob>();
+
+    for (const scene of scenesToImport) {
+      if (!isFoundryVTTData(scene.data)) continue;
+      const wallData = convertFoundryToVTTData(scene.data);
+      const mapSources = getSceneMapSources(scene.data);
+      for (let index = 0; index < mapSources.length; index++) {
+        const mapSource = mapSources[index];
+        const mapPath = mapSource.path;
+        if (!mapPath) continue;
+        try {
+          let mediaBlob = mediaBlobByPath.get(mapPath);
+          if (!mediaBlob) {
+            mediaBlob = await extractImageFromZip(zipObject, mapPath);
+            mediaBlobByPath.set(mapPath, mediaBlob);
+          }
+          const mapName =
+            mapSources.length > 1
+              ? `${scene.name || "Map"} (${index + 1})`
+              : scene.name || "Map";
+          sources.push({
+            name: mapName,
+            mediaBlob,
+            dpi: wallData.resolution.pixels_per_grid,
+            wallData: index === 0 ? wallData : undefined,
+            sourceSceneName: scene.name || "Scene",
+            mapPlacement: mapSource.placement,
+          });
+        } catch (error) {
+          console.warn(
+            `Failed to extract map media "${mapPath}" from scene "${scene.name}".`,
+            error,
+          );
+        }
+      }
+    }
+
+    return sources;
+  };
+
   const buildMapImportSources = async (): Promise<MapImportSource[]> => {
     const sources: MapImportSource[] = [];
 
@@ -1664,26 +1746,7 @@ function App() {
     }
 
     if (availableScenes.length > 0) {
-      if (!zipObject) {
-        throw new Error("Scene archive is not loaded.");
-      }
-
-      for (const scene of selectedScenes) {
-        if (!isFoundryVTTData(scene.data)) continue;
-        const imgPath = scene.data.img || scene.data.background?.src;
-        if (!imgPath) continue;
-
-        const mediaBlob = await extractImageFromZip(zipObject, imgPath);
-        const wallData = convertFoundryToVTTData(scene.data);
-        sources.push({
-          name: scene.name || "Map",
-          mediaBlob,
-          dpi: wallData.resolution.pixels_per_grid,
-          wallData,
-        });
-      }
-
-      return sources;
+      return buildArchiveSceneMapImportSources(selectedScenes);
     }
 
     const mediaFiles =
@@ -1882,7 +1945,10 @@ function App() {
         lightOptions: buildLightImportOptions(),
         lockMaps: lockImportedMaps,
         compressionMode,
-        sceneName: multiSceneName,
+        sceneName:
+          availableScenes.length > 0 && selectedScenes.length === 1
+            ? selectedScenes[0].name || "Scene"
+            : multiSceneName,
         selectionToken: activeSelectionToken,
         forceSelectionPrompt: !!runOptions.forceSelectionPrompt,
         videoOptions: buildVideoCompressionOptions(abortController.signal),
@@ -2020,24 +2086,50 @@ function App() {
           fogImportOptions,
         );
       } else if (availableScenes.length > 0 && zipObject) {
-        const scene = availableScenes[selectedSceneIndex].data;
-        if (!isFoundryVTTData(scene)) {
+        const selectedScene = availableScenes[selectedSceneIndex];
+        const scene = selectedScene?.data;
+        if (!scene || !isFoundryVTTData(scene)) {
           throw new Error("Selected scene data is not compatible.");
         }
-        const imgPath = scene.img || scene.background?.src;
-        if (!imgPath) throw new Error("No image found for this scene.");
+        const sceneMapSources = await buildArchiveSceneMapImportSources([
+          selectedScene,
+        ]);
+        if (sceneMapSources.length === 0) {
+          throw new Error("No image found for this scene.");
+        }
 
-        const imgBlob = await extractImageFromZip(zipObject, imgPath);
-        await uploadFoundryScene(
-          scene,
-          imgBlob,
-          scene.name || "Foundry Scene",
-          compressionMode,
-          (progress) => setUploadProgress(progress),
-          videoCompressionOptions,
-          (stage) => setCompressionStage(stage),
-          fogImportOptions,
-        );
+        if (sceneMapSources.length === 1) {
+          await uploadFoundryScene(
+            scene,
+            sceneMapSources[0].mediaBlob,
+            scene.name || "Foundry Scene",
+            compressionMode,
+            (progress) => setUploadProgress(progress),
+            videoCompressionOptions,
+            (stage) => setCompressionStage(stage),
+            fogImportOptions,
+          );
+        } else {
+          const result = await createSceneWithMultipleMaps(sceneMapSources, {
+            layout: "STACK",
+            snapToGrid: false,
+            scale: 1,
+            includeWalls: includeWallsWithMaps,
+            lightOptions: buildLightImportOptions(),
+            lockMaps: lockImportedMaps,
+            compressionMode,
+            sceneName: scene.name || "Scene",
+            videoOptions: buildVideoCompressionOptions(abortController.signal),
+            onProgress: setUploadProgress,
+            onStage: setCompressionStage,
+            onFileProgress: setMapFileProgress,
+          });
+
+          await showMapWorkflowMismatchWarning(result, {
+            includeWalls: includeWallsWithMaps,
+            includeLights: includeImportedLights,
+          });
+        }
         // Compression done — clear progress bar, show uploading state
         setUploadProgress(null);
         setCompressionStage(null);
@@ -2079,6 +2171,13 @@ function App() {
 
       OBR.modal.close("com.eppinguin.scene-importer/modal");
     } catch (error) {
+      if (error instanceof MapSelectionPendingError) {
+        await OBR.notification.show(
+          "No maps were selected. Re-run Create New Scene to reopen map selection.",
+          "INFO",
+        );
+        return;
+      }
       console.error("Error creating scene:", error);
       const getErrorMessage = (err: unknown): string => {
         if (err instanceof Error) return err.message;
@@ -2497,7 +2596,8 @@ function App() {
                           Math.max(availableScenes.length - 1, 0),
                         );
                         setSelectedSceneIndex(idx);
-                        setHasImage(!!(s.data.img || s.data.background?.src));
+                        setHasImage(getSceneMapImagePaths(s.data).length > 0);
+                        setMultiSceneName((s.name || "Scene").trim() || "Scene");
 
                         if (isContextMenuMode) {
                           setSelectedSceneIndices([idx]);

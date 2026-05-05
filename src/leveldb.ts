@@ -381,6 +381,119 @@ export function extractScenesFromLevelDB(
         }
     }
 
+    const extractEmbeddedSceneCollection = (
+        keyPrefix: string
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ): Map<string, any[]> => {
+        const docsByKey = new Map<string, {
+            sequence: number;
+            value: string | null;
+            deleted: boolean;
+        }>();
+
+        for (const buffer of ldbBuffers) {
+            const entries = parseSSTTableEntries(buffer, keyPrefix);
+            for (const entry of entries) {
+                const current = docsByKey.get(entry.key);
+                if (!current || entry.sequence > current.sequence) {
+                    docsByKey.set(entry.key, {
+                        sequence: entry.sequence,
+                        value: entry.value,
+                        deleted: entry.deleted,
+                    });
+                }
+            }
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const grouped = new Map<string, Map<string, any>>();
+        for (const [key, entry] of docsByKey) {
+            if (entry.deleted || entry.value === null) continue;
+            if (!key.startsWith(keyPrefix)) continue;
+
+            const suffix = key.slice(keyPrefix.length);
+            const firstDot = suffix.indexOf('.');
+            if (firstDot <= 0 || firstDot >= suffix.length - 1) continue;
+
+            const sceneId = suffix.slice(0, firstDot);
+            const docId = suffix.slice(firstDot + 1);
+            if (!sceneId || !docId) continue;
+
+            try {
+                const parsed = JSON.parse(entry.value);
+                const sceneDocs = grouped.get(sceneId) ?? new Map<string, unknown>();
+                sceneDocs.set(docId, parsed);
+                grouped.set(sceneId, sceneDocs);
+            } catch {
+                // Skip entries that aren't valid JSON
+            }
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = new Map<string, any[]>();
+        for (const [sceneId, sceneDocs] of grouped) {
+            result.set(sceneId, Array.from(sceneDocs.values()));
+        }
+        return result;
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const hydrateReferenceCollection = (rawCollection: unknown, embedded: any[] | undefined): any[] | undefined => {
+        if (!Array.isArray(rawCollection) && (!embedded || embedded.length === 0)) {
+            return undefined;
+        }
+
+        const refs = Array.isArray(rawCollection) ? rawCollection : [];
+        const docs = Array.isArray(embedded) ? embedded : [];
+        if (refs.length === 0) {
+            return docs;
+        }
+
+        const docsById = new Map<string, unknown>();
+        for (const doc of docs) {
+            if (!doc || typeof doc !== 'object') continue;
+            const id = (doc as { _id?: unknown })._id;
+            if (typeof id === 'string' && id.trim().length > 0) {
+                docsById.set(id, doc);
+            }
+        }
+
+        const hydrated: unknown[] = [];
+        const seenDocIds = new Set<string>();
+
+        for (const ref of refs) {
+            if (typeof ref === 'string') {
+                const embeddedDoc = docsById.get(ref);
+                if (embeddedDoc) {
+                    hydrated.push(embeddedDoc);
+                    seenDocIds.add(ref);
+                } else {
+                    hydrated.push(ref);
+                }
+                continue;
+            }
+            hydrated.push(ref);
+            if (ref && typeof ref === 'object') {
+                const refId = (ref as { _id?: unknown })._id;
+                if (typeof refId === 'string' && refId.trim().length > 0) {
+                    seenDocIds.add(refId);
+                }
+            }
+        }
+
+        for (const [docId, embeddedDoc] of docsById) {
+            if (!seenDocIds.has(docId)) {
+                hydrated.push(embeddedDoc);
+            }
+        }
+
+        return hydrated;
+    };
+
+    const sceneTilesBySceneId = extractEmbeddedSceneCollection('!scenes.tiles!');
+    const sceneWallsBySceneId = extractEmbeddedSceneCollection('!scenes.walls!');
+    const sceneLightsBySceneId = extractEmbeddedSceneCollection('!scenes.lights!');
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sceneMap = new Map<string, any>();
 
@@ -393,6 +506,11 @@ export function extractScenesFromLevelDB(
             const scene = JSON.parse(entry.value);
             // Use _id or the key suffix as the unique identifier
             const id = scene._id || key.replace('!scenes!', '');
+            if (typeof id === 'string' && id.trim().length > 0) {
+                scene.tiles = hydrateReferenceCollection(scene.tiles, sceneTilesBySceneId.get(id)) ?? scene.tiles;
+                scene.walls = hydrateReferenceCollection(scene.walls, sceneWallsBySceneId.get(id)) ?? scene.walls;
+                scene.lights = hydrateReferenceCollection(scene.lights, sceneLightsBySceneId.get(id)) ?? scene.lights;
+            }
             sceneMap.set(id, scene);
         } catch {
             // Skip entries that aren't valid JSON

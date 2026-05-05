@@ -21,14 +21,23 @@ export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
     const d = data as Partial<FoundryVTTData>;
     const hasNumericGrid = typeof d.grid === 'number';
     const hasGridObject = typeof d.grid === 'object' && d.grid !== null && 'size' in d.grid;
+    const isSceneReferenceId = (value: unknown): value is string =>
+        typeof value === 'string' && value.trim().length > 0;
+    const isWallObject = (value: unknown): value is Partial<FoundryVTTWall> =>
+        typeof value === 'object'
+        && value !== null
+        && Array.isArray((value as Partial<FoundryVTTWall>).c)
+        && (value as Partial<FoundryVTTWall>).c!.length === 4;
+    const isLightObject = (value: unknown): value is Partial<FoundryVTTLight> =>
+        typeof value === 'object' && value !== null;
     const hasValidWalls = d.walls === undefined || (
         Array.isArray(d.walls)
-        && d.walls.every((w: Partial<FoundryVTTWall>) =>
-            Array.isArray(w.c) && w.c.length === 4)
+        && d.walls.every((w: unknown) =>
+            isSceneReferenceId(w) || isWallObject(w))
     );
     const hasValidLights = d.lights === undefined || (
         Array.isArray(d.lights)
-        && d.lights.every((light: Partial<FoundryVTTLight>) => typeof light === 'object' && light !== null)
+        && d.lights.every((light: unknown) => isSceneReferenceId(light) || isLightObject(light))
     );
     return !!d
         && typeof d.width === 'number'
@@ -221,6 +230,21 @@ export interface MapImportSource {
     mediaBlob: Blob | File;
     dpi?: number;
     wallData?: VTTMapData;
+    sourceSceneName?: string;
+    mapPlacement?: {
+        x?: number;
+        y?: number;
+        rotation?: number;
+        scaleX?: number;
+        scaleY?: number;
+        targetWidth?: number;
+        targetHeight?: number;
+        z?: number;
+        sort?: number;
+        elevation?: number;
+        orderIndex?: number;
+        zIndex?: number;
+    };
 }
 
 export async function buildMapImportSourceFromVTTFile(file: File): Promise<MapImportSource | null> {
@@ -307,9 +331,12 @@ interface PreparedMapImportSource {
     displayName: string;
     uploadName: string;
     selectionKey: string;
+    assetSelectionKey: string;
     file: File;
     dpi: number;
     wallData?: VTTMapData;
+    sourceSceneName?: string;
+    mapPlacement?: MapImportSource['mapPlacement'];
 }
 
 interface ResolvedMapImportSource {
@@ -319,6 +346,9 @@ interface ResolvedMapImportSource {
     image: ImageContent;
     grid: ImageGrid;
     position: Vector2;
+    rotation: number;
+    scale: Vector2;
+    zIndex?: number;
 }
 
 interface SelectedImageCandidate {
@@ -1890,10 +1920,26 @@ async function prepareMapSources(
 
     if (prepared.length === 0) {
         const total = Math.max(1, sources.length);
+        const blobIds = new WeakMap<Blob, number>();
+        let nextBlobId = 1;
+        const getBlobId = (blob: Blob): number => {
+            const existingId = blobIds.get(blob);
+            if (existingId) return existingId;
+            const id = nextBlobId++;
+            blobIds.set(blob, id);
+            return id;
+        };
+        const processedAssetByKey = new Map<string, {
+            file: File;
+            dpi: number;
+            uploadName: string;
+            assetSelectionKey: string;
+        }>();
 
         for (let i = 0; i < sources.length; i++) {
             const source = sources[i];
             const sourceDpi = clampPositiveNumber(source.dpi, 100);
+            const assetCacheKey = `${getBlobId(source.mediaBlob)}|${sourceDpi}`;
             onFileProgress?.({
                 fileName: source.name,
                 currentFile: i + 1,
@@ -1915,63 +1961,77 @@ async function prepareMapSources(
                 onStage(`Preparing ${source.name}`);
             }
 
-            const isVideo =
-                source.mediaBlob.type.startsWith('video/') ||
-                /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(source.name.toLowerCase());
+            let processedAsset = processedAssetByKey.get(assetCacheKey);
+            if (!processedAsset) {
+                const isVideo =
+                    source.mediaBlob.type.startsWith('video/') ||
+                    /\.(mp4|webm|mov|avi|mkv|ogv)$/i.test(source.name.toLowerCase());
 
-            let finalBlob: Blob = source.mediaBlob;
-            let effectiveDpi = sourceDpi;
+                let finalBlob: Blob = source.mediaBlob;
+                let effectiveDpi = sourceDpi;
 
-            if (isVideo) {
-                if (compressionMode !== 'none') {
-                    const sizeInMb = source.mediaBlob.size / (1024 * 1024);
-                    if (sizeInMb > 500) {
-                        throw new VideoCompressionError(
-                            'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
-                            `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
-                        );
-                    }
-                    const compressed = await compressVideo(source.mediaBlob, compressionMode, reportProgress, {
-                        ...videoOptions,
-                        onStage,
-                    });
-                    finalBlob = compressed.blob;
-                    if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
-                        effectiveDpi = sourceDpi * (compressed.outputWidth / compressed.sourceWidth);
+                if (isVideo) {
+                    if (compressionMode !== 'none') {
+                        const sizeInMb = source.mediaBlob.size / (1024 * 1024);
+                        if (sizeInMb > 500) {
+                            throw new VideoCompressionError(
+                                'VIDEO_COMPRESSION_SOURCE_TOO_LARGE',
+                                `Video file is too large (${sizeInMb.toFixed(1)}MB). The maximum supported size for browser compression is 500MB.`
+                            );
+                        }
+                        const compressed = await compressVideo(source.mediaBlob, compressionMode, reportProgress, {
+                            ...videoOptions,
+                            onStage,
+                        });
+                        finalBlob = compressed.blob;
+                        if (compressed.outputWidth > 0 && compressed.sourceWidth > 0) {
+                            effectiveDpi = sourceDpi * (compressed.outputWidth / compressed.sourceWidth);
+                        }
+                    } else {
+                        reportProgress(100);
                     }
                 } else {
-                    reportProgress(100);
+                    const sourceDimensions = await getImageDimensions(source.mediaBlob);
+                    finalBlob = await optimizeImage(
+                        source.mediaBlob,
+                        {
+                            compressionMode,
+                            maxSizeInMB: compressionMode === 'high' ? 49 : 24,
+                            maxMegapixels: compressionMode === 'standard' ? 67 : 144,
+                            maxDimension: videoOptions?.maxDimension,
+                        },
+                        reportProgress,
+                        onStage,
+                    );
+                    const dimensions = await getImageDimensions(finalBlob);
+                    effectiveDpi = getAdjustedDpiAfterResize(sourceDpi, sourceDimensions, dimensions);
                 }
-            } else {
-                const sourceDimensions = await getImageDimensions(source.mediaBlob);
-                finalBlob = await optimizeImage(
-                    source.mediaBlob,
-                    {
-                        compressionMode,
-                        maxSizeInMB: compressionMode === 'high' ? 49 : 24,
-                        maxMegapixels: compressionMode === 'standard' ? 67 : 144,
-                        maxDimension: videoOptions?.maxDimension,
-                    },
-                    reportProgress,
-                    onStage,
-                );
-                const dimensions = await getImageDimensions(finalBlob);
-                effectiveDpi = getAdjustedDpiAfterResize(sourceDpi, sourceDimensions, dimensions);
-            }
 
-            const extension = getImageExtensionFromMimeType(
-                finalBlob.type,
-                isVideo ? (finalBlob.type.includes('webm') ? 'webm' : 'mp4') : 'png'
-            );
-            const file = new File([finalBlob], `${sanitizeMapName(source.name)}.${extension}`, { type: finalBlob.type });
+                const extension = getImageExtensionFromMimeType(
+                    finalBlob.type,
+                    isVideo ? (finalBlob.type.includes('webm') ? 'webm' : 'mp4') : 'png'
+                );
+                processedAsset = {
+                    file: new File([finalBlob], `${sanitizeMapName(source.name)}.${extension}`, { type: finalBlob.type }),
+                    dpi: clampPositiveNumber(effectiveDpi, sourceDpi),
+                    uploadName: buildUploadName(source.name),
+                    assetSelectionKey: `${prefix}:asset:${processedAssetByKey.size + 1}`,
+                };
+                processedAssetByKey.set(assetCacheKey, processedAsset);
+            } else {
+                reportProgress(100);
+            }
 
             prepared.push({
                 displayName: sanitizeMapName(source.name),
-                uploadName: buildUploadName(source.name),
+                uploadName: processedAsset.uploadName,
                 selectionKey: `${prefix}:map:${i + 1}`,
-                file,
-                dpi: clampPositiveNumber(effectiveDpi, sourceDpi),
+                assetSelectionKey: processedAsset.assetSelectionKey,
+                file: processedAsset.file,
+                dpi: processedAsset.dpi,
                 wallData: source.wallData,
+                sourceSceneName: source.sourceSceneName,
+                mapPlacement: source.mapPlacement,
             });
 
             onFileProgress?.({
@@ -1988,10 +2048,16 @@ async function prepareMapSources(
             onProgress(72);
         }
 
-        const uploads = prepared.map((source) =>
+        const uploadSources = new Map<string, PreparedMapImportSource>();
+        for (const source of prepared) {
+            if (!uploadSources.has(source.assetSelectionKey)) {
+                uploadSources.set(source.assetSelectionKey, source);
+            }
+        }
+        const uploads = Array.from(uploadSources.values()).map((source) =>
             buildImageUpload(source.file)
                 .name(source.uploadName)
-                .description(source.selectionKey)
+                .description(source.assetSelectionKey)
                 .dpi(source.dpi)
                 .locked(true)
                 .build()
@@ -2037,19 +2103,59 @@ async function prepareMapSources(
         rememberCompletedMapSelection(prefix, prepared, selectedCandidates);
     }
 
-    const preparedBySelectionKey = new Map(prepared.map((entry, index) => [entry.selectionKey, index]));
-    const preparedByUploadName = new Map(prepared.map((entry, index) => [entry.uploadName, index]));
+    const preparedByAssetSelectionKey = new Map<string, PreparedMapImportSource[]>();
+    const preparedByUploadName = new Map<string, PreparedMapImportSource[]>();
+    for (const entry of prepared) {
+        const byAsset = preparedByAssetSelectionKey.get(entry.assetSelectionKey) ?? [];
+        byAsset.push(entry);
+        preparedByAssetSelectionKey.set(entry.assetSelectionKey, byAsset);
+        const byUpload = preparedByUploadName.get(entry.uploadName) ?? [];
+        byUpload.push(entry);
+        preparedByUploadName.set(entry.uploadName, byUpload);
+    }
+
+    const selectedWithMetadata: Array<{
+        selectedImage: SelectedImageCandidate;
+        sourceMeta?: PreparedMapImportSource;
+        metadataMatched: boolean;
+    }> = [];
+    const emittedSelectionKeys = new Set<string>();
+    for (const selectedImage of selectedCandidates) {
+        const matchedByAssetKey = selectedImage.description
+            ? preparedByAssetSelectionKey.get(selectedImage.description) ?? []
+            : [];
+        const matchedByUploadName = preparedByUploadName.get(selectedImage.name) ?? [];
+        const matches = matchedByAssetKey.length > 0 ? matchedByAssetKey : matchedByUploadName;
+        if (matches.length === 0) {
+            selectedWithMetadata.push({
+                selectedImage,
+                metadataMatched: false,
+            });
+            continue;
+        }
+        for (const sourceMeta of matches) {
+            if (emittedSelectionKeys.has(sourceMeta.selectionKey)) continue;
+            emittedSelectionKeys.add(sourceMeta.selectionKey);
+            selectedWithMetadata.push({
+                selectedImage,
+                sourceMeta,
+                metadataMatched: true,
+            });
+        }
+    }
 
     const scale = clampPositiveNumber(options.scale, 1);
     const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
     const shouldSnapToGrid = options.snapToGrid ?? true;
     const layout = options.layout ?? 'GRID';
 
-    const displayWidths = selectedCandidates.map((entry) => {
+    const displayWidths = selectedWithMetadata.map(({ selectedImage }) => {
+        const entry = selectedImage;
         const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
         return (entry.image.width * targetDpi / sourceDpi) * scale;
     });
-    const displayHeights = selectedCandidates.map((entry) => {
+    const displayHeights = selectedWithMetadata.map(({ selectedImage }) => {
+        const entry = selectedImage;
         const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
         return (entry.image.height * targetDpi / sourceDpi) * scale;
     });
@@ -2059,29 +2165,92 @@ async function prepareMapSources(
         onProgress(92);
     }
 
-    return selectedCandidates.map((selectedImage, index) => {
-        const byKeyIndex = selectedImage.description
-            ? preparedBySelectionKey.get(selectedImage.description)
-            : undefined;
-        const byNameIndex = preparedByUploadName.get(selectedImage.name);
-        const sourceMeta =
-            typeof byKeyIndex === 'number'
-                ? prepared[byKeyIndex]
-                : typeof byNameIndex === 'number'
-                    ? prepared[byNameIndex]
-                    : undefined;
+    return selectedWithMetadata.map(({ selectedImage, sourceMeta, metadataMatched }, index) => {
 
         if (!sourceMeta) {
             console.warn(`No metadata match found for selected map "${selectedImage.name}". Importing without wall data.`);
         }
 
+        const sourceDpi = clampPositiveNumber(selectedImage.grid?.dpi, 100);
+        const mapPlacement = sourceMeta?.mapPlacement;
+        let position = positions[index];
+        let resolvedScale: Vector2 = { x: 1, y: 1 };
+        let resolvedRotation = 0;
+        let resolvedZIndex: number | undefined = undefined;
+
+        if (mapPlacement) {
+            const targetDpiRatio = targetDpi / sourceDpi;
+            const mappedX = typeof mapPlacement.x === 'number' && Number.isFinite(mapPlacement.x)
+                ? mapPlacement.x * targetDpiRatio
+                : undefined;
+            const mappedY = typeof mapPlacement.y === 'number' && Number.isFinite(mapPlacement.y)
+                ? mapPlacement.y * targetDpiRatio
+                : undefined;
+            if (typeof mappedX === 'number' || typeof mappedY === 'number') {
+                position = {
+                    x: typeof mappedX === 'number' ? mappedX : position.x,
+                    y: typeof mappedY === 'number' ? mappedY : position.y,
+                };
+            }
+
+            const baseWidth = (selectedImage.image.width * targetDpi) / sourceDpi;
+            const baseHeight = (selectedImage.image.height * targetDpi) / sourceDpi;
+            const targetWidth = typeof mapPlacement.targetWidth === 'number' && Number.isFinite(mapPlacement.targetWidth)
+                ? mapPlacement.targetWidth * targetDpiRatio
+                : undefined;
+            const targetHeight = typeof mapPlacement.targetHeight === 'number' && Number.isFinite(mapPlacement.targetHeight)
+                ? mapPlacement.targetHeight * targetDpiRatio
+                : undefined;
+            const widthScale = targetWidth && baseWidth > 0 ? targetWidth / baseWidth : undefined;
+            const heightScale = targetHeight && baseHeight > 0 ? targetHeight / baseHeight : undefined;
+            const explicitScaleX = typeof mapPlacement.scaleX === 'number' && Number.isFinite(mapPlacement.scaleX)
+                ? mapPlacement.scaleX
+                : undefined;
+            const explicitScaleY = typeof mapPlacement.scaleY === 'number' && Number.isFinite(mapPlacement.scaleY)
+                ? mapPlacement.scaleY
+                : undefined;
+            resolvedScale = {
+                x: widthScale ?? explicitScaleX ?? 1,
+                y: heightScale ?? explicitScaleY ?? 1,
+            };
+
+            if (typeof mapPlacement.rotation === 'number' && Number.isFinite(mapPlacement.rotation)) {
+                resolvedRotation = mapPlacement.rotation;
+            }
+            const elevation = typeof mapPlacement.elevation === 'number' && Number.isFinite(mapPlacement.elevation)
+                ? mapPlacement.elevation
+                : 0;
+            const z = typeof mapPlacement.z === 'number' && Number.isFinite(mapPlacement.z)
+                ? mapPlacement.z
+                : 0;
+            const sort = typeof mapPlacement.sort === 'number' && Number.isFinite(mapPlacement.sort)
+                ? mapPlacement.sort
+                : (typeof mapPlacement.zIndex === 'number' && Number.isFinite(mapPlacement.zIndex)
+                    ? mapPlacement.zIndex
+                    : 0);
+            const orderIndex = typeof mapPlacement.orderIndex === 'number' && Number.isFinite(mapPlacement.orderIndex)
+                ? mapPlacement.orderIndex
+                : index;
+            // Foundry stacks by several depth hints (elevation + z/sort + draw order).
+            // Collapse these into one deterministic OBR z-index.
+            resolvedZIndex = Math.round(
+                elevation * 1_000_000 +
+                z * 1_000 +
+                sort * 10 +
+                orderIndex
+            );
+        }
+
         return {
             displayName: selectedImage.name || sourceMeta?.displayName || `Map ${index + 1}`,
-            metadataMatched: !!sourceMeta,
+            metadataMatched,
             wallData: sourceMeta?.wallData,
             image: selectedImage.image,
             grid: selectedImage.grid,
-            position: positions[index],
+            position,
+            rotation: resolvedRotation,
+            scale: resolvedScale,
+            zIndex: resolvedZIndex,
         };
     });
 }
@@ -2135,16 +2304,20 @@ export async function addMapsToCurrentScene(
         },
     }));
 
-    const mapItems: Item[] = positionedPrepared.map((entry) =>
-        buildImage(entry.image, entry.grid)
+    const mapItems: Item[] = positionedPrepared.map((entry) => {
+        let builder = buildImage(entry.image, entry.grid)
             .name(entry.displayName)
             .layer('MAP')
             .position(entry.position)
-            .scale({ x: scale, y: scale })
+            .rotation(entry.rotation)
+            .scale({ x: entry.scale.x * scale, y: entry.scale.y * scale })
             .locked(lockMaps)
-            .visible(true)
-            .build()
-    );
+            .visible(true);
+        if (typeof entry.zIndex === 'number' && Number.isFinite(entry.zIndex)) {
+            builder = builder.zIndex(entry.zIndex);
+        }
+        return builder.build();
+    });
 
     await addItemsInBatches(mapItems, BATCH_SIZE);
 
@@ -2166,14 +2339,18 @@ export async function addMapsToCurrentScene(
     for (const entry of positionedPrepared) {
         if (!entry.wallData) continue;
         let addedFeaturesForMap = false;
+        const sourceScale = {
+            x: entry.scale.x * scale,
+            y: entry.scale.y * scale,
+        };
         if (includeWalls) {
-            const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+            const walls = await createWallItems(entry.wallData, entry.position, sourceScale, targetDpi);
             if (walls.length > 0) {
                 fogItems.push(...walls);
                 addedFeaturesForMap = true;
             }
             if (entry.wallData.portals && entry.wallData.portals.length > 0) {
-                const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                const doors = await createDoorItems(entry.wallData, entry.position, sourceScale, targetDpi);
                 if (doors.length > 0) {
                     fogItems.push(...doors);
                     addedFeaturesForMap = true;
@@ -2181,7 +2358,7 @@ export async function addMapsToCurrentScene(
             }
         }
         if (includeLights && entry.wallData.lights && entry.wallData.lights.length > 0) {
-            const lights = await createLightItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi, options.lightOptions);
+            const lights = await createLightItems(entry.wallData, entry.position, sourceScale, targetDpi, options.lightOptions);
             if (lights.length > 0) {
                 fogItems.push(...lights);
                 addedFeaturesForMap = true;
@@ -2371,16 +2548,20 @@ export async function createSceneWithMultipleMaps(
     const lockMaps = options.lockMaps ?? true;
     const prepared = await prepareMapSources(sources, targetDpi, options);
 
-    const sceneItems: Item[] = prepared.map((entry) =>
-        buildImage(entry.image, entry.grid)
+    const sceneItems: Item[] = prepared.map((entry) => {
+        let builder = buildImage(entry.image, entry.grid)
             .name(entry.displayName)
             .layer('MAP')
             .position(entry.position)
-            .scale({ x: scale, y: scale })
+            .rotation(entry.rotation)
+            .scale({ x: entry.scale.x * scale, y: entry.scale.y * scale })
             .locked(lockMaps)
-            .visible(true)
-            .build()
-    );
+            .visible(true);
+        if (typeof entry.zIndex === 'number' && Number.isFinite(entry.zIndex)) {
+            builder = builder.zIndex(entry.zIndex);
+        }
+        return builder.build();
+    });
 
     let addedFogFeatureItems = false;
     let wallsAppliedToMapCount = 0;
@@ -2388,15 +2569,19 @@ export async function createSceneWithMultipleMaps(
         for (const entry of prepared) {
             if (!entry.wallData) continue;
             let addedFeaturesForMap = false;
+            const sourceScale = {
+                x: entry.scale.x * scale,
+                y: entry.scale.y * scale,
+            };
             if (includeWalls) {
-                const walls = await createWallItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                const walls = await createWallItems(entry.wallData, entry.position, sourceScale, targetDpi);
                 if (walls.length > 0) {
                     addedFogFeatureItems = true;
                     addedFeaturesForMap = true;
                     sceneItems.push(...walls);
                 }
                 if (entry.wallData.portals && entry.wallData.portals.length > 0) {
-                    const doors = await createDoorItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi);
+                    const doors = await createDoorItems(entry.wallData, entry.position, sourceScale, targetDpi);
                     if (doors.length > 0) {
                         addedFogFeatureItems = true;
                         addedFeaturesForMap = true;
@@ -2405,7 +2590,7 @@ export async function createSceneWithMultipleMaps(
                 }
             }
             if (includeLights && entry.wallData.lights && entry.wallData.lights.length > 0) {
-                const lights = await createLightItems(entry.wallData, entry.position, { x: scale, y: scale }, targetDpi, options.lightOptions);
+                const lights = await createLightItems(entry.wallData, entry.position, sourceScale, targetDpi, options.lightOptions);
                 if (lights.length > 0) {
                     addedFogFeatureItems = true;
                     addedFeaturesForMap = true;
