@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import "./App.css";
 import {
   uploadSceneFromVTT,
@@ -46,14 +46,26 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import {
   extractScenesFromFoundryZip,
+  type FoundryFolderMeta,
   getFoundrySceneMapImagePaths,
   getFoundrySceneMapSources,
 } from "./foundryZip";
+import {
+  buildFolderTree,
+  filterGroupedScenesBySearch,
+  groupScenesByFolder,
+  sortScenesFoundryOrder,
+  UNGROUPED_FOLDER_ID,
+  type FoundryGroupedFolderNode,
+  type FoundrySceneGroupingItem,
+} from "./foundrySceneGrouping";
 import type { FoundryVTTData, VTTMapData } from "./vttTypes";
 
 type SceneData = (FoundryVTTData | VTTMapData) & {
   _id?: string;
   name?: string;
+  folder?: string | null;
+  sort?: number;
   img?: string;
   thumb?: string;
   background?: {
@@ -131,6 +143,20 @@ const getSceneMapSources = (
     return [];
   }
   return getFoundrySceneMapSources(sceneData);
+};
+
+const getSceneFolderId = (sceneData: SceneData): string | null => {
+  const folderId = sceneData.folder;
+  if (typeof folderId !== "string") return null;
+  const normalized = folderId.trim();
+  return normalized.length > 0 ? normalized : null;
+};
+
+const getSceneSortOrder = (sceneData: SceneData): number => {
+  const sortValue = sceneData.sort;
+  return typeof sortValue === "number" && Number.isFinite(sortValue)
+    ? sortValue
+    : 0;
 };
 
 const sceneHasWallsOrDoors = (sceneData: SceneData): boolean => {
@@ -276,10 +302,17 @@ function App() {
   const [moduleUrl, setModuleUrl] = useState("");
   const [zipObject, setZipObject] = useState<JSZip | null>(null);
   const [availableScenes, setAvailableScenes] = useState<SceneInfo[]>([]);
+  const [availableSceneFolders, setAvailableSceneFolders] = useState<
+    FoundryFolderMeta[]
+  >([]);
   const [selectedSceneIndex, setSelectedSceneIndex] = useState(0);
   const [selectedSceneIndices, setSelectedSceneIndices] = useState<number[]>(
     [],
   );
+  const [sceneSearchQuery, setSceneSearchQuery] = useState("");
+  const [expandedFolderIds, setExpandedFolderIds] = useState<
+    Record<string, boolean>
+  >({});
   const [layoutMode, setLayoutMode] = useState<MapLayoutMode>("GRID");
   const [mapPlacementMode, setMapPlacementMode] =
     useState<MapPlacementMode>("RIGHT");
@@ -406,6 +439,86 @@ function App() {
   const selectedScenes = selectedSceneIndexes
     .map((idx) => availableScenes[idx])
     .filter((scene): scene is SceneInfo => !!scene);
+  const sceneGroupingItems = useMemo<FoundrySceneGroupingItem[]>(
+    () =>
+      availableScenes.map((scene, index) => ({
+        index,
+        name:
+          typeof scene.name === "string" && scene.name.trim().length > 0
+            ? scene.name
+            : `Scene ${index + 1}`,
+        folderId: getSceneFolderId(scene.data),
+        sort: getSceneSortOrder(scene.data),
+      })),
+    [availableScenes],
+  );
+  const sceneGroupingItemsInFoundryOrder = useMemo(
+    () => sortScenesFoundryOrder(sceneGroupingItems),
+    [sceneGroupingItems],
+  );
+  const foundryFolderTree = useMemo(
+    () => buildFolderTree(availableSceneFolders, sceneGroupingItemsInFoundryOrder),
+    [availableSceneFolders, sceneGroupingItemsInFoundryOrder],
+  );
+  const groupedScenesByFolder = useMemo(
+    () => groupScenesByFolder(sceneGroupingItemsInFoundryOrder, foundryFolderTree),
+    [sceneGroupingItemsInFoundryOrder, foundryFolderTree],
+  );
+  const filteredGroupedScenes = useMemo(
+    () =>
+      filterGroupedScenesBySearch(
+        groupedScenesByFolder,
+        sceneGroupingItemsInFoundryOrder,
+        sceneSearchQuery,
+      ),
+    [groupedScenesByFolder, sceneGroupingItemsInFoundryOrder, sceneSearchQuery],
+  );
+  const foundryFolderParentById = useMemo(() => {
+    const parentById = new Map<string, string | null>();
+    const stack = [...foundryFolderTree];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current) continue;
+      parentById.set(current.id, current.parentId);
+      for (const child of current.children) {
+        stack.push(child);
+      }
+    }
+    return parentById;
+  }, [foundryFolderTree]);
+  const visibleSceneCount =
+    filteredGroupedScenes.roots.reduce(
+      (total, folder) => total + folder.totalSceneCount,
+      0,
+    ) + filteredGroupedScenes.ungroupedSceneIndices.length;
+  const hasActiveSceneSearch = sceneSearchQuery.trim().length > 0;
+  const visibleSceneIndicesInDisplayOrder = useMemo(() => {
+    const orderedSceneIndices: number[] = [];
+    const isExpanded = (folderId: string): boolean =>
+      hasActiveSceneSearch ? true : (expandedFolderIds[folderId] ?? true);
+    const visitFolder = (folder: FoundryGroupedFolderNode) => {
+      if (!isExpanded(folder.id)) return;
+      orderedSceneIndices.push(...folder.sceneIndices);
+      for (const child of folder.children) {
+        visitFolder(child);
+      }
+    };
+
+    for (const root of filteredGroupedScenes.roots) {
+      visitFolder(root);
+    }
+    if (isExpanded(UNGROUPED_FOLDER_ID)) {
+      orderedSceneIndices.push(...filteredGroupedScenes.ungroupedSceneIndices);
+    }
+    return orderedSceneIndices;
+  }, [expandedFolderIds, filteredGroupedScenes, hasActiveSceneSearch]);
+  const visibleSceneOrderByIndex = useMemo(() => {
+    const orderByIndex = new Map<number, number>();
+    visibleSceneIndicesInDisplayOrder.forEach((sceneIndex, position) => {
+      orderByIndex.set(sceneIndex, position);
+    });
+    return orderByIndex;
+  }, [visibleSceneIndicesInDisplayOrder]);
   const usesTouchSelectionControls =
     !isContextMenuMode && availableScenes.length > 1 && !canHoverPreview;
   const hasRawMediaSources =
@@ -855,6 +968,87 @@ function App() {
   }, [selectedSceneIndices, selectedSceneIndex]);
 
   useEffect(() => {
+    if (availableScenes.length !== 0) return;
+    setSceneSearchQuery((previous) => (previous.length > 0 ? "" : previous));
+    setExpandedFolderIds((previous) =>
+      Object.keys(previous).length > 0 ? {} : previous,
+    );
+    setAvailableSceneFolders((previous) =>
+      previous.length > 0 ? [] : previous,
+    );
+  }, [availableScenes.length]);
+
+  useEffect(() => {
+    if (foundryFolderTree.length === 0 || availableScenes.length === 0) {
+      return;
+    }
+
+    const validFolderIds = new Set<string>();
+    const stack = [...foundryFolderTree];
+    while (stack.length > 0) {
+      const folder = stack.pop();
+      if (!folder) continue;
+      validFolderIds.add(folder.id);
+      for (const child of folder.children) {
+        stack.push(child);
+      }
+    }
+
+    const selectedScene = sceneGroupingItems.find(
+      (scene) => scene.index === selectedSceneIndex,
+    );
+    const selectedFolderAncestors = new Set<string>();
+    let currentFolderId = selectedScene?.folderId ?? null;
+    while (currentFolderId) {
+      selectedFolderAncestors.add(currentFolderId);
+      currentFolderId = foundryFolderParentById.get(currentFolderId) ?? null;
+    }
+
+    const rootFolderIds = new Set(foundryFolderTree.map((root) => root.id));
+
+    setExpandedFolderIds((previous) => {
+      const nextState: Record<string, boolean> = {};
+      let hasChanges = false;
+
+      for (const folderId of validFolderIds) {
+        const previousValue = previous[folderId];
+        nextState[folderId] =
+          previousValue !== undefined ? previousValue : rootFolderIds.has(folderId);
+      }
+      if (previous[UNGROUPED_FOLDER_ID] !== undefined) {
+        nextState[UNGROUPED_FOLDER_ID] = previous[UNGROUPED_FOLDER_ID];
+      }
+
+      for (const folderId of selectedFolderAncestors) {
+        if (!nextState[folderId]) {
+          nextState[folderId] = true;
+        }
+      }
+
+      const previousKeys = Object.keys(previous);
+      const nextKeys = Object.keys(nextState);
+      if (previousKeys.length !== nextKeys.length) {
+        hasChanges = true;
+      } else {
+        for (const key of nextKeys) {
+          if (previous[key] !== nextState[key]) {
+            hasChanges = true;
+            break;
+          }
+        }
+      }
+
+      return hasChanges ? nextState : previous;
+    });
+  }, [
+    availableScenes.length,
+    foundryFolderTree,
+    foundryFolderParentById,
+    sceneGroupingItems,
+    selectedSceneIndex,
+  ]);
+
+  useEffect(() => {
     if (selectedRawFiles.length > 0 || selectedPairedImports.length > 0) {
       if (!hasImage) setHasImage(true);
       return;
@@ -930,14 +1124,15 @@ function App() {
     try {
       const zip = await JSZip.loadAsync(fileOrBlob);
       setZipObject(zip);
-      const scenes: SceneInfo[] = await extractScenesFromFoundryZip(
+      const { scenes, folders } = await extractScenesFromFoundryZip(
         zip,
         fileOrBlob instanceof File ? fileOrBlob.name : "module",
       );
+      const sceneList: SceneInfo[] = scenes;
 
-      if (scenes.length > 0) {
+      if (sceneList.length > 0) {
         // Pre-fetch thumbnails as object URLs
-        for (const s of scenes) {
+        for (const s of sceneList) {
           // V11+ stores thumbnails in assets/scenes/<id>-thumb.webp
           const sceneId = s.data._id || "";
           const v11ThumbPath = sceneId
@@ -967,9 +1162,12 @@ function App() {
           }
         }
 
-        setAvailableScenes(scenes);
+        setAvailableScenes(sceneList);
+        setAvailableSceneFolders(folders);
         setSelectedSceneIndex(0);
         setSelectedSceneIndices([0]);
+        setSceneSearchQuery("");
+        setExpandedFolderIds({});
         setSelectedFile(null);
         setSelectedWallDataFile(null);
         setSelectedWallData(null);
@@ -979,13 +1177,14 @@ function App() {
         setIsFoundryFormat(true);
         setSelectedFileHasWallsOrDoors(false);
         setSelectedFileHasLights(false);
-        const firstScene = scenes[0].data;
+        const firstScene = sceneList[0].data;
         setHasImage(getSceneMapImagePaths(firstScene).length > 0);
-        setMultiSceneName((scenes[0].name || "Scene").trim() || "Scene");
+        setMultiSceneName((sceneList[0].name || "Scene").trim() || "Scene");
       } else {
         OBR.notification.show("No scenes found in this ZIP.", "WARNING");
         setZipObject(null);
         setAvailableScenes([]);
+        setAvailableSceneFolders([]);
         setSelectedSceneIndices([]);
         setSelectedWallDataFile(null);
         setSelectedWallData(null);
@@ -999,6 +1198,7 @@ function App() {
       OBR.notification.show("Failed to parse ZIP file.", "ERROR");
       setZipObject(null);
       setAvailableScenes([]);
+      setAvailableSceneFolders([]);
       setSelectedSceneIndices([]);
       setSelectedWallDataFile(null);
       setSelectedWallData(null);
@@ -2364,6 +2564,287 @@ function App() {
     }
   };
 
+  const isSceneSelected = (sceneIndex: number): boolean =>
+    (
+      isContextMenuMode
+        ? selectedSceneIndex === sceneIndex
+        : selectedSceneIndices.includes(sceneIndex)
+    );
+
+  const handleSceneCardSelection = (
+    sceneIndex: number,
+    isRangeSelect: boolean,
+    isMultiSelectToggle: boolean,
+  ) => {
+    const anchorIndex = Math.min(
+      Math.max(selectedSceneIndex, 0),
+      Math.max(availableScenes.length - 1, 0),
+    );
+
+    setSelectedSceneIndex(sceneIndex);
+    const selectedScene = availableScenes[sceneIndex];
+    if (selectedScene) {
+      setHasImage(getSceneMapImagePaths(selectedScene.data).length > 0);
+      setMultiSceneName(
+        (selectedScene.name || "Scene").trim() || "Scene",
+      );
+    }
+
+    if (isContextMenuMode) {
+      setSelectedSceneIndices([sceneIndex]);
+      return;
+    }
+
+    if (isRangeSelect) {
+      const anchorOrderIndex =
+        visibleSceneOrderByIndex.get(anchorIndex) ?? -1;
+      const targetOrderIndex = visibleSceneOrderByIndex.get(sceneIndex) ?? -1;
+
+      const range =
+        anchorOrderIndex >= 0 && targetOrderIndex >= 0
+          ? visibleSceneIndicesInDisplayOrder.slice(
+              Math.min(anchorOrderIndex, targetOrderIndex),
+              Math.max(anchorOrderIndex, targetOrderIndex) + 1,
+            )
+          : [sceneIndex];
+
+      if (isMultiSelectToggle) {
+        setSelectedSceneIndices((previous) => {
+          const merged = new Set([...previous, ...range]);
+          return Array.from(merged).sort((left, right) => {
+            const leftOrder = visibleSceneOrderByIndex.get(left);
+            const rightOrder = visibleSceneOrderByIndex.get(right);
+            if (leftOrder !== undefined && rightOrder !== undefined) {
+              return leftOrder - rightOrder;
+            }
+            if (leftOrder !== undefined) return -1;
+            if (rightOrder !== undefined) return 1;
+            return left - right;
+          });
+        });
+        return;
+      }
+
+      setSelectedSceneIndices(range);
+      return;
+    }
+
+    if (!isMultiSelectToggle) {
+      setSelectedSceneIndices([sceneIndex]);
+      return;
+    }
+
+    setSelectedSceneIndices((previous) => {
+      const exists = previous.includes(sceneIndex);
+      const next = exists
+        ? previous.filter((value) => value !== sceneIndex)
+        : [...previous, sceneIndex];
+      return next.length > 0 ? next : [sceneIndex];
+    });
+  };
+
+  const renderSceneCard = (sceneIndex: number) => {
+    const scene = availableScenes[sceneIndex];
+    if (!scene) return null;
+
+    return (
+      <div
+        key={scene.data._id || `${sceneIndex}-${scene.name}`}
+        className={`scene-card ${isSceneSelected(sceneIndex) ? "selected" : ""}`}
+        onClick={(event) => {
+          if (suppressNextCardClickRef.current) {
+            suppressNextCardClickRef.current = false;
+            return;
+          }
+
+          const isRangeSelect = event.shiftKey;
+          const isMultiSelectToggle =
+            event.metaKey ||
+            event.ctrlKey ||
+            (usesTouchSelectionControls && touchMultiSelectMode);
+
+          handleSceneCardSelection(
+            sceneIndex,
+            isRangeSelect,
+            isMultiSelectToggle,
+          );
+        }}
+        onMouseEnter={() => {
+          if (!canHoverPreview || !scene.thumbUrl) return;
+          if (suppressedPreviewCardIndexRef.current === sceneIndex) return;
+          const preview = {
+            url: scene.thumbUrl,
+            isVideo: scene.isVideo,
+          };
+
+          if (hoveredSceneThumb) {
+            clearPreviewOpenTimeout();
+            clearPreviewHideTimeout();
+            previewSourceIndexRef.current = sceneIndex;
+            setHoveredSceneThumb(preview);
+            return;
+          }
+
+          schedulePreviewOpen(
+            sceneIndex,
+            preview,
+            PREVIEW_HOVER_OPEN_DELAY_MS,
+          );
+        }}
+        onMouseLeave={() => {
+          if (!canHoverPreview) return;
+          if (suppressedPreviewCardIndexRef.current === sceneIndex) {
+            suppressedPreviewCardIndexRef.current = null;
+          }
+          hideHoverPreviewSoon();
+        }}
+        onPointerDown={(event) => {
+          if (canHoverPreview || !scene.thumbUrl) return;
+          if (event.pointerType !== "touch" && event.pointerType !== "pen") {
+            return;
+          }
+
+          touchPreviewPressStartedAtRef.current = Date.now();
+
+          schedulePreviewOpen(
+            sceneIndex,
+            {
+              url: scene.thumbUrl,
+              isVideo: scene.isVideo,
+            },
+            PREVIEW_TOUCH_OPEN_DELAY_MS,
+            () => {
+              suppressNextCardClickRef.current = true;
+            },
+          );
+        }}
+        onPointerUp={() => {
+          if (canHoverPreview) return;
+          const pressStartedAt = touchPreviewPressStartedAtRef.current;
+          touchPreviewPressStartedAtRef.current = null;
+
+          if (!scene.thumbUrl || pressStartedAt === null) {
+            clearPreviewOpenTimeout();
+            return;
+          }
+
+          const elapsedMs = Date.now() - pressStartedAt;
+          if (!hoveredSceneThumb && elapsedMs >= PREVIEW_TOUCH_RELEASE_THRESHOLD_MS) {
+            clearPreviewOpenTimeout();
+            clearPreviewHideTimeout();
+            previewSourceIndexRef.current = sceneIndex;
+            setHoveredSceneThumb({
+              url: scene.thumbUrl,
+              isVideo: scene.isVideo,
+            });
+            suppressNextCardClickRef.current = true;
+            return;
+          }
+
+          clearPreviewOpenTimeout();
+        }}
+        onPointerCancel={() => {
+          if (canHoverPreview) return;
+          touchPreviewPressStartedAtRef.current = null;
+          clearPreviewOpenTimeout();
+        }}
+        onPointerLeave={() => {
+          if (canHoverPreview) return;
+          touchPreviewPressStartedAtRef.current = null;
+          clearPreviewOpenTimeout();
+        }}>
+        <div className="scene-thumb-container">
+          {scene.isVideo && (
+            <div className="video-badge">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
+              </svg>
+            </div>
+          )}
+          {scene.thumbUrl ? (
+            scene.isVideo ? (
+              <video
+                src={scene.thumbUrl}
+                className="scene-thumb"
+                autoPlay={selectedSceneIndex === sceneIndex}
+                loop
+                muted
+                playsInline
+                preload={selectedSceneIndex === sceneIndex ? "metadata" : "none"}
+              />
+            ) : (
+              <img
+                src={scene.thumbUrl}
+                className="scene-thumb"
+                alt={scene.name}
+                loading="lazy"
+                decoding="async"
+              />
+            )
+          ) : (
+            <span className="scene-thumb-placeholder">No Preview</span>
+          )}
+        </div>
+        <div className="scene-name" title={scene.name || `Scene ${sceneIndex + 1}`}>
+          {scene.name || `Scene ${sceneIndex + 1}`}
+        </div>
+      </div>
+    );
+  };
+
+  const isFolderExpanded = (folderId: string): boolean =>
+    hasActiveSceneSearch ? true : (expandedFolderIds[folderId] ?? true);
+
+  const toggleFolderExpanded = (folderId: string) => {
+    if (hasActiveSceneSearch) return;
+    setExpandedFolderIds((previous) => ({
+      ...previous,
+      [folderId]: !(previous[folderId] ?? true),
+    }));
+  };
+
+  const renderFolderNode = (
+    folder: FoundryGroupedFolderNode,
+    depth: number,
+  ) => {
+    if (folder.totalSceneCount === 0) return null;
+    const expanded = isFolderExpanded(folder.id);
+
+    return (
+      <section
+        key={folder.id}
+        className="scene-folder-section"
+        style={{ marginLeft: `${Math.max(0, depth) * 10}px` }}>
+        <button
+          type="button"
+          className="scene-folder-header"
+          onClick={() => toggleFolderExpanded(folder.id)}
+          aria-expanded={expanded}
+          aria-controls={`scene-folder-${folder.id}`}>
+          <span className={`scene-folder-caret${expanded ? " expanded" : ""}`}>
+            ▸
+          </span>
+          <span className="scene-folder-name" title={folder.name}>
+            {folder.name}
+          </span>
+          <span className="scene-folder-count">{folder.totalSceneCount}</span>
+        </button>
+        {expanded && (
+          <div
+            className="scene-folder-content"
+            id={`scene-folder-${folder.id}`}>
+            {folder.sceneIndices.length > 0 && (
+              <div className="scene-gallery">
+                {folder.sceneIndices.map((sceneIndex) => renderSceneCard(sceneIndex))}
+              </div>
+            )}
+            {folder.children.map((child) => renderFolderNode(child, depth + 1))}
+          </div>
+        )}
+      </section>
+    );
+  };
+
   return (
     <Box className={containerClassName} ref={containerRef}>
       {!isGM ? (
@@ -2562,8 +3043,20 @@ function App() {
                     )}
                   </Stack>
                 )}
+                <TextField
+                  size="small"
+                  fullWidth
+                  value={sceneSearchQuery}
+                  onChange={(event) => setSceneSearchQuery(event.target.value)}
+                  placeholder="Search scenes"
+                  className="scene-search-input"
+                  sx={{ mb: 1 }}
+                  inputProps={{
+                    "aria-label": "Search scenes",
+                  }}
+                />
                 <div
-                  className="scene-gallery"
+                  className="scene-folder-scroll"
                   onClickCapture={() => {
                     if (!canHoverPreview || !hoveredSceneThumb) return;
                     suppressedPreviewCardIndexRef.current =
@@ -2573,211 +3066,48 @@ function App() {
                     setHoveredSceneThumb(null);
                   }}
                   onScroll={() => setHoveredSceneThumb(null)}>
-                  {availableScenes.map((s, idx) => (
-                    <div
-                      key={idx}
-                      className={`scene-card ${
-                        (
-                          isContextMenuMode
-                            ? selectedSceneIndex === idx
-                            : selectedSceneIndices.includes(idx)
-                        )
-                          ? "selected"
-                          : ""
-                      }`}
-                      onClick={(event) => {
-                        if (suppressNextCardClickRef.current) {
-                          suppressNextCardClickRef.current = false;
-                          return;
+                  {filteredGroupedScenes.roots.map((folder) =>
+                    renderFolderNode(folder, 0),
+                  )}
+                  {filteredGroupedScenes.ungroupedSceneIndices.length > 0 && (
+                    <section className="scene-folder-section">
+                      <button
+                        type="button"
+                        className="scene-folder-header"
+                        onClick={() =>
+                          toggleFolderExpanded(UNGROUPED_FOLDER_ID)
                         }
-
-                        const anchorIndex = Math.min(
-                          Math.max(selectedSceneIndex, 0),
-                          Math.max(availableScenes.length - 1, 0),
-                        );
-                        setSelectedSceneIndex(idx);
-                        setHasImage(getSceneMapImagePaths(s.data).length > 0);
-                        setMultiSceneName((s.name || "Scene").trim() || "Scene");
-
-                        if (isContextMenuMode) {
-                          setSelectedSceneIndices([idx]);
-                          return;
-                        }
-
-                        const isRangeSelect = event.shiftKey;
-                        const isMultiSelectToggle =
-                          event.metaKey ||
-                          event.ctrlKey ||
-                          (usesTouchSelectionControls && touchMultiSelectMode);
-
-                        if (isRangeSelect) {
-                          const start = Math.min(anchorIndex, idx);
-                          const end = Math.max(anchorIndex, idx);
-                          const range = Array.from(
-                            { length: end - start + 1 },
-                            (_, offset) => start + offset,
-                          );
-
-                          if (isMultiSelectToggle) {
-                            setSelectedSceneIndices((previous) => {
-                              const merged = new Set([...previous, ...range]);
-                              return Array.from(merged).sort((a, b) => a - b);
-                            });
-                            return;
-                          }
-
-                          setSelectedSceneIndices(range);
-                          return;
-                        }
-
-                        if (!isMultiSelectToggle) {
-                          setSelectedSceneIndices([idx]);
-                          return;
-                        }
-
-                        setSelectedSceneIndices((previous) => {
-                          const exists = previous.includes(idx);
-                          const next = exists
-                            ? previous.filter((value) => value !== idx)
-                            : [...previous, idx];
-                          return next.length > 0 ? next : [idx];
-                        });
-                      }}
-                      onMouseEnter={() => {
-                        if (!canHoverPreview || !s.thumbUrl) return;
-                        if (suppressedPreviewCardIndexRef.current === idx)
-                          return;
-                        const preview = {
-                          url: s.thumbUrl,
-                          isVideo: s.isVideo,
-                        };
-
-                        if (hoveredSceneThumb) {
-                          clearPreviewOpenTimeout();
-                          clearPreviewHideTimeout();
-                          previewSourceIndexRef.current = idx;
-                          setHoveredSceneThumb(preview);
-                          return;
-                        }
-
-                        schedulePreviewOpen(
-                          idx,
-                          preview,
-                          PREVIEW_HOVER_OPEN_DELAY_MS,
-                        );
-                      }}
-                      onMouseLeave={() => {
-                        if (!canHoverPreview) return;
-                        if (suppressedPreviewCardIndexRef.current === idx) {
-                          suppressedPreviewCardIndexRef.current = null;
-                        }
-                        hideHoverPreviewSoon();
-                      }}
-                      onPointerDown={(event) => {
-                        if (canHoverPreview || !s.thumbUrl) return;
-                        if (
-                          event.pointerType !== "touch" &&
-                          event.pointerType !== "pen"
-                        ) {
-                          return;
-                        }
-
-                        touchPreviewPressStartedAtRef.current = Date.now();
-
-                        schedulePreviewOpen(
-                          idx,
-                          {
-                            url: s.thumbUrl,
-                            isVideo: s.isVideo,
-                          },
-                          PREVIEW_TOUCH_OPEN_DELAY_MS,
-                          () => {
-                            suppressNextCardClickRef.current = true;
-                          },
-                        );
-                      }}
-                      onPointerUp={() => {
-                        if (canHoverPreview) return;
-                        const pressStartedAt =
-                          touchPreviewPressStartedAtRef.current;
-                        touchPreviewPressStartedAtRef.current = null;
-
-                        if (!s.thumbUrl || pressStartedAt === null) {
-                          clearPreviewOpenTimeout();
-                          return;
-                        }
-
-                        const elapsedMs = Date.now() - pressStartedAt;
-                        if (
-                          !hoveredSceneThumb &&
-                          elapsedMs >= PREVIEW_TOUCH_RELEASE_THRESHOLD_MS
-                        ) {
-                          clearPreviewOpenTimeout();
-                          clearPreviewHideTimeout();
-                          previewSourceIndexRef.current = idx;
-                          setHoveredSceneThumb({
-                            url: s.thumbUrl,
-                            isVideo: s.isVideo,
-                          });
-                          suppressNextCardClickRef.current = true;
-                          return;
-                        }
-
-                        clearPreviewOpenTimeout();
-                      }}
-                      onPointerCancel={() => {
-                        if (canHoverPreview) return;
-                        touchPreviewPressStartedAtRef.current = null;
-                        clearPreviewOpenTimeout();
-                      }}
-                      onPointerLeave={() => {
-                        if (canHoverPreview) return;
-                        touchPreviewPressStartedAtRef.current = null;
-                        clearPreviewOpenTimeout();
-                      }}>
-                      <div className="scene-thumb-container">
-                        {s.isVideo && (
-                          <div className="video-badge">
-                            <svg viewBox="0 0 24 24" fill="currentColor">
-                              <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
-                            </svg>
+                        aria-expanded={isFolderExpanded(UNGROUPED_FOLDER_ID)}
+                        aria-controls="scene-folder-ungrouped">
+                        <span
+                          className={`scene-folder-caret${isFolderExpanded(UNGROUPED_FOLDER_ID) ? " expanded" : ""}`}>
+                          ▸
+                        </span>
+                        <span className="scene-folder-name">Ungrouped</span>
+                        <span className="scene-folder-count">
+                          {filteredGroupedScenes.ungroupedSceneIndices.length}
+                        </span>
+                      </button>
+                      {isFolderExpanded(UNGROUPED_FOLDER_ID) && (
+                        <div
+                          className="scene-folder-content"
+                          id="scene-folder-ungrouped">
+                          <div className="scene-gallery">
+                            {filteredGroupedScenes.ungroupedSceneIndices.map(
+                              (sceneIndex) => renderSceneCard(sceneIndex),
+                            )}
                           </div>
-                        )}
-                        {s.thumbUrl ? (
-                          s.isVideo ? (
-                            <video
-                              src={s.thumbUrl}
-                              className="scene-thumb"
-                              autoPlay={selectedSceneIndex === idx}
-                              loop
-                              muted
-                              playsInline
-                              preload={
-                                selectedSceneIndex === idx ? "metadata" : "none"
-                              }
-                            />
-                          ) : (
-                            <img
-                              src={s.thumbUrl}
-                              className="scene-thumb"
-                              alt={s.name}
-                              loading="lazy"
-                              decoding="async"
-                            />
-                          )
-                        ) : (
-                          <span className="scene-thumb-placeholder">
-                            No Preview
-                          </span>
-                        )}
-                      </div>
-                      <div
-                        className="scene-name"
-                        title={s.name || `Scene ${idx + 1}`}>
-                        {s.name || `Scene ${idx + 1}`}
-                      </div>
-                    </div>
-                  ))}
+                        </div>
+                      )}
+                    </section>
+                  )}
+                  {visibleSceneCount === 0 && (
+                    <Typography
+                      variant="caption"
+                      className="help-text scene-empty-search">
+                      No scenes matched your search.
+                    </Typography>
+                  )}
                 </div>
               </Box>
             )}

@@ -132,9 +132,7 @@ html, body {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
   gap: 0.65rem;
-  max-height: clamp(290px, 52vh, 520px);
-  overflow-y: auto;
-  padding: 0.3rem 0;
+  padding: 0.3rem 0 0.15rem;
   background: transparent;
   border-radius: 10px;
   border: none;
@@ -142,10 +140,86 @@ html, body {
   -webkit-backdrop-filter: none;
 }
 
-.container.context-mode.has-scenes .scene-gallery {
+.scene-folder-scroll {
+  max-height: clamp(290px, 52vh, 520px);
+  overflow-y: auto;
+  padding: 0.2rem 0 0;
+}
+
+.container.context-mode.has-scenes .scene-folder-scroll {
   flex: 1;
   min-height: 0;
   max-height: none;
+}
+
+.scene-search-input .MuiInputBase-root {
+  border-radius: 10px;
+}
+
+.scene-folder-section {
+  margin: 0;
+  padding: 0;
+}
+
+.scene-folder-header {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text-primary, #f3f3f3);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 2rem;
+  padding: 0.2rem 0.15rem;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 8px;
+}
+
+.scene-folder-header:hover {
+  background: rgba(var(--text-primary-rgb, 255, 255, 255), 0.06);
+}
+
+.scene-folder-caret {
+  width: 0.9rem;
+  font-size: 0.7rem;
+  line-height: 1;
+  color: var(--text-secondary, #c3c3c3);
+  transition: transform 0.14s ease;
+}
+
+.scene-folder-caret.expanded {
+  transform: rotate(90deg);
+}
+
+.scene-folder-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scene-folder-count {
+  font-size: 0.72rem;
+  line-height: 1;
+  color: var(--text-secondary, #c3c3c3);
+  padding: 0.1rem 0.32rem;
+  border-radius: 999px;
+  background: rgba(var(--text-primary-rgb, 255, 255, 255), 0.08);
+}
+
+.scene-folder-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+}
+
+.scene-empty-search {
+  display: block;
+  padding: 0.55rem 0.2rem 0.2rem;
 }
 
 .scene-card {

@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import { isFoundryVTTData } from "./importVTT";
 import {
+  extractFoldersFromLevelDB,
   extractScenesFromAdventureLevelDB,
   extractScenesFromLevelDB,
 } from "./leveldb";
@@ -11,6 +12,8 @@ export type FoundrySceneData = FoundryVTTData & {
   name?: string;
   img?: string;
   thumb?: string;
+  folder?: string | null;
+  sort?: number;
   tiles?: Array<
     | string
     | {
@@ -35,6 +38,19 @@ export type FoundryZipScene = {
   name: string;
   data: FoundrySceneData;
   fileSource: string;
+};
+
+export type FoundryFolderMeta = {
+  _id: string;
+  name: string;
+  folder: string | null;
+  sort?: number;
+  type?: string;
+};
+
+export type FoundryZipExtractionResult = {
+  scenes: FoundryZipScene[];
+  folders: FoundryFolderMeta[];
 };
 
 export type FoundrySceneMapSource = {
@@ -282,7 +298,7 @@ const loadLdbBuffers = async (
       .map((file) => file.async("arraybuffer")),
   );
 
-type PackType = "Scene" | "Adventure";
+type PackType = "Scene" | "Adventure" | "Folder";
 
 const addFoundrySceneCandidate = (
   scenes: FoundryZipScene[],
@@ -309,6 +325,52 @@ const addFoundrySceneCandidate = (
     data: scene,
     fileSource,
   });
+};
+
+const normalizeFoundryFolderCandidate = (
+  candidate: unknown,
+): FoundryFolderMeta | null => {
+  if (!candidate || typeof candidate !== "object") return null;
+  const raw = candidate as {
+    _id?: unknown;
+    name?: unknown;
+    folder?: unknown;
+    sort?: unknown;
+    type?: unknown;
+  };
+  if (typeof raw._id !== "string" || raw._id.trim().length === 0) {
+    return null;
+  }
+
+  const normalizeString = (value: unknown): string | null =>
+    typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  const id = raw._id.trim();
+  const parentFolderId = normalizeString(raw.folder);
+  const folderSort =
+    typeof raw.sort === "number" && Number.isFinite(raw.sort)
+      ? raw.sort
+      : undefined;
+  const folderType = normalizeString(raw.type) ?? undefined;
+
+  return {
+    _id: id,
+    name: normalizeString(raw.name) ?? "Untitled Folder",
+    folder: parentFolderId && parentFolderId !== id ? parentFolderId : null,
+    sort: folderSort,
+    type: folderType,
+  };
+};
+
+const addFoundryFolderCandidate = (
+  folders: FoundryFolderMeta[],
+  seenFolderIds: Set<string>,
+  candidate: unknown,
+) => {
+  const folder = normalizeFoundryFolderCandidate(candidate);
+  if (!folder) return;
+  if (seenFolderIds.has(folder._id)) return;
+  seenFolderIds.add(folder._id);
+  folders.push(folder);
 };
 
 const addScenesFromDocs = (
@@ -339,13 +401,29 @@ const addScenesFromDocs = (
   }
 };
 
+const addFoldersFromDocs = (
+  folders: FoundryFolderMeta[],
+  seenFolderIds: Set<string>,
+  docs: unknown[],
+) => {
+  for (const doc of docs) {
+    addFoundryFolderCandidate(folders, seenFolderIds, doc);
+  }
+};
+
 const addScenesFromLdbBuffers = (
   scenes: FoundryZipScene[],
   seenSceneIds: Set<string>,
+  folders: FoundryFolderMeta[],
+  seenFolderIds: Set<string>,
   ldbBuffers: ArrayBuffer[],
   fileSource: string,
   sourceType?: PackType,
 ) => {
+  for (const folder of extractFoldersFromLevelDB(ldbBuffers)) {
+    addFoundryFolderCandidate(folders, seenFolderIds, folder);
+  }
+
   if (sourceType === "Adventure") {
     for (const scene of extractScenesFromAdventureLevelDB(ldbBuffers)) {
       addFoundrySceneCandidate(scenes, seenSceneIds, scene, fileSource);
@@ -374,7 +452,7 @@ type ModulePackLike = {
 export async function extractScenesFromFoundryZip(
   zip: JSZip,
   fileSource: string,
-): Promise<FoundryZipScene[]> {
+): Promise<FoundryZipExtractionResult> {
   let moduleJsonFile = zip.file("module.json");
   if (!moduleJsonFile) {
     const match = Object.keys(zip.files).find((p) => p.endsWith("module.json"));
@@ -389,11 +467,15 @@ export async function extractScenesFromFoundryZip(
 
   const scenes: FoundryZipScene[] = [];
   const seenSceneIds = new Set<string>();
+  const folders: FoundryFolderMeta[] = [];
+  const seenFolderIds = new Set<string>();
 
   if (moduleJson && Array.isArray(moduleJson.packs)) {
     for (const pack of moduleJson.packs) {
       if (
-        (pack.type === "Scene" || pack.type === "Adventure") &&
+        (pack.type === "Scene" ||
+          pack.type === "Adventure" ||
+          pack.type === "Folder") &&
         pack.path
       ) {
         const packType = pack.type as PackType;
@@ -411,13 +493,12 @@ export async function extractScenesFromFoundryZip(
 
         if (packFile) {
           const content = await packFile.async("string");
-          addScenesFromDocs(
-            scenes,
-            seenSceneIds,
-            parseJsonLineDocs(content),
-            fileSource,
-            packType,
-          );
+          const docs = parseJsonLineDocs(content);
+          if (packType === "Folder") {
+            addFoldersFromDocs(folders, seenFolderIds, docs);
+          } else {
+            addScenesFromDocs(scenes, seenSceneIds, docs, fileSource, packType);
+          }
         } else {
           // Try LevelDB format (it might be a directory in the zip)
           // Support both legacy `<pack>.db` paths and modern `<pack>/` ldb directories.
@@ -427,6 +508,8 @@ export async function extractScenesFromFoundryZip(
             addScenesFromLdbBuffers(
               scenes,
               seenSceneIds,
+              folders,
+              seenFolderIds,
               await loadLdbBuffers(zip, ldbFiles),
               fileSource,
               packType,
@@ -446,6 +529,8 @@ export async function extractScenesFromFoundryZip(
       addScenesFromLdbBuffers(
         scenes,
         seenSceneIds,
+        folders,
+        seenFolderIds,
         await loadLdbBuffers(zip, allLdbFiles),
         fileSource,
       );
@@ -459,10 +544,14 @@ export async function extractScenesFromFoundryZip(
           const file = zip.file(path);
           if (!file) continue;
           const content = await file.async("string");
+          const docs = parseJsonLineDocs(content);
+          if (lower.includes("folder")) {
+            addFoldersFromDocs(folders, seenFolderIds, docs);
+          }
           addScenesFromDocs(
             scenes,
             seenSceneIds,
-            parseJsonLineDocs(content),
+            docs,
             fileSource,
           );
         }
@@ -470,5 +559,5 @@ export async function extractScenesFromFoundryZip(
     }
   }
 
-  return scenes;
+  return { scenes, folders };
 }

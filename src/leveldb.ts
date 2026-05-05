@@ -347,6 +347,38 @@ function parseSSTTableEntries(
     return results;
 }
 
+function collectLatestEntriesByPrefix(
+    ldbBuffers: ArrayBuffer[],
+    keyPrefix: string
+): Map<string, {
+    sequence: number;
+    value: string | null;
+    deleted: boolean;
+}> {
+    const docsByKey = new Map<string, {
+        sequence: number;
+        value: string | null;
+        deleted: boolean;
+    }>();
+
+    for (const buffer of ldbBuffers) {
+        const entries = parseSSTTableEntries(buffer, keyPrefix);
+
+        for (const entry of entries) {
+            const current = docsByKey.get(entry.key);
+            if (!current || entry.sequence > current.sequence) {
+                docsByKey.set(entry.key, {
+                    sequence: entry.sequence,
+                    value: entry.value,
+                    deleted: entry.deleted,
+                });
+            }
+        }
+    }
+
+    return docsByKey;
+}
+
 /**
  * Extract Foundry VTT scene documents from LevelDB SSTable files.
  *
@@ -360,26 +392,7 @@ export function extractScenesFromLevelDB(
     ldbBuffers: ArrayBuffer[]
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): any[] {
-    const sceneDocsByKey = new Map<string, {
-        sequence: number;
-        value: string | null;
-        deleted: boolean;
-    }>();
-
-    for (const buffer of ldbBuffers) {
-        const entries = parseSSTTableEntries(buffer, '!scenes!');
-
-        for (const entry of entries) {
-            const current = sceneDocsByKey.get(entry.key);
-            if (!current || entry.sequence > current.sequence) {
-                sceneDocsByKey.set(entry.key, {
-                    sequence: entry.sequence,
-                    value: entry.value,
-                    deleted: entry.deleted,
-                });
-            }
-        }
-    }
+    const sceneDocsByKey = collectLatestEntriesByPrefix(ldbBuffers, '!scenes!');
 
     const extractEmbeddedSceneCollection = (
         keyPrefix: string
@@ -521,6 +534,51 @@ export function extractScenesFromLevelDB(
 }
 
 /**
+ * Extract Foundry folder documents from LevelDB SSTable files.
+ *
+ * Foundry stores folders with keys like `!folders!<documentId>`.
+ * Values are JSON folder objects.
+ *
+ * @param ldbBuffers Array of ArrayBuffer contents from .ldb files in the pack directory.
+ * @returns Array of parsed folder objects, deduplicated by _id (latest wins).
+ */
+export function extractFoldersFromLevelDB(
+    ldbBuffers: ArrayBuffer[]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): any[] {
+    const folderDocsByKey = collectLatestEntriesByPrefix(ldbBuffers, '!folders!');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const folderMap = new Map<string, any>();
+
+    for (const [key, entry] of folderDocsByKey) {
+        if (entry.deleted || entry.value === null) {
+            continue;
+        }
+
+        try {
+            const parsed = JSON.parse(entry.value);
+            if (!parsed || typeof parsed !== 'object') continue;
+            const folderDoc = parsed as { _id?: unknown };
+            const fallbackId = key.replace('!folders!', '').trim();
+            const docId =
+                typeof folderDoc._id === 'string' && folderDoc._id.trim().length > 0
+                    ? folderDoc._id.trim()
+                    : fallbackId;
+            if (!docId) continue;
+
+            folderMap.set(docId, {
+                ...parsed,
+                _id: docId,
+            });
+        } catch {
+            // Skip entries that aren't valid JSON
+        }
+    }
+
+    return Array.from(folderMap.values());
+}
+
+/**
  * Extract scene documents embedded inside Adventure compendium documents.
  *
  * Foundry Adventure packs store documents under keys like `!adventures!<documentId>`.
@@ -533,26 +591,7 @@ export function extractScenesFromAdventureLevelDB(
     ldbBuffers: ArrayBuffer[]
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): any[] {
-    const adventureDocsByKey = new Map<string, {
-        sequence: number;
-        value: string | null;
-        deleted: boolean;
-    }>();
-
-    for (const buffer of ldbBuffers) {
-        const entries = parseSSTTableEntries(buffer, '!adventures!');
-
-        for (const entry of entries) {
-            const current = adventureDocsByKey.get(entry.key);
-            if (!current || entry.sequence > current.sequence) {
-                adventureDocsByKey.set(entry.key, {
-                    sequence: entry.sequence,
-                    value: entry.value,
-                    deleted: entry.deleted,
-                });
-            }
-        }
-    }
+    const adventureDocsByKey = collectLatestEntriesByPrefix(ldbBuffers, '!adventures!');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sceneMap = new Map<string, any>();
