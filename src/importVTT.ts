@@ -2017,6 +2017,28 @@ function rotatePointAroundOrigin(point: Vector2, origin: Vector2, degrees: numbe
     };
 }
 
+function compensateForCenterAnchoredRotation(
+    basePosition: Vector2,
+    localCenter: Vector2,
+    rotation: number
+): Vector2 {
+    const normalizedRotation = normalizeDegrees(rotation);
+    if (normalizedRotation === 0) {
+        return basePosition;
+    }
+
+    const rotatedCenter = rotatePointAroundOrigin(
+        localCenter,
+        { x: 0, y: 0 },
+        normalizedRotation
+    );
+
+    return {
+        x: basePosition.x + localCenter.x - rotatedCenter.x,
+        y: basePosition.y + localCenter.y - rotatedCenter.y,
+    };
+}
+
 function applyMapRotationToImportedItems(
     items: Item[],
     mapOrigin: Vector2,
@@ -2505,115 +2527,129 @@ async function prepareMapSources(
                 })),
     });
 
-const scale = clampPositiveNumber(options.scale, 1);
-const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
-const shouldSnapToGrid = options.snapToGrid ?? true;
-const layout = options.layout ?? 'GRID';
+    const scale = clampPositiveNumber(options.scale, 1);
+    const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
+    const shouldSnapToGrid = options.snapToGrid ?? true;
+    const layout = options.layout ?? 'GRID';
 
-const displayWidths = selectedWithMetadata.map(({ selectedImage }) => {
-    const entry = selectedImage;
-    const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
-    return (entry.image.width * targetDpi / sourceDpi) * scale;
-});
-const displayHeights = selectedWithMetadata.map(({ selectedImage }) => {
-    const entry = selectedImage;
-    const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
-    return (entry.image.height * targetDpi / sourceDpi) * scale;
-});
-const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing, targetDpi, shouldSnapToGrid);
+    const displayWidths = selectedWithMetadata.map(({ selectedImage }) => {
+        const entry = selectedImage;
+        const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
+        return (entry.image.width * targetDpi / sourceDpi) * scale;
+    });
+    const displayHeights = selectedWithMetadata.map(({ selectedImage }) => {
+        const entry = selectedImage;
+        const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
+        return (entry.image.height * targetDpi / sourceDpi) * scale;
+    });
+    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing, targetDpi, shouldSnapToGrid);
 
-if (onProgress) {
-    onProgress(92);
-}
-
-return selectedWithMetadata.map(({ selectedImage, sourceMeta, metadataMatched }, index) => {
-
-    if (!sourceMeta) {
-        console.warn(`No metadata match found for selected map "${selectedImage.name}". Importing without wall data.`);
+    if (onProgress) {
+        onProgress(92);
     }
 
-    const sourceDpi = clampPositiveNumber(selectedImage.grid?.dpi, 100);
-    const mapPlacement = sourceMeta?.mapPlacement;
-    let position = positions[index];
-    let resolvedScale: Vector2 = { x: 1, y: 1 };
-    let resolvedRotation = 0;
-    let resolvedZIndex: number | undefined = undefined;
-
-    if (mapPlacement) {
-        const targetDpiRatio = targetDpi / sourceDpi;
-        const mappedX = typeof mapPlacement.x === 'number' && Number.isFinite(mapPlacement.x)
-            ? mapPlacement.x * targetDpiRatio
-            : undefined;
-        const mappedY = typeof mapPlacement.y === 'number' && Number.isFinite(mapPlacement.y)
-            ? mapPlacement.y * targetDpiRatio
-            : undefined;
-        if (typeof mappedX === 'number' || typeof mappedY === 'number') {
-            position = {
-                x: typeof mappedX === 'number' ? mappedX : position.x,
-                y: typeof mappedY === 'number' ? mappedY : position.y,
-            };
+    return selectedWithMetadata.map(({ selectedImage, sourceMeta, metadataMatched }, index) => {
+        if (!sourceMeta) {
+            console.warn(`No metadata match found for selected map "${selectedImage.name}". Importing without wall data.`);
         }
 
+        const sourceDpi = clampPositiveNumber(selectedImage.grid?.dpi, 100);
+        const mapPlacement = sourceMeta?.mapPlacement;
+        let position = positions[index];
+        let resolvedScale: Vector2 = { x: 1, y: 1 };
+        let resolvedRotation = 0;
+        let resolvedZIndex: number | undefined = undefined;
         const baseWidth = (selectedImage.image.width * targetDpi) / sourceDpi;
         const baseHeight = (selectedImage.image.height * targetDpi) / sourceDpi;
-        const targetWidth = typeof mapPlacement.targetWidth === 'number' && Number.isFinite(mapPlacement.targetWidth)
-            ? mapPlacement.targetWidth * targetDpiRatio
-            : undefined;
-        const targetHeight = typeof mapPlacement.targetHeight === 'number' && Number.isFinite(mapPlacement.targetHeight)
-            ? mapPlacement.targetHeight * targetDpiRatio
-            : undefined;
-        const widthScale = targetWidth && baseWidth > 0 ? targetWidth / baseWidth : undefined;
-        const heightScale = targetHeight && baseHeight > 0 ? targetHeight / baseHeight : undefined;
-        const explicitScaleX = typeof mapPlacement.scaleX === 'number' && Number.isFinite(mapPlacement.scaleX)
-            ? mapPlacement.scaleX
-            : undefined;
-        const explicitScaleY = typeof mapPlacement.scaleY === 'number' && Number.isFinite(mapPlacement.scaleY)
-            ? mapPlacement.scaleY
-            : undefined;
-        resolvedScale = {
-            x: widthScale ?? explicitScaleX ?? 1,
-            y: heightScale ?? explicitScaleY ?? 1,
-        };
 
-        if (typeof mapPlacement.rotation === 'number' && Number.isFinite(mapPlacement.rotation)) {
-            resolvedRotation = mapPlacement.rotation;
+        if (mapPlacement) {
+            const targetDpiRatio = targetDpi / sourceDpi;
+            const mappedX = typeof mapPlacement.x === 'number' && Number.isFinite(mapPlacement.x)
+                ? mapPlacement.x * targetDpiRatio
+                : undefined;
+            const mappedY = typeof mapPlacement.y === 'number' && Number.isFinite(mapPlacement.y)
+                ? mapPlacement.y * targetDpiRatio
+                : undefined;
+            if (typeof mappedX === 'number' || typeof mappedY === 'number') {
+                position = {
+                    x: typeof mappedX === 'number' ? mappedX : position.x,
+                    y: typeof mappedY === 'number' ? mappedY : position.y,
+                };
+            }
+
+            const targetWidth = typeof mapPlacement.targetWidth === 'number' && Number.isFinite(mapPlacement.targetWidth)
+                ? mapPlacement.targetWidth * targetDpiRatio
+                : undefined;
+            const targetHeight = typeof mapPlacement.targetHeight === 'number' && Number.isFinite(mapPlacement.targetHeight)
+                ? mapPlacement.targetHeight * targetDpiRatio
+                : undefined;
+            const widthScale = targetWidth && baseWidth > 0 ? targetWidth / baseWidth : undefined;
+            const heightScale = targetHeight && baseHeight > 0 ? targetHeight / baseHeight : undefined;
+            const explicitScaleX = typeof mapPlacement.scaleX === 'number' && Number.isFinite(mapPlacement.scaleX)
+                ? mapPlacement.scaleX
+                : undefined;
+            const explicitScaleY = typeof mapPlacement.scaleY === 'number' && Number.isFinite(mapPlacement.scaleY)
+                ? mapPlacement.scaleY
+                : undefined;
+            resolvedScale = {
+                x: widthScale ?? explicitScaleX ?? 1,
+                y: heightScale ?? explicitScaleY ?? 1,
+            };
+
+            if (typeof mapPlacement.rotation === 'number' && Number.isFinite(mapPlacement.rotation)) {
+                resolvedRotation = mapPlacement.rotation;
+            }
+            const elevation = typeof mapPlacement.elevation === 'number' && Number.isFinite(mapPlacement.elevation)
+                ? mapPlacement.elevation
+                : 0;
+            const z = typeof mapPlacement.z === 'number' && Number.isFinite(mapPlacement.z)
+                ? mapPlacement.z
+                : 0;
+            const sort = typeof mapPlacement.sort === 'number' && Number.isFinite(mapPlacement.sort)
+                ? mapPlacement.sort
+                : (typeof mapPlacement.zIndex === 'number' && Number.isFinite(mapPlacement.zIndex)
+                    ? mapPlacement.zIndex
+                    : 0);
+            const orderIndex = typeof mapPlacement.orderIndex === 'number' && Number.isFinite(mapPlacement.orderIndex)
+                ? mapPlacement.orderIndex
+                : index;
+            // Foundry stacks by several depth hints (elevation + z/sort + draw order).
+            // Collapse these into one deterministic OBR z-index.
+            resolvedZIndex = Math.round(
+                elevation * 1_000_000 +
+                z * 1_000 +
+                sort * 10 +
+                orderIndex
+            );
         }
-        const elevation = typeof mapPlacement.elevation === 'number' && Number.isFinite(mapPlacement.elevation)
-            ? mapPlacement.elevation
-            : 0;
-        const z = typeof mapPlacement.z === 'number' && Number.isFinite(mapPlacement.z)
-            ? mapPlacement.z
-            : 0;
-        const sort = typeof mapPlacement.sort === 'number' && Number.isFinite(mapPlacement.sort)
-            ? mapPlacement.sort
-            : (typeof mapPlacement.zIndex === 'number' && Number.isFinite(mapPlacement.zIndex)
-                ? mapPlacement.zIndex
-                : 0);
-        const orderIndex = typeof mapPlacement.orderIndex === 'number' && Number.isFinite(mapPlacement.orderIndex)
-            ? mapPlacement.orderIndex
-            : index;
-        // Foundry stacks by several depth hints (elevation + z/sort + draw order).
-        // Collapse these into one deterministic OBR z-index.
-        resolvedZIndex = Math.round(
-            elevation * 1_000_000 +
-            z * 1_000 +
-            sort * 10 +
-            orderIndex
-        );
-    }
 
-    return {
-        displayName: selectedImage.name || sourceMeta?.displayName || `Map ${index + 1}`,
-        metadataMatched,
-        wallData: sourceMeta?.wallData,
-        image: selectedImage.image,
-        grid: selectedImage.grid,
-        position,
-        rotation: resolvedRotation,
-        scale: resolvedScale,
-        zIndex: resolvedZIndex,
-    };
-});
+        if (
+            Number.isFinite(resolvedRotation)
+            && normalizeDegrees(resolvedRotation) !== 0
+            && Number.isFinite(baseWidth)
+            && Number.isFinite(baseHeight)
+            && baseWidth > 0
+            && baseHeight > 0
+        ) {
+            const localCenter = {
+                x: (baseWidth * Math.abs(resolvedScale.x) * scale) / 2,
+                y: (baseHeight * Math.abs(resolvedScale.y) * scale) / 2,
+            };
+            position = compensateForCenterAnchoredRotation(position, localCenter, resolvedRotation);
+        }
+
+        return {
+            displayName: selectedImage.name || sourceMeta?.displayName || `Map ${index + 1}`,
+            metadataMatched,
+            wallData: sourceMeta?.wallData,
+            image: selectedImage.image,
+            grid: selectedImage.grid,
+            position,
+            rotation: resolvedRotation,
+            scale: resolvedScale,
+            zIndex: resolvedZIndex,
+        };
+    });
 }
 
 export async function addMapsToCurrentScene(
