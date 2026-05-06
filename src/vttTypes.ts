@@ -10,10 +10,40 @@ export interface VTTLight {
     vision?: boolean;
 }
 
+export type VTTDrawingType = "RECTANGLE" | "ELLIPSE" | "POLYGON" | "FREEHAND" | "TEXT";
+
+export interface VTTDrawing {
+    id?: string;
+    type: VTTDrawingType;
+    x: number;
+    y: number;
+    width?: number;
+    height?: number;
+    radius?: number;
+    points?: number[];
+    rotation?: number;
+    hidden?: boolean;
+    locked?: boolean;
+    zIndex?: number;
+    fillColor?: string;
+    fillOpacity?: number;
+    strokeColor?: string;
+    strokeOpacity?: number;
+    strokeWidth?: number;
+    text?: string;
+    textColor?: string;
+    textOpacity?: number;
+    fontFamily?: string;
+    fontSize?: number;
+    textHasShapeDecoration?: boolean;
+    bezierFactor?: number;
+}
+
 export interface VTTMapData {
     line_of_sight: Vector2[][];
     objects_line_of_sight: Vector2[][];
     lights?: VTTLight[];
+    drawings?: VTTDrawing[];
     portals?: {
         position: { x: number; y: number };
         bounds: Vector2[];
@@ -68,6 +98,45 @@ export interface FoundryVTTLight {
     attenuation?: number;
 }
 
+export interface FoundryShapeData {
+    type?: string;
+    width?: number;
+    height?: number;
+    radius?: number;
+    points?: number[] | Array<number[]>;
+}
+
+export interface FoundryVTTDrawing {
+    _id?: string | null;
+    type?: string;
+    t?: string;
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    points?: number[] | Array<number[]>;
+    shape?: FoundryShapeData;
+    rotation?: number;
+    elevation?: number;
+    sort?: number;
+    z?: number;
+    hidden?: boolean;
+    locked?: boolean;
+    fillType?: number;
+    fillColor?: string | number;
+    fillAlpha?: number;
+    strokeWidth?: number;
+    strokeColor?: string | number;
+    strokeAlpha?: number;
+    text?: string;
+    textColor?: string | number;
+    textAlpha?: number;
+    fontFamily?: string;
+    fontSize?: number;
+    bezierFactor?: number;
+    texture?: string;
+}
+
 export interface FoundryVTTData {
     name: string;
     width: number;
@@ -85,6 +154,7 @@ export interface FoundryVTTData {
     };
     walls?: FoundryVTTWall[];
     lights?: FoundryVTTLight[];
+    drawings?: Array<FoundryVTTDrawing | string>;
 }
 
 export interface UniversalVTT extends VTTMapData {

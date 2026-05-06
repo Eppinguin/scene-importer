@@ -393,9 +393,36 @@ export function extractScenesFromLevelDB(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): any[] {
     const sceneDocsByKey = collectLatestEntriesByPrefix(ldbBuffers, '!scenes!');
+    const sceneScopedEntriesByBuffer = ldbBuffers.map((buffer) =>
+        parseSSTTableEntries(buffer, '!scenes')
+    );
+
+    type EmbeddedSceneCollectionKind = 'tiles' | 'walls' | 'lights' | 'drawings';
+
+    const parseEmbeddedSceneCollectionKey = (
+        key: string,
+        collection: EmbeddedSceneCollectionKind
+    ): { sceneId: string; docId: string } | null => {
+        const escapedCollection = collection.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const patterns = [
+            new RegExp(`^!scenes\\.${escapedCollection}!(?<sceneId>[^.]+)\\.(?<docId>.+)$`),
+            new RegExp(`^!scenes\\.${escapedCollection}\\.(?<sceneId>[^.]+)\\.(?<docId>.+)$`),
+            new RegExp(`^!scenes!(?<sceneId>[^.]+)\\.${escapedCollection}\\.(?<docId>.+)$`),
+            new RegExp(`^!scenes!(?<sceneId>[^!]+)!${escapedCollection}!(?<docId>.+)$`),
+        ];
+        for (const pattern of patterns) {
+            const match = key.match(pattern);
+            const sceneId = match?.groups?.sceneId?.trim();
+            const docId = match?.groups?.docId?.trim();
+            if (sceneId && docId) {
+                return { sceneId, docId };
+            }
+        }
+        return null;
+    };
 
     const extractEmbeddedSceneCollection = (
-        keyPrefix: string
+        collection: EmbeddedSceneCollectionKind
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ): Map<string, any[]> => {
         const docsByKey = new Map<string, {
@@ -404,8 +431,7 @@ export function extractScenesFromLevelDB(
             deleted: boolean;
         }>();
 
-        for (const buffer of ldbBuffers) {
-            const entries = parseSSTTableEntries(buffer, keyPrefix);
+        for (const entries of sceneScopedEntriesByBuffer) {
             for (const entry of entries) {
                 const current = docsByKey.get(entry.key);
                 if (!current || entry.sequence > current.sequence) {
@@ -422,15 +448,9 @@ export function extractScenesFromLevelDB(
         const grouped = new Map<string, Map<string, any>>();
         for (const [key, entry] of docsByKey) {
             if (entry.deleted || entry.value === null) continue;
-            if (!key.startsWith(keyPrefix)) continue;
-
-            const suffix = key.slice(keyPrefix.length);
-            const firstDot = suffix.indexOf('.');
-            if (firstDot <= 0 || firstDot >= suffix.length - 1) continue;
-
-            const sceneId = suffix.slice(0, firstDot);
-            const docId = suffix.slice(firstDot + 1);
-            if (!sceneId || !docId) continue;
+            const keyParts = parseEmbeddedSceneCollectionKey(key, collection);
+            if (!keyParts) continue;
+            const { sceneId, docId } = keyParts;
 
             try {
                 const parsed = JSON.parse(entry.value);
@@ -450,8 +470,138 @@ export function extractScenesFromLevelDB(
         return result;
     };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const hydrateReferenceCollection = (rawCollection: unknown, embedded: any[] | undefined): any[] | undefined => {
+    const doesDocumentBelongToScene = (doc: unknown, sceneId: string): boolean => {
+        if (!doc || typeof doc !== 'object') return false;
+        const candidate = doc as {
+            scene?: unknown;
+            sceneId?: unknown;
+            _scene?: unknown;
+            parent?: unknown;
+            _parent?: unknown;
+            parentId?: unknown;
+            flags?: { core?: { sourceId?: unknown } };
+        };
+
+        const parentCandidates = [
+            candidate.scene,
+            candidate.sceneId,
+            candidate._scene,
+            candidate.parent,
+            candidate._parent,
+            candidate.parentId,
+        ];
+
+        for (const parentCandidate of parentCandidates) {
+            if (typeof parentCandidate === 'string' && parentCandidate.trim() === sceneId) {
+                return true;
+            }
+            if (
+                parentCandidate &&
+                typeof parentCandidate === 'object' &&
+                typeof (parentCandidate as { _id?: unknown })._id === 'string' &&
+                ((parentCandidate as { _id?: string })._id ?? '').trim() === sceneId
+            ) {
+                return true;
+            }
+        }
+
+        const sourceId = candidate.flags?.core?.sourceId;
+        if (typeof sourceId === 'string' && sourceId.includes(`Scene.${sceneId}`)) {
+            return true;
+        }
+
+        return false;
+    };
+
+    const isLikelyEmbeddedDocKind = (
+        doc: unknown,
+        kind: EmbeddedSceneCollectionKind
+    ): boolean => {
+        if (!doc || typeof doc !== 'object') return false;
+        const candidate = doc as {
+            c?: unknown;
+            door?: unknown;
+            ds?: unknown;
+            x?: unknown;
+            y?: unknown;
+            config?: unknown;
+            bright?: unknown;
+            dim?: unknown;
+            angle?: unknown;
+            img?: unknown;
+            texture?: { src?: unknown };
+            shape?: unknown;
+            text?: unknown;
+            points?: unknown;
+            strokeWidth?: unknown;
+            fillColor?: unknown;
+            strokeColor?: unknown;
+        };
+
+        if (kind === 'walls') {
+            if (Array.isArray(candidate.c) && candidate.c.length >= 4) return true;
+            if (typeof candidate.door === 'number' || typeof candidate.ds === 'number') return true;
+            return false;
+        }
+        if (kind === 'lights') {
+            if (typeof candidate.x !== 'number' || typeof candidate.y !== 'number') return false;
+            return (
+                typeof candidate.config === 'object'
+                || typeof candidate.bright === 'number'
+                || typeof candidate.dim === 'number'
+                || typeof candidate.angle === 'number'
+            );
+        }
+        if (kind === 'tiles') {
+            return (
+                (typeof candidate.img === 'string' && candidate.img.trim().length > 0)
+                || (typeof candidate.texture?.src === 'string' && candidate.texture.src.trim().length > 0)
+            );
+        }
+        // drawings
+        return (
+            typeof candidate.shape === 'object'
+            || typeof candidate.text === 'string'
+            || Array.isArray(candidate.points)
+            || typeof candidate.strokeWidth === 'number'
+            || typeof candidate.fillColor !== 'undefined'
+            || typeof candidate.strokeColor !== 'undefined'
+        );
+    };
+
+    let allDocsById: Map<string, unknown[]> | null = null;
+    const ensureAllDocsById = (): Map<string, unknown[]> => {
+        if (allDocsById) {
+            return allDocsById;
+        }
+
+        const indexedDocsById = new Map<string, unknown[]>();
+        const allDocsByKey = collectLatestEntriesByPrefix(ldbBuffers, '!');
+        for (const entry of allDocsByKey.values()) {
+            if (entry.deleted || entry.value === null) continue;
+            try {
+                const parsed = JSON.parse(entry.value) as { _id?: unknown };
+                if (!parsed || typeof parsed !== 'object') continue;
+                const docId = typeof parsed._id === 'string' ? parsed._id.trim() : '';
+                if (!docId) continue;
+                const docs = indexedDocsById.get(docId) ?? [];
+                docs.push(parsed);
+                indexedDocsById.set(docId, docs);
+            } catch {
+                // Ignore non-JSON documents.
+            }
+        }
+
+        allDocsById = indexedDocsById;
+        return indexedDocsById;
+    };
+
+    const hydrateReferenceCollection = (
+        rawCollection: unknown,
+        embedded: unknown[] | undefined,
+        sceneId: string,
+        kind: EmbeddedSceneCollectionKind
+    ): unknown[] | undefined => {
         if (!Array.isArray(rawCollection) && (!embedded || embedded.length === 0)) {
             return undefined;
         }
@@ -481,7 +631,17 @@ export function extractScenesFromLevelDB(
                     hydrated.push(embeddedDoc);
                     seenDocIds.add(ref);
                 } else {
-                    hydrated.push(ref);
+                    const globalDocsById = ensureAllDocsById();
+                    const globalCandidates = globalDocsById.get(ref) ?? [];
+                    const fallback = globalCandidates.find((doc) =>
+                        isLikelyEmbeddedDocKind(doc, kind) && doesDocumentBelongToScene(doc, sceneId)
+                    );
+                    if (fallback) {
+                        hydrated.push(fallback);
+                        seenDocIds.add(ref);
+                    } else {
+                        hydrated.push(ref);
+                    }
                 }
                 continue;
             }
@@ -503,9 +663,10 @@ export function extractScenesFromLevelDB(
         return hydrated;
     };
 
-    const sceneTilesBySceneId = extractEmbeddedSceneCollection('!scenes.tiles!');
-    const sceneWallsBySceneId = extractEmbeddedSceneCollection('!scenes.walls!');
-    const sceneLightsBySceneId = extractEmbeddedSceneCollection('!scenes.lights!');
+    const sceneTilesBySceneId = extractEmbeddedSceneCollection('tiles');
+    const sceneWallsBySceneId = extractEmbeddedSceneCollection('walls');
+    const sceneLightsBySceneId = extractEmbeddedSceneCollection('lights');
+    const sceneDrawingsBySceneId = extractEmbeddedSceneCollection('drawings');
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sceneMap = new Map<string, any>();
@@ -520,9 +681,10 @@ export function extractScenesFromLevelDB(
             // Use _id or the key suffix as the unique identifier
             const id = scene._id || key.replace('!scenes!', '');
             if (typeof id === 'string' && id.trim().length > 0) {
-                scene.tiles = hydrateReferenceCollection(scene.tiles, sceneTilesBySceneId.get(id)) ?? scene.tiles;
-                scene.walls = hydrateReferenceCollection(scene.walls, sceneWallsBySceneId.get(id)) ?? scene.walls;
-                scene.lights = hydrateReferenceCollection(scene.lights, sceneLightsBySceneId.get(id)) ?? scene.lights;
+                scene.tiles = hydrateReferenceCollection(scene.tiles, sceneTilesBySceneId.get(id), id, 'tiles') ?? scene.tiles;
+                scene.walls = hydrateReferenceCollection(scene.walls, sceneWallsBySceneId.get(id), id, 'walls') ?? scene.walls;
+                scene.lights = hydrateReferenceCollection(scene.lights, sceneLightsBySceneId.get(id), id, 'lights') ?? scene.lights;
+                scene.drawings = hydrateReferenceCollection(scene.drawings, sceneDrawingsBySceneId.get(id), id, 'drawings') ?? scene.drawings;
             }
             sceneMap.set(id, scene);
         } catch {

@@ -104,17 +104,32 @@ const PREVIEW_TOUCH_RELEASE_THRESHOLD_MS = 120;
 
 const showMapWorkflowMismatchWarning = async (
   result: MapWorkflowResult,
-  options: { includeWalls: boolean; includeLights: boolean },
+  options: {
+    includeWalls: boolean;
+    includeDrawings: boolean;
+    includeLights: boolean;
+  },
 ) => {
-  if (!options.includeWalls && !options.includeLights) return;
+  const enabledFeatureLabels: string[] = [];
+  if (options.includeWalls) enabledFeatureLabels.push("walls/doors");
+  if (options.includeDrawings) enabledFeatureLabels.push("drawings/text");
+  if (options.includeLights) enabledFeatureLabels.push("lights");
+  if (enabledFeatureLabels.length === 0) return;
   if (result.unmatchedSelectionNames.length === 0) return;
 
   const unmatchedCount = result.unmatchedSelectionNames.length;
   const preview = result.unmatchedSelectionNames.slice(0, 3).join(", ");
   const moreSuffix = unmatchedCount > 3 ? ` (+${unmatchedCount - 3} more)` : "";
+  const skippedFeatureSummary =
+    enabledFeatureLabels.length === 1
+      ? enabledFeatureLabels[0]
+      : enabledFeatureLabels.length === 2
+        ? `${enabledFeatureLabels[0]} or ${enabledFeatureLabels[1]}`
+        : `${enabledFeatureLabels.slice(0, -1).join(", ")}, or ${enabledFeatureLabels[enabledFeatureLabels.length - 1]}`;
+  const skippedVerb = enabledFeatureLabels.length === 1 ? "was" : "were";
 
   await OBR.notification.show(
-    `${unmatchedCount} selected map(s) did not match uploaded metadata, so walls/doors/lights were skipped for those maps. ${preview}${moreSuffix}`,
+    `${unmatchedCount} selected map(s) did not match uploaded metadata, so ${skippedFeatureSummary} ${skippedVerb} skipped for those maps. ${preview}${moreSuffix}`,
     "WARNING",
   );
 };
@@ -184,6 +199,16 @@ const sceneHasLightData = (sceneData: SceneData): boolean => {
   return Array.isArray(vttData.lights) && vttData.lights.length > 0;
 };
 
+const sceneHasDrawingsData = (sceneData: SceneData): boolean => {
+  if (isFoundryVTTData(sceneData)) {
+    const foundryDrawings = (sceneData as { drawings?: unknown[] }).drawings;
+    return Array.isArray(foundryDrawings) && foundryDrawings.length > 0;
+  }
+
+  const vttData = sceneData as Partial<VTTMapData>;
+  return Array.isArray(vttData.drawings) && vttData.drawings.length > 0;
+};
+
 const wallDataHasLights = (wallData: CompanionWallData | null): boolean => {
   if (!wallData) return false;
   if (isFoundryVTTData(wallData)) {
@@ -191,6 +216,15 @@ const wallDataHasLights = (wallData: CompanionWallData | null): boolean => {
     return Array.isArray(foundryLights) && foundryLights.length > 0;
   }
   return Array.isArray(wallData.lights) && wallData.lights.length > 0;
+};
+
+const wallDataHasDrawings = (wallData: CompanionWallData | null): boolean => {
+  if (!wallData) return false;
+  if (isFoundryVTTData(wallData)) {
+    const foundryDrawings = (wallData as { drawings?: unknown[] }).drawings;
+    return Array.isArray(foundryDrawings) && foundryDrawings.length > 0;
+  }
+  return Array.isArray(wallData.drawings) && wallData.drawings.length > 0;
 };
 
 const wallDataHasWallsOrDoors = (
@@ -321,6 +355,7 @@ function App() {
   const [layoutScalePercent, setLayoutScalePercent] = useState("100");
   const [includeMapImages, setIncludeMapImages] = useState(true);
   const [includeWallsWithMaps, setIncludeWallsWithMaps] = useState(true);
+  const [includeImportedDrawings, setIncludeImportedDrawings] = useState(true);
   const [includeImportedLights, setIncludeImportedLights] = useState(true);
   const [importedLightType, setImportedLightType] = useState<
     "AUTO" | "PRIMARY" | "SECONDARY" | "AUXILIARY"
@@ -357,6 +392,7 @@ function App() {
   const [hasImage, setHasImage] = useState(false);
   const [selectedFileHasWallsOrDoors, setSelectedFileHasWallsOrDoors] =
     useState(false);
+  const [selectedFileHasDrawings, setSelectedFileHasDrawings] = useState(false);
   const [selectedFileHasLights, setSelectedFileHasLights] = useState(false);
   const [compressionMode, setCompressionMode] =
     useState<CompressionMode>("standard");
@@ -457,11 +493,13 @@ function App() {
     [sceneGroupingItems],
   );
   const foundryFolderTree = useMemo(
-    () => buildFolderTree(availableSceneFolders, sceneGroupingItemsInFoundryOrder),
+    () =>
+      buildFolderTree(availableSceneFolders, sceneGroupingItemsInFoundryOrder),
     [availableSceneFolders, sceneGroupingItemsInFoundryOrder],
   );
   const groupedScenesByFolder = useMemo(
-    () => groupScenesByFolder(sceneGroupingItemsInFoundryOrder, foundryFolderTree),
+    () =>
+      groupScenesByFolder(sceneGroupingItemsInFoundryOrder, foundryFolderTree),
     [sceneGroupingItemsInFoundryOrder, foundryFolderTree],
   );
   const filteredGroupedScenes = useMemo(
@@ -532,14 +570,23 @@ function App() {
     hasImage;
   const hasArchiveMapSources =
     availableScenes.length > 0 &&
-    selectedScenes.some((scene) => getSceneMapImagePaths(scene.data).length > 0);
+    selectedScenes.some(
+      (scene) => getSceneMapImagePaths(scene.data).length > 0,
+    );
   const hasArchiveLightSources =
     availableScenes.length > 0 &&
     selectedScenes.some((scene) => sceneHasLightData(scene.data));
+  const hasArchiveDrawingSources =
+    availableScenes.length > 0 &&
+    selectedScenes.some((scene) => sceneHasDrawingsData(scene.data));
   const hasCompanionWallData = wallDataHasWallsOrDoors(selectedWallData);
+  const hasCompanionDrawingData = wallDataHasDrawings(selectedWallData);
   const hasCompanionLightData = wallDataHasLights(selectedWallData);
   const hasPairedImportWallData = selectedPairedImports.some((selection) =>
     wallDataHasWallsOrDoors(selection.wallData),
+  );
+  const hasPairedImportDrawingData = selectedPairedImports.some((selection) =>
+    wallDataHasDrawings(selection.wallData),
   );
   const hasPairedImportLightData = selectedPairedImports.some(
     (selection) =>
@@ -548,6 +595,8 @@ function App() {
   );
   const hasStandaloneFileLightData =
     !!selectedFile && !isRawMediaFile(selectedFile) && selectedFileHasLights;
+  const hasStandaloneFileDrawingData =
+    !!selectedFile && !isRawMediaFile(selectedFile) && selectedFileHasDrawings;
   const hasStandaloneFileWallData =
     !!selectedFile &&
     !isRawMediaFile(selectedFile) &&
@@ -570,11 +619,14 @@ function App() {
     selectedScenes.some(
       (scene) =>
         (includeWallsWithMaps && sceneHasWallsOrDoors(scene.data)) ||
+        (includeImportedDrawings && sceneHasDrawingsData(scene.data)) ||
         (includeImportedLights && sceneHasLightData(scene.data)),
     );
   const selectedSceneHasMap =
     availableScenes.length === 0 ||
-    selectedScenes.some((scene) => getSceneMapImagePaths(scene.data).length > 0);
+    selectedScenes.some(
+      (scene) => getSceneMapImagePaths(scene.data).length > 0,
+    );
   const selectedSceneIsVideo = selectedScenes.some((scene) => !!scene.isVideo);
   const selectedPairedImportsContainVideo = selectedPairedImports.some(
     (selection) => selection.isVideo,
@@ -618,10 +670,17 @@ function App() {
     hasCompanionWallData ||
     hasPairedImportWallData ||
     hasStandaloneFileWallData;
+  const hasDrawingImportSources =
+    hasArchiveDrawingSources ||
+    hasCompanionDrawingData ||
+    hasPairedImportDrawingData ||
+    hasStandaloneFileDrawingData;
   const wantsMapImport = includeMapImages && hasMapWorkflowSources;
   const wantsWallDoorImport = includeWallsWithMaps && hasWallImportSources;
+  const wantsDrawingImport = includeImportedDrawings && hasDrawingImportSources;
   const wantsLightImport = includeImportedLights && hasLightImportSources;
-  const wantsFogFeatureImport = wantsWallDoorImport || wantsLightImport;
+  const wantsFogFeatureImport =
+    wantsWallDoorImport || wantsDrawingImport || wantsLightImport;
   const canImportToCurrentScene = wantsMapImport || wantsFogFeatureImport;
   const canCreateNewScene =
     !isContextMenuMode &&
@@ -645,12 +704,16 @@ function App() {
   const videoCompressionBlocked =
     selectedInputIsVideo && !isVideoCompressionSupported;
   const shouldShowImportOptionsPanel = isContextMenuMode
-    ? hasWallImportSources || hasLightImportSources
-    : hasImage || hasWallImportSources || hasLightImportSources;
+    ? hasWallImportSources || hasDrawingImportSources || hasLightImportSources
+    : hasImage ||
+      hasWallImportSources ||
+      hasDrawingImportSources ||
+      hasLightImportSources;
   const hasQuickImportOptions = includeMapImages && hasImage;
   const hasAdvancedOptionContent =
     hasMapWorkflowSources ||
     hasWallImportSources ||
+    hasDrawingImportSources ||
     hasLightImportSources ||
     hasImage;
   const containerClassName = `container ${isContextMenuMode ? "context-mode" : "action-mode"} ${availableScenes.length > 0 ? "has-scenes" : ""}`;
@@ -1013,7 +1076,9 @@ function App() {
       for (const folderId of validFolderIds) {
         const previousValue = previous[folderId];
         nextState[folderId] =
-          previousValue !== undefined ? previousValue : rootFolderIds.has(folderId);
+          previousValue !== undefined
+            ? previousValue
+            : rootFolderIds.has(folderId);
       }
       if (previous[UNGROUPED_FOLDER_ID] !== undefined) {
         nextState[UNGROUPED_FOLDER_ID] = previous[UNGROUPED_FOLDER_ID];
@@ -1176,6 +1241,7 @@ function App() {
         resetMapWorkflowState();
         setIsFoundryFormat(true);
         setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasDrawings(false);
         setSelectedFileHasLights(false);
         const firstScene = sceneList[0].data;
         setHasImage(getSceneMapImagePaths(firstScene).length > 0);
@@ -1191,6 +1257,7 @@ function App() {
         setSelectedPairedImports([]);
         resetMapWorkflowState();
         setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasDrawings(false);
         setSelectedFileHasLights(false);
       }
     } catch (e) {
@@ -1205,6 +1272,7 @@ function App() {
       setSelectedPairedImports([]);
       resetMapWorkflowState();
       setSelectedFileHasWallsOrDoors(false);
+      setSelectedFileHasDrawings(false);
       setSelectedFileHasLights(false);
     }
     setIsLoading(false);
@@ -1299,9 +1367,15 @@ function App() {
         ((fileData as { lights?: unknown[] }).lights?.length ?? 0) > 0
       : Array.isArray((fileData as Partial<VTTMapData>).lights) &&
         ((fileData as Partial<VTTMapData>).lights?.length ?? 0) > 0;
+    const fileHasDrawings = foundryFormat
+      ? Array.isArray((fileData as { drawings?: unknown[] }).drawings) &&
+        ((fileData as { drawings?: unknown[] }).drawings?.length ?? 0) > 0
+      : Array.isArray((fileData as Partial<VTTMapData>).drawings) &&
+        ((fileData as Partial<VTTMapData>).drawings?.length ?? 0) > 0;
     setIsFoundryFormat(foundryFormat);
     setHasImage(imageExists);
     setSelectedFileHasWallsOrDoors(fileHasWallsOrDoors);
+    setSelectedFileHasDrawings(fileHasDrawings);
     setSelectedFileHasLights(fileHasLights);
 
     const fileObj =
@@ -1441,12 +1515,14 @@ function App() {
       ? source.objects_line_of_sight
       : [];
     const portals = Array.isArray(source.portals) ? source.portals : [];
+    const drawings = Array.isArray(source.drawings) ? source.drawings : [];
     const lights = Array.isArray(source.lights) ? source.lights : [];
 
     if (
       lineOfSight.length === 0 &&
       objectLineOfSight.length === 0 &&
       portals.length === 0 &&
+      drawings.length === 0 &&
       lights.length === 0
     ) {
       return null;
@@ -1456,6 +1532,7 @@ function App() {
       line_of_sight: lineOfSight,
       objects_line_of_sight: objectLineOfSight,
       portals,
+      drawings,
       lights,
       resolution: {
         map_origin: { x: mapOriginX, y: mapOriginY },
@@ -1491,6 +1568,7 @@ function App() {
     setIsFoundryFormat(false);
     setHasImage(true);
     setSelectedFileHasWallsOrDoors(false);
+    setSelectedFileHasDrawings(false);
     setSelectedFileHasLights(false);
     setAvailableScenes([]);
     setSelectedSceneIndices([]);
@@ -1662,6 +1740,7 @@ function App() {
           setIsFoundryFormat(false);
           setHasImage(true);
           setSelectedFileHasWallsOrDoors(false);
+          setSelectedFileHasDrawings(false);
           setSelectedFileHasLights(false);
           return;
         } catch (error) {
@@ -1699,6 +1778,7 @@ function App() {
       setIsFoundryFormat(false);
       setHasImage(true);
       setSelectedFileHasWallsOrDoors(false);
+      setSelectedFileHasDrawings(false);
       setSelectedFileHasLights(false);
       return;
     }
@@ -1771,6 +1851,7 @@ function App() {
           setIsFoundryFormat(false);
           setHasImage(false);
           setSelectedFileHasWallsOrDoors(false);
+          setSelectedFileHasDrawings(false);
           setSelectedFileHasLights(false);
         }
       } else {
@@ -1788,6 +1869,7 @@ function App() {
         setIsFoundryFormat(false);
         setHasImage(false);
         setSelectedFileHasWallsOrDoors(false);
+        setSelectedFileHasDrawings(false);
         setSelectedFileHasLights(false);
       }
     }
@@ -1874,6 +1956,7 @@ function App() {
       snapToGrid,
       includeMapImages,
       includeWallsWithMaps,
+      includeImportedDrawings,
       includeImportedLights,
       importedLightType,
       lightShadowDetail,
@@ -1946,7 +2029,9 @@ function App() {
     }
 
     if (availableScenes.length > 0) {
-      return buildArchiveSceneMapImportSources(selectedScenes);
+      const archiveSources =
+        await buildArchiveSceneMapImportSources(selectedScenes);
+      return archiveSources;
     }
 
     const mediaFiles =
@@ -2049,6 +2134,7 @@ function App() {
         scale: getLayoutScale(),
         placement: mapPlacementMode,
         includeWalls: includeWallsWithMaps,
+        includeDrawings: includeImportedDrawings,
         lightOptions: buildLightImportOptions(),
         lockMaps: lockImportedMaps,
         compressionMode,
@@ -2061,8 +2147,9 @@ function App() {
       });
 
       await showMapWorkflowMismatchWarning(result, {
-        includeWalls: includeWallsWithMaps,
-        includeLights: includeImportedLights,
+        includeWalls: includeWallsWithMaps && hasWallImportSources,
+        includeDrawings: includeImportedDrawings && hasDrawingImportSources,
+        includeLights: includeImportedLights && hasLightImportSources,
       });
 
       setMapSelectionToken(activeSelectionToken);
@@ -2142,6 +2229,7 @@ function App() {
         snapToGrid,
         scale: getLayoutScale(),
         includeWalls: includeWallsWithMaps,
+        includeDrawings: includeImportedDrawings,
         lightOptions: buildLightImportOptions(),
         lockMaps: lockImportedMaps,
         compressionMode,
@@ -2158,8 +2246,9 @@ function App() {
       });
 
       await showMapWorkflowMismatchWarning(result, {
-        includeWalls: includeWallsWithMaps,
-        includeLights: includeImportedLights,
+        includeWalls: includeWallsWithMaps && hasWallImportSources,
+        includeDrawings: includeImportedDrawings && hasDrawingImportSources,
+        includeLights: includeImportedLights && hasLightImportSources,
       });
 
       setMapSelectionToken(activeSelectionToken);
@@ -2221,7 +2310,7 @@ function App() {
       return;
     }
     void OBR.notification.show(
-      "Enable at least one import option (image, walls/doors, lights).",
+      "Enable at least one import option (image, walls/doors, drawings/text, lights).",
       "INFO",
     );
   };
@@ -2266,6 +2355,7 @@ function App() {
       );
       const fogImportOptions = {
         includeWalls: includeWallsWithMaps,
+        includeDrawings: includeImportedDrawings,
         lightOptions: buildLightImportOptions(),
       };
 
@@ -2315,6 +2405,7 @@ function App() {
             snapToGrid: false,
             scale: 1,
             includeWalls: includeWallsWithMaps,
+            includeDrawings: includeImportedDrawings,
             lightOptions: buildLightImportOptions(),
             lockMaps: lockImportedMaps,
             compressionMode,
@@ -2326,8 +2417,9 @@ function App() {
           });
 
           await showMapWorkflowMismatchWarning(result, {
-            includeWalls: includeWallsWithMaps,
-            includeLights: includeImportedLights,
+            includeWalls: includeWallsWithMaps && hasWallImportSources,
+            includeDrawings: includeImportedDrawings && hasDrawingImportSources,
+            includeLights: includeImportedLights && hasLightImportSources,
           });
         }
         // Compression done — clear progress bar, show uploading state
@@ -2458,9 +2550,13 @@ function App() {
   };
 
   const handleAddWallsToCurrentScene = async () => {
-    if (!includeWallsWithMaps && !includeImportedLights) {
+    if (
+      !includeWallsWithMaps &&
+      !includeImportedDrawings &&
+      !includeImportedLights
+    ) {
       await OBR.notification.show(
-        "Enable walls/doors or lights to import fog data.",
+        "Enable walls/doors, drawings/text, or lights to import scene data.",
         "INFO",
       );
       return;
@@ -2476,11 +2572,19 @@ function App() {
     }
     if (availableScenes.length > 0 && !selectedSceneHasEnabledFogData) {
       const noFogDataMessage =
-        includeWallsWithMaps && includeImportedLights
-          ? "Selected scene has no walls, doors, or lights to import."
-          : includeWallsWithMaps
-            ? "Selected scene has no walls or doors to import."
-            : "Selected scene has no lights to import.";
+        includeWallsWithMaps && includeImportedDrawings && includeImportedLights
+          ? "Selected scene has no walls, doors, drawings, or lights to import."
+          : includeWallsWithMaps && includeImportedDrawings
+            ? "Selected scene has no walls, doors, or drawings to import."
+            : includeWallsWithMaps && includeImportedLights
+              ? "Selected scene has no walls, doors, or lights to import."
+              : includeImportedDrawings && includeImportedLights
+                ? "Selected scene has no drawings or lights to import."
+                : includeWallsWithMaps
+                  ? "Selected scene has no walls or doors to import."
+                  : includeImportedDrawings
+                    ? "Selected scene has no drawings to import."
+                    : "Selected scene has no lights to import.";
       await OBR.notification.show(noFogDataMessage, "INFO");
       return;
     }
@@ -2496,22 +2600,24 @@ function App() {
           scale: getLayoutScale(),
           placement: "ORIGIN",
           includeWalls: includeWallsWithMaps,
+          includeDrawings: includeImportedDrawings,
           lightOptions: buildLightImportOptions(),
         });
 
         await showMapWorkflowMismatchWarning(result, {
-          includeWalls: includeWallsWithMaps,
-          includeLights: includeImportedLights,
+          includeWalls: includeWallsWithMaps && hasWallImportSources,
+          includeDrawings: includeImportedDrawings && hasDrawingImportSources,
+          includeLights: includeImportedLights && hasLightImportSources,
         });
 
         if (result.wallsAppliedToMapCount === 0) {
           await OBR.notification.show(
-            "No walls, doors, or lights were found for the selected maps.",
+            "No walls, doors, drawings, or lights were found for the selected maps.",
             "INFO",
           );
         } else {
           await OBR.notification.show(
-            `Imported walls/doors/lights for ${result.wallsAppliedToMapCount} map(s).`,
+            `Imported walls/doors/drawings/lights for ${result.wallsAppliedToMapCount} map(s).`,
             "SUCCESS",
           );
         }
@@ -2523,6 +2629,7 @@ function App() {
           isContextMenuMode,
           {
             includeWalls: includeWallsWithMaps,
+            includeDrawings: includeImportedDrawings,
             lightOptions: buildLightImportOptions(),
           },
         );
@@ -2534,12 +2641,14 @@ function App() {
             : (s.data as VTTMapData);
           await addItemsFromData(wallData, isContextMenuMode, {
             includeWalls: includeWallsWithMaps,
+            includeDrawings: includeImportedDrawings,
             lightOptions: buildLightImportOptions(),
           });
         }
       } else if (selectedFile) {
         await addItemsFromVTT(selectedFile, isContextMenuMode, {
           includeWalls: includeWallsWithMaps,
+          includeDrawings: includeImportedDrawings,
           lightOptions: buildLightImportOptions(),
         });
       }
@@ -2565,11 +2674,9 @@ function App() {
   };
 
   const isSceneSelected = (sceneIndex: number): boolean =>
-    (
-      isContextMenuMode
-        ? selectedSceneIndex === sceneIndex
-        : selectedSceneIndices.includes(sceneIndex)
-    );
+    isContextMenuMode
+      ? selectedSceneIndex === sceneIndex
+      : selectedSceneIndices.includes(sceneIndex);
 
   const handleSceneCardSelection = (
     sceneIndex: number,
@@ -2585,9 +2692,7 @@ function App() {
     const selectedScene = availableScenes[sceneIndex];
     if (selectedScene) {
       setHasImage(getSceneMapImagePaths(selectedScene.data).length > 0);
-      setMultiSceneName(
-        (selectedScene.name || "Scene").trim() || "Scene",
-      );
+      setMultiSceneName((selectedScene.name || "Scene").trim() || "Scene");
     }
 
     if (isContextMenuMode) {
@@ -2596,8 +2701,7 @@ function App() {
     }
 
     if (isRangeSelect) {
-      const anchorOrderIndex =
-        visibleSceneOrderByIndex.get(anchorIndex) ?? -1;
+      const anchorOrderIndex = visibleSceneOrderByIndex.get(anchorIndex) ?? -1;
       const targetOrderIndex = visibleSceneOrderByIndex.get(sceneIndex) ?? -1;
 
       const range =
@@ -2685,11 +2789,7 @@ function App() {
             return;
           }
 
-          schedulePreviewOpen(
-            sceneIndex,
-            preview,
-            PREVIEW_HOVER_OPEN_DELAY_MS,
-          );
+          schedulePreviewOpen(sceneIndex, preview, PREVIEW_HOVER_OPEN_DELAY_MS);
         }}
         onMouseLeave={() => {
           if (!canHoverPreview) return;
@@ -2729,7 +2829,10 @@ function App() {
           }
 
           const elapsedMs = Date.now() - pressStartedAt;
-          if (!hoveredSceneThumb && elapsedMs >= PREVIEW_TOUCH_RELEASE_THRESHOLD_MS) {
+          if (
+            !hoveredSceneThumb &&
+            elapsedMs >= PREVIEW_TOUCH_RELEASE_THRESHOLD_MS
+          ) {
             clearPreviewOpenTimeout();
             clearPreviewHideTimeout();
             previewSourceIndexRef.current = sceneIndex;
@@ -2770,7 +2873,9 @@ function App() {
                 loop
                 muted
                 playsInline
-                preload={selectedSceneIndex === sceneIndex ? "metadata" : "none"}
+                preload={
+                  selectedSceneIndex === sceneIndex ? "metadata" : "none"
+                }
               />
             ) : (
               <img
@@ -2785,7 +2890,9 @@ function App() {
             <span className="scene-thumb-placeholder">No Preview</span>
           )}
         </div>
-        <div className="scene-name" title={scene.name || `Scene ${sceneIndex + 1}`}>
+        <div
+          className="scene-name"
+          title={scene.name || `Scene ${sceneIndex + 1}`}>
           {scene.name || `Scene ${sceneIndex + 1}`}
         </div>
       </div>
@@ -2835,7 +2942,9 @@ function App() {
             id={`scene-folder-${folder.id}`}>
             {folder.sceneIndices.length > 0 && (
               <div className="scene-gallery">
-                {folder.sceneIndices.map((sceneIndex) => renderSceneCard(sceneIndex))}
+                {folder.sceneIndices.map((sceneIndex) =>
+                  renderSceneCard(sceneIndex),
+                )}
               </div>
             )}
             {folder.children.map((child) => renderFolderNode(child, depth + 1))}
@@ -3254,6 +3363,7 @@ function App() {
                   <Stack className="advanced-video-options" spacing={1}>
                     {(hasMapWorkflowSources ||
                       hasWallImportSources ||
+                      hasDrawingImportSources ||
                       hasLightImportSources) && (
                       <Box className="advanced-option-group">
                         <Typography
@@ -3294,6 +3404,22 @@ function App() {
                               label="Walls & doors"
                             />
                           )}
+                          {hasDrawingImportSources && (
+                            <FormControlLabel
+                              className="import-option-toggle"
+                              control={
+                                <Checkbox
+                                  size="small"
+                                  checked={includeImportedDrawings}
+                                  onChange={(e) =>
+                                    setIncludeImportedDrawings(e.target.checked)
+                                  }
+                                  disabled={isLoading}
+                                />
+                              }
+                              label="Drawings & text"
+                            />
+                          )}
                           {hasLightImportSources && (
                             <FormControlLabel
                               className="import-option-toggle"
@@ -3319,139 +3445,139 @@ function App() {
                         shouldShowPlacementControl ||
                         shouldShowLayoutControls ||
                         (includeMapImages && hasMapWorkflowSources)) && (
-                      <Box className="advanced-option-group">
-                        <Typography
-                          variant="caption"
-                          className="advanced-option-group-heading">
-                          Map setup
-                        </Typography>
-                        <Stack spacing={0.8}>
-                          {shouldUseMultiMapSceneCreation && (
-                            <TextField
-                              label="New Scene Name"
-                              value={multiSceneName}
-                              onChange={(e) =>
-                                setMultiSceneName(e.target.value)
-                              }
-                              size="small"
-                              fullWidth
-                              disabled={isLoading}
-                            />
-                          )}
-                          {shouldShowPlacementControl && (
-                            <FormControl fullWidth size="small">
-                              <InputLabel id="placement-mode-label">
-                                Map Placement
-                              </InputLabel>
-                              <Select
-                                labelId="placement-mode-label"
-                                label="Map Placement"
-                                value={mapPlacementMode}
-                                onChange={(e) =>
-                                  setMapPlacementMode(
-                                    e.target.value as MapPlacementMode,
-                                  )
-                                }
-                                disabled={isLoading}>
-                                <MenuItem value="RIGHT">
-                                  Place right of existing
-                                </MenuItem>
-                                <MenuItem value="BELOW">
-                                  Place below existing
-                                </MenuItem>
-                                <MenuItem value="ORIGIN">
-                                  Place at origin
-                                </MenuItem>
-                              </Select>
-                            </FormControl>
-                          )}
-                          {shouldShowLayoutControls && (
-                            <>
-                              <FormControl fullWidth size="small">
-                                <InputLabel id="layout-mode-label">
-                                  Layout
-                                </InputLabel>
-                                <Select
-                                  labelId="layout-mode-label"
-                                  label="Layout"
-                                  value={layoutMode}
-                                  onChange={(e) =>
-                                    setLayoutMode(
-                                      e.target.value as MapLayoutMode,
-                                    )
-                                  }
-                                  disabled={isLoading}>
-                                  <MenuItem value="GRID">
-                                    Grid (auto columns)
-                                  </MenuItem>
-                                  <MenuItem value="ROW">Single row</MenuItem>
-                                  <MenuItem value="COLUMN">
-                                    Single column
-                                  </MenuItem>
-                                  <MenuItem value="STACK">
-                                    Stacked on top of each other
-                                  </MenuItem>
-                                </Select>
-                              </FormControl>
+                        <Box className="advanced-option-group">
+                          <Typography
+                            variant="caption"
+                            className="advanced-option-group-heading">
+                            Map setup
+                          </Typography>
+                          <Stack spacing={0.8}>
+                            {shouldUseMultiMapSceneCreation && (
                               <TextField
-                                type="number"
-                                label="Minimum Spacing (px, optional)"
-                                value={layoutSpacing}
+                                label="New Scene Name"
+                                value={multiSceneName}
                                 onChange={(e) =>
-                                  setLayoutSpacing(e.target.value)
+                                  setMultiSceneName(e.target.value)
                                 }
-                                inputProps={{ min: 0, step: 1 }}
-                                placeholder="One grid size"
-                                helperText="Minimum free space between maps. Leave empty to default to one grid square."
                                 size="small"
                                 fullWidth
                                 disabled={isLoading}
                               />
+                            )}
+                            {shouldShowPlacementControl && (
+                              <FormControl fullWidth size="small">
+                                <InputLabel id="placement-mode-label">
+                                  Map Placement
+                                </InputLabel>
+                                <Select
+                                  labelId="placement-mode-label"
+                                  label="Map Placement"
+                                  value={mapPlacementMode}
+                                  onChange={(e) =>
+                                    setMapPlacementMode(
+                                      e.target.value as MapPlacementMode,
+                                    )
+                                  }
+                                  disabled={isLoading}>
+                                  <MenuItem value="RIGHT">
+                                    Place right of existing
+                                  </MenuItem>
+                                  <MenuItem value="BELOW">
+                                    Place below existing
+                                  </MenuItem>
+                                  <MenuItem value="ORIGIN">
+                                    Place at origin
+                                  </MenuItem>
+                                </Select>
+                              </FormControl>
+                            )}
+                            {shouldShowLayoutControls && (
+                              <>
+                                <FormControl fullWidth size="small">
+                                  <InputLabel id="layout-mode-label">
+                                    Layout
+                                  </InputLabel>
+                                  <Select
+                                    labelId="layout-mode-label"
+                                    label="Layout"
+                                    value={layoutMode}
+                                    onChange={(e) =>
+                                      setLayoutMode(
+                                        e.target.value as MapLayoutMode,
+                                      )
+                                    }
+                                    disabled={isLoading}>
+                                    <MenuItem value="GRID">
+                                      Grid (auto columns)
+                                    </MenuItem>
+                                    <MenuItem value="ROW">Single row</MenuItem>
+                                    <MenuItem value="COLUMN">
+                                      Single column
+                                    </MenuItem>
+                                    <MenuItem value="STACK">
+                                      Stacked on top of each other
+                                    </MenuItem>
+                                  </Select>
+                                </FormControl>
+                                <TextField
+                                  type="number"
+                                  label="Minimum Spacing (px, optional)"
+                                  value={layoutSpacing}
+                                  onChange={(e) =>
+                                    setLayoutSpacing(e.target.value)
+                                  }
+                                  inputProps={{ min: 0, step: 1 }}
+                                  placeholder="One grid size"
+                                  helperText="Minimum free space between maps. Leave empty to default to one grid square."
+                                  size="small"
+                                  fullWidth
+                                  disabled={isLoading}
+                                />
+                                <FormControlLabel
+                                  control={
+                                    <Checkbox
+                                      size="small"
+                                      checked={snapToGrid}
+                                      onChange={(e) =>
+                                        setSnapToGrid(e.target.checked)
+                                      }
+                                      disabled={isLoading}
+                                    />
+                                  }
+                                  label="Snap placement to grid"
+                                />
+                                <TextField
+                                  type="number"
+                                  label="Scale (%)"
+                                  value={layoutScalePercent}
+                                  onChange={(e) =>
+                                    setLayoutScalePercent(e.target.value)
+                                  }
+                                  inputProps={{ min: 10, step: 5 }}
+                                  size="small"
+                                  fullWidth
+                                  disabled={isLoading}
+                                />
+                              </>
+                            )}
+                            {includeMapImages && hasMapWorkflowSources && (
                               <FormControlLabel
                                 control={
                                   <Checkbox
                                     size="small"
-                                    checked={snapToGrid}
+                                    checked={lockImportedMaps}
                                     onChange={(e) =>
-                                      setSnapToGrid(e.target.checked)
+                                      setLockImportedMaps(e.target.checked)
                                     }
                                     disabled={isLoading}
                                   />
                                 }
-                                label="Snap placement to grid"
+                                label="Lock placed maps"
                               />
-                              <TextField
-                                type="number"
-                                label="Scale (%)"
-                                value={layoutScalePercent}
-                                onChange={(e) =>
-                                  setLayoutScalePercent(e.target.value)
-                                }
-                                inputProps={{ min: 10, step: 5 }}
-                                size="small"
-                                fullWidth
-                                disabled={isLoading}
-                              />
-                            </>
-                          )}
-                          {includeMapImages && hasMapWorkflowSources && (
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  size="small"
-                                  checked={lockImportedMaps}
-                                  onChange={(e) =>
-                                    setLockImportedMaps(e.target.checked)
-                                  }
-                                  disabled={isLoading}
-                                />
-                              }
-                              label="Lock placed maps"
-                            />
-                          )}
-                        </Stack>
-                      </Box>
-                    )}
+                            )}
+                          </Stack>
+                        </Box>
+                      )}
 
                     {hasLightImportSources && includeImportedLights && (
                       <Box className="advanced-option-group">
@@ -3473,10 +3599,10 @@ function App() {
                                 value === "AUTO"
                                   ? "Auto (data, fallback Secondary)"
                                   : value === "PRIMARY"
-                                  ? "Primary"
-                                  : value === "AUXILIARY"
-                                    ? "Auxiliary"
-                                    : "Secondary"
+                                    ? "Primary"
+                                    : value === "AUXILIARY"
+                                      ? "Auxiliary"
+                                      : "Secondary"
                               }
                               onChange={(e) =>
                                 setImportedLightType(
@@ -3830,21 +3956,35 @@ function App() {
                   disabled={
                     (!selectedFile && availableScenes.length === 0) ||
                     isLoading ||
-                    (!includeWallsWithMaps && !includeImportedLights) ||
+                    (!includeWallsWithMaps &&
+                      !includeImportedDrawings &&
+                      !includeImportedLights) ||
                     (availableScenes.length > 0 &&
                       !selectedSceneHasEnabledFogData)
                   }>
                   {isLoading
                     ? "Uploading..."
-                    : !includeWallsWithMaps && !includeImportedLights
-                      ? "Enable Walls/Doors or Lights"
+                    : !includeWallsWithMaps &&
+                        !includeImportedDrawings &&
+                        !includeImportedLights
+                      ? "Enable Walls/Doors, Drawings, or Lights"
                       : availableScenes.length > 0 &&
                           !selectedSceneHasEnabledFogData
-                        ? includeWallsWithMaps && includeImportedLights
+                        ? includeWallsWithMaps &&
+                          includeImportedDrawings &&
+                          includeImportedLights
                           ? "No Fog Data In Selected Scene"
-                          : includeWallsWithMaps
-                            ? "No Walls/Doors In Selected Scene"
-                            : "No Lights In Selected Scene"
+                          : includeWallsWithMaps && includeImportedDrawings
+                            ? "No Walls/Doors/Drawings In Selected Scene"
+                            : includeWallsWithMaps && includeImportedLights
+                              ? "No Walls/Doors/Lights In Selected Scene"
+                              : includeImportedDrawings && includeImportedLights
+                                ? "No Drawings/Lights In Selected Scene"
+                                : includeWallsWithMaps
+                                  ? "No Walls/Doors In Selected Scene"
+                                  : includeImportedDrawings
+                                    ? "No Drawings In Selected Scene"
+                                    : "No Lights In Selected Scene"
                         : "Import to Selected Map"}
                 </Button>
               </>

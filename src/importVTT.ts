@@ -7,8 +7,8 @@ import OBR, {
     type Item,
     type Vector2
 } from "@owlbear-rodeo/sdk";
-import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTWall, type FoundryVTTLight } from "./vttTypes";
-import { createWallItems, createDoorItems, createLightItems, type LightImportOptions } from "./vttItems";
+import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTWall, type FoundryVTTLight, type FoundryVTTDrawing, type VTTDrawing } from "./vttTypes";
+import { createWallItems, createDoorItems, createLightItems, createDrawingItems, type LightImportOptions } from "./vttItems";
 export type { LightImportOptions } from "./vttItems";
 
 type VTTData = VTTMapData;
@@ -16,6 +16,8 @@ type VTTData = VTTMapData;
 import JSZip from 'jszip';
 
 const DEFAULT_NEW_SCENE_GRID_DPI = 150;
+const DYNAMIC_FOG_LIGHT_KEY = "rodeo.owlbear.dynamic-fog/light";
+const CHROMODYNAMIC_LIGHT_KEY = "com.desain.chromodynamic/light";
 
 export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
     const d = data as Partial<FoundryVTTData>;
@@ -60,11 +62,193 @@ export function hasMapImage(data: unknown): boolean {
     return !!(data && typeof data === 'object' && 'image' in data && (data as { image?: string }).image);
 }
 
+function normalizeFoundryColor(value: unknown, fallback: string): string {
+    if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (!trimmed) return fallback;
+        const hexMatch = trimmed.match(/^#?([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3}|[A-Fa-f0-9]{8})$/);
+        if (!hexMatch) return fallback;
+        let hex = hexMatch[1];
+        if (hex.length === 3) {
+            hex = hex.split('').map((channel) => channel + channel).join('');
+        } else if (hex.length === 8) {
+            hex = hex.slice(0, 6);
+        }
+        return `#${hex.toUpperCase()}`;
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        const normalized = Math.max(0, Math.min(0xffffff, Math.round(value)));
+        return `#${normalized.toString(16).padStart(6, '0').toUpperCase()}`;
+    }
+
+    return fallback;
+}
+
+function normalizeFoundryPoints(points: unknown): number[] {
+    if (!Array.isArray(points)) return [];
+    if (points.length === 0) return [];
+    if (typeof points[0] === 'number') {
+        const raw = points as unknown[];
+        const result: number[] = [];
+        for (let i = 0; i < raw.length; i++) {
+            const value = Number(raw[i]);
+            if (!Number.isFinite(value)) continue;
+            result.push(value);
+        }
+        return result.length >= 4 ? result : [];
+    }
+
+    const nested = points as unknown[];
+    const flattened: number[] = [];
+    for (const point of nested) {
+        if (!Array.isArray(point) || point.length < 2) continue;
+        const x = Number(point[0]);
+        const y = Number(point[1]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        flattened.push(x, y);
+    }
+    return flattened.length >= 4 ? flattened : [];
+}
+
+function toVttDrawingType(value: unknown): VTTDrawing['type'] {
+    const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
+    if (normalized === 'T' || normalized === 'TEXT') return 'TEXT';
+    if (normalized === 'R' || normalized === 'RECT' || normalized === 'RECTANGLE') return 'RECTANGLE';
+    if (normalized === 'E' || normalized === 'ELLIPSE' || normalized === 'CIRCLE') return 'ELLIPSE';
+    if (normalized === 'P' || normalized === 'POLYGON') return 'POLYGON';
+    if (normalized === 'F' || normalized === 'FREEHAND') return 'FREEHAND';
+    return 'RECTANGLE';
+}
+
+function pointsDefineClosedLoop(points: number[]): boolean {
+    if (points.length < 4) return false;
+    const firstX = points[0];
+    const firstY = points[1];
+    const lastX = points[points.length - 2];
+    const lastY = points[points.length - 1];
+    return Number.isFinite(firstX)
+        && Number.isFinite(firstY)
+        && Number.isFinite(lastX)
+        && Number.isFinite(lastY)
+        && Math.abs(firstX - lastX) <= 0.00001
+        && Math.abs(firstY - lastY) <= 0.00001;
+}
+
+function convertFoundryDrawingsToVTTDrawings(
+    sourceDrawings: Array<FoundryVTTDrawing | string>,
+    offsetX: number,
+    offsetY: number,
+    gridSize: number
+): VTTDrawing[] {
+    const drawings: VTTDrawing[] = [];
+
+    for (const drawing of sourceDrawings) {
+        if (!drawing || typeof drawing !== 'object') continue;
+
+        const rawX = Number(drawing.x ?? 0);
+        const rawY = Number(drawing.y ?? 0);
+        const x = (Number.isFinite(rawX) ? rawX : 0) - offsetX;
+        const y = (Number.isFinite(rawY) ? rawY : 0) - offsetY;
+
+        const shape = drawing.shape;
+        const rawType = drawing.type ?? drawing.t ?? shape?.type;
+        let shapeType = toVttDrawingType(rawType);
+        const width = Number(shape?.width ?? drawing.width);
+        const height = Number(shape?.height ?? drawing.height);
+        const radius = Number(shape?.radius);
+        const rawPoints = normalizeFoundryPoints(shape?.points ?? drawing.points);
+        const points = rawPoints.map((point) => point / gridSize);
+        const text = typeof drawing.text === 'string' ? drawing.text : '';
+
+        if (
+            shapeType !== 'TEXT' &&
+            !Number.isFinite(width) &&
+            !Number.isFinite(height) &&
+            !Number.isFinite(radius) &&
+            points.length < 4
+        ) {
+            continue;
+        }
+
+        const fillAlpha = Number(drawing.fillAlpha);
+        const strokeAlpha = Number(drawing.strokeAlpha);
+        const strokeWidth = Number(drawing.strokeWidth);
+        const fillType = Number(drawing.fillType);
+        const hasExplicitFillColor = drawing.fillColor !== undefined && drawing.fillColor !== null && `${drawing.fillColor}`.trim().length > 0;
+        const hasExplicitStrokeColor = drawing.strokeColor !== undefined && drawing.strokeColor !== null && `${drawing.strokeColor}`.trim().length > 0;
+        const fontSize = Number(drawing.fontSize);
+        const textAlpha = Number(drawing.textAlpha);
+        const rotation = Number(drawing.rotation);
+        const z = Number.isFinite(Number(drawing.z)) ? Number(drawing.z) : 0;
+        const sort = Number.isFinite(Number(drawing.sort)) ? Number(drawing.sort) : 0;
+        const elevation = Number.isFinite(Number(drawing.elevation)) ? Number(drawing.elevation) : 0;
+        const bezierFactor = Number(drawing.bezierFactor);
+
+        const normalizedFillOpacity = Number.isFinite(fillAlpha) ? Math.max(0, Math.min(1, fillAlpha)) : 0;
+        const fillTypeIsNone = Number.isFinite(fillType) && fillType === 0;
+        const normalizedRawType = typeof rawType === 'string' ? rawType.trim().toUpperCase() : '';
+        const explicitFreehandType = normalizedRawType === 'F' || normalizedRawType === 'FREEHAND';
+        const hasBezierSmoothing = Number.isFinite(bezierFactor) && bezierFactor > 0;
+        const hasFreehandPointDensity = points.length >= 8;
+        const hasOpenStrokePath = hasFreehandPointDensity && !pointsDefineClosedLoop(points);
+        const likelyFreehandFromPolygon = shapeType === 'POLYGON'
+            && (
+                explicitFreehandType
+                || (hasOpenStrokePath && fillTypeIsNone)
+                || (hasBezierSmoothing && (hasOpenStrokePath || fillTypeIsNone))
+            );
+        if (likelyFreehandFromPolygon) {
+            shapeType = 'FREEHAND';
+        }
+        const effectiveFillOpacity = fillTypeIsNone ? 0 : normalizedFillOpacity;
+        const normalizedStrokeOpacity = Number.isFinite(strokeAlpha) ? Math.max(0, Math.min(1, strokeAlpha)) : 1;
+        const normalizedStrokeWidth = Number.isFinite(strokeWidth) ? Math.max(0, strokeWidth) / gridSize : 0;
+        const hasFillDecoration = !fillTypeIsNone && effectiveFillOpacity > 0 && hasExplicitFillColor;
+        const hasStrokeDecoration = normalizedStrokeWidth > 0 && normalizedStrokeOpacity > 0 && hasExplicitStrokeColor;
+        const textHasShapeDecoration = hasFillDecoration || hasStrokeDecoration;
+
+        const normalizedDrawing: VTTDrawing = {
+            id: typeof drawing._id === 'string' ? drawing._id : undefined,
+            type: shapeType,
+            x: x / gridSize,
+            y: y / gridSize,
+            width: Number.isFinite(width) ? width / gridSize : undefined,
+            height: Number.isFinite(height) ? height / gridSize : undefined,
+            radius: Number.isFinite(radius) ? radius / gridSize : undefined,
+            points: points.length >= 4 ? points : undefined,
+            rotation: Number.isFinite(rotation) ? rotation : 0,
+            hidden: !!drawing.hidden,
+            locked: !!drawing.locked,
+            zIndex: Math.round(elevation * 1_000_000 + z * 1_000 + sort),
+            fillColor: normalizeFoundryColor(drawing.fillColor, '#000000'),
+            fillOpacity: effectiveFillOpacity,
+            strokeColor: normalizeFoundryColor(drawing.strokeColor, '#000000'),
+            strokeOpacity: normalizedStrokeOpacity,
+            strokeWidth: normalizedStrokeWidth,
+            text: text.trim().length > 0 ? text : undefined,
+            textColor: normalizeFoundryColor(drawing.textColor, '#FFFFFF'),
+            textOpacity: Number.isFinite(textAlpha) ? Math.max(0, Math.min(1, textAlpha)) : 1,
+            fontFamily: typeof drawing.fontFamily === 'string' && drawing.fontFamily.trim().length > 0
+                ? drawing.fontFamily
+                : undefined,
+            fontSize: Number.isFinite(fontSize) && fontSize > 0 ? fontSize / gridSize : undefined,
+            textHasShapeDecoration,
+            bezierFactor: Number.isFinite(bezierFactor) ? Math.max(0, Math.min(1, bezierFactor)) : undefined,
+        };
+
+        drawings.push(normalizedDrawing);
+    }
+
+    return drawings;
+}
+
 export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
     let padX = 0;
     let padY = 0;
     const sourceWalls = Array.isArray(foundryData.walls) ? foundryData.walls : [];
     const sourceLights = Array.isArray(foundryData.lights) ? foundryData.lights : [];
+    const sourceDrawings = Array.isArray(foundryData.drawings) ? foundryData.drawings : [];
 
     // Resolve grid size handling for both Foundry V11 (numeric) and V12+ (object)
     const gridSize = typeof foundryData.grid === 'object' ? (foundryData.grid?.size || 100) : (Number(foundryData.grid) || 100);
@@ -175,6 +359,7 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
             };
         })
         .filter((light) => light.range > 0);
+    const drawings = convertFoundryDrawingsToVTTDrawings(sourceDrawings, offsetX, offsetY, gridSize);
 
     return {
         resolution: {
@@ -187,6 +372,7 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
         objects_line_of_sight: [],
         portals: portals,
         lights,
+        drawings,
     };
 }
 
@@ -222,6 +408,7 @@ export type MapPlacementMode = 'RIGHT' | 'BELOW' | 'ORIGIN';
 
 export interface FogImportOptions {
     includeWalls?: boolean;
+    includeDrawings?: boolean;
     lightOptions?: LightImportOptions;
 }
 
@@ -300,6 +487,7 @@ export interface MultiMapImportOptions {
     scale?: number;
     placement?: MapPlacementMode;
     includeWalls?: boolean;
+    includeDrawings?: boolean;
     lightOptions?: LightImportOptions;
     lockMaps?: boolean;
     compressionMode?: CompressionMode;
@@ -1791,6 +1979,110 @@ function buildUploadName(name: string): string {
     return sanitizeMapName(name).slice(0, 40);
 }
 
+function normalizeNameForMatching(name: string): string {
+    return name
+        .replace(/\.[^/.]+$/, '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .replace(/[^a-z0-9 _-]/g, '')
+        .trim();
+}
+
+function normalizeNameForLooseMatching(name: string): string {
+    const strict = normalizeNameForMatching(name);
+    return strict.replace(/\s*\(\d+\)\s*$/, '').trim();
+}
+
+function normalizeDegrees(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    const normalized = ((value % 360) + 360) % 360;
+    return normalized === 0 ? 0 : normalized;
+}
+
+function rotatePointAroundOrigin(point: Vector2, origin: Vector2, degrees: number): Vector2 {
+    const normalizedDegrees = normalizeDegrees(degrees);
+    if (normalizedDegrees === 0) {
+        return point;
+    }
+
+    const radians = (normalizedDegrees * Math.PI) / 180;
+    const cos = Math.cos(radians);
+    const sin = Math.sin(radians);
+    const dx = point.x - origin.x;
+    const dy = point.y - origin.y;
+
+    return {
+        x: origin.x + (dx * cos) - (dy * sin),
+        y: origin.y + (dx * sin) + (dy * cos),
+    };
+}
+
+function applyMapRotationToImportedItems(
+    items: Item[],
+    mapOrigin: Vector2,
+    mapRotation: number
+): Item[] {
+    const normalizedRotation = normalizeDegrees(mapRotation);
+    if (normalizedRotation === 0) {
+        return items;
+    }
+
+    return items.map((item) => {
+        const existingRotation =
+            typeof item.rotation === "number" && Number.isFinite(item.rotation)
+                ? item.rotation
+                : 0;
+        const currentPosition = item.position;
+        const nextPosition =
+            currentPosition &&
+            Number.isFinite(currentPosition.x) &&
+            Number.isFinite(currentPosition.y)
+                ? rotatePointAroundOrigin(currentPosition, mapOrigin, normalizedRotation)
+                : currentPosition;
+
+        let nextMetadata = item.metadata;
+        const dynamicFog = item.metadata?.[DYNAMIC_FOG_LIGHT_KEY];
+        if (dynamicFog && typeof dynamicFog === "object") {
+            const dynamicFogLight = dynamicFog as { rotation?: unknown };
+            const currentRotation = Number(dynamicFogLight.rotation ?? 0);
+            const adjustedDynamicFogLight = {
+                ...dynamicFogLight,
+                rotation: normalizeDegrees(
+                    (Number.isFinite(currentRotation) ? currentRotation : 0) + normalizedRotation
+                ),
+            };
+
+            const chromodynamic = item.metadata?.[CHROMODYNAMIC_LIGHT_KEY];
+            const adjustedChromodynamic =
+                chromodynamic && typeof chromodynamic === "object"
+                    ? {
+                        ...(chromodynamic as { rotation?: unknown }),
+                        rotation: normalizeDegrees(
+                            (Number(
+                                (chromodynamic as { rotation?: unknown }).rotation ?? 0
+                            ) || 0) + normalizedRotation
+                        ),
+                    }
+                    : chromodynamic;
+
+            nextMetadata = {
+                ...item.metadata,
+                [DYNAMIC_FOG_LIGHT_KEY]: adjustedDynamicFogLight,
+                ...(adjustedChromodynamic
+                    ? { [CHROMODYNAMIC_LIGHT_KEY]: adjustedChromodynamic }
+                    : {}),
+            };
+        }
+
+        return {
+            ...item,
+            position: nextPosition,
+            rotation: normalizeDegrees(existingRotation + normalizedRotation),
+            metadata: nextMetadata,
+        };
+    });
+}
+
 function clampPositiveNumber(value: number | undefined, fallback: number): number {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
         return fallback;
@@ -2105,6 +2397,8 @@ async function prepareMapSources(
 
     const preparedByAssetSelectionKey = new Map<string, PreparedMapImportSource[]>();
     const preparedByUploadName = new Map<string, PreparedMapImportSource[]>();
+    const preparedByNormalizedUploadName = new Map<string, PreparedMapImportSource[]>();
+    const preparedByLooseNormalizedUploadName = new Map<string, PreparedMapImportSource[]>();
     for (const entry of prepared) {
         const byAsset = preparedByAssetSelectionKey.get(entry.assetSelectionKey) ?? [];
         byAsset.push(entry);
@@ -2112,6 +2406,18 @@ async function prepareMapSources(
         const byUpload = preparedByUploadName.get(entry.uploadName) ?? [];
         byUpload.push(entry);
         preparedByUploadName.set(entry.uploadName, byUpload);
+        const normalizedUploadName = normalizeNameForMatching(entry.uploadName);
+        if (normalizedUploadName) {
+            const byNormalizedUpload = preparedByNormalizedUploadName.get(normalizedUploadName) ?? [];
+            byNormalizedUpload.push(entry);
+            preparedByNormalizedUploadName.set(normalizedUploadName, byNormalizedUpload);
+        }
+        const looseNormalizedUploadName = normalizeNameForLooseMatching(entry.uploadName);
+        if (looseNormalizedUploadName) {
+            const byLooseNormalizedUpload = preparedByLooseNormalizedUploadName.get(looseNormalizedUploadName) ?? [];
+            byLooseNormalizedUpload.push(entry);
+            preparedByLooseNormalizedUploadName.set(looseNormalizedUploadName, byLooseNormalizedUpload);
+        }
     }
 
     const selectedWithMetadata: Array<{
@@ -2119,17 +2425,56 @@ async function prepareMapSources(
         sourceMeta?: PreparedMapImportSource;
         metadataMatched: boolean;
     }> = [];
+    const unmatchedSelectionDebug: Array<{
+        selectedName: string;
+        selectedDescription: string;
+        normalizedSelectedName: string;
+    }> = [];
     const emittedSelectionKeys = new Set<string>();
     for (const selectedImage of selectedCandidates) {
         const matchedByAssetKey = selectedImage.description
             ? preparedByAssetSelectionKey.get(selectedImage.description) ?? []
             : [];
         const matchedByUploadName = preparedByUploadName.get(selectedImage.name) ?? [];
-        const matches = matchedByAssetKey.length > 0 ? matchedByAssetKey : matchedByUploadName;
+        const normalizedSelectedName = normalizeNameForMatching(selectedImage.name);
+        const matchedByNormalizedName = normalizedSelectedName
+            ? preparedByNormalizedUploadName.get(normalizedSelectedName) ?? []
+            : [];
+        const looseNormalizedSelectedName = normalizeNameForLooseMatching(selectedImage.name);
+        const matchedByLooseNormalizedName = looseNormalizedSelectedName
+            ? preparedByLooseNormalizedUploadName.get(looseNormalizedSelectedName) ?? []
+            : [];
+        const unmatchedAssetMatches = matchedByAssetKey.filter(
+            (sourceMeta) => !emittedSelectionKeys.has(sourceMeta.selectionKey)
+        );
+        const unmatchedUploadNameMatches = matchedByUploadName.filter(
+            (sourceMeta) => !emittedSelectionKeys.has(sourceMeta.selectionKey)
+        );
+        const unmatchedNormalizedMatches = matchedByNormalizedName.filter(
+            (sourceMeta) => !emittedSelectionKeys.has(sourceMeta.selectionKey)
+        );
+        const unmatchedLooseNormalizedMatches = matchedByLooseNormalizedName.filter(
+            (sourceMeta) => !emittedSelectionKeys.has(sourceMeta.selectionKey)
+        );
+        let matches: PreparedMapImportSource[] = [];
+        if (unmatchedAssetMatches.length > 0) {
+            matches = unmatchedAssetMatches;
+        } else if (unmatchedUploadNameMatches.length === 1) {
+            matches = unmatchedUploadNameMatches;
+        } else if (unmatchedNormalizedMatches.length === 1) {
+            matches = unmatchedNormalizedMatches;
+        } else if (unmatchedLooseNormalizedMatches.length === 1) {
+            matches = unmatchedLooseNormalizedMatches;
+        }
         if (matches.length === 0) {
             selectedWithMetadata.push({
                 selectedImage,
                 metadataMatched: false,
+            });
+            unmatchedSelectionDebug.push({
+                selectedName: selectedImage.name,
+                selectedDescription: selectedImage.description ?? '',
+                normalizedSelectedName,
             });
             continue;
         }
@@ -2144,115 +2489,131 @@ async function prepareMapSources(
         }
     }
 
-    const scale = clampPositiveNumber(options.scale, 1);
-    const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
-    const shouldSnapToGrid = options.snapToGrid ?? true;
-    const layout = options.layout ?? 'GRID';
 
-    const displayWidths = selectedWithMetadata.map(({ selectedImage }) => {
-        const entry = selectedImage;
-        const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
-        return (entry.image.width * targetDpi / sourceDpi) * scale;
-    });
-    const displayHeights = selectedWithMetadata.map(({ selectedImage }) => {
-        const entry = selectedImage;
-        const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
-        return (entry.image.height * targetDpi / sourceDpi) * scale;
-    });
-    const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing, targetDpi, shouldSnapToGrid);
 
-    if (onProgress) {
-        onProgress(92);
+    console.info('[Scene Importer][Map Match] final', {
+        preparedCount: prepared.length,
+        selectedCount: selectedCandidates.length,
+            matchedCount: selectedWithMetadata.filter((entry) => entry.metadataMatched).length,
+                matchedSample: selectedWithMetadata.slice(0, 10).map((entry) => ({
+                    selectedName: entry.selectedImage.name,
+                    metadataMatched: entry.metadataMatched,
+                    sourceDisplayName: entry.sourceMeta?.displayName ?? '',
+                    sourceUploadName: entry.sourceMeta?.uploadName ?? '',
+                    hasWallData: !!entry.sourceMeta?.wallData,
+                    drawingCount: entry.sourceMeta?.wallData?.drawings?.length ?? 0,
+                })),
+    });
+
+const scale = clampPositiveNumber(options.scale, 1);
+const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
+const shouldSnapToGrid = options.snapToGrid ?? true;
+const layout = options.layout ?? 'GRID';
+
+const displayWidths = selectedWithMetadata.map(({ selectedImage }) => {
+    const entry = selectedImage;
+    const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
+    return (entry.image.width * targetDpi / sourceDpi) * scale;
+});
+const displayHeights = selectedWithMetadata.map(({ selectedImage }) => {
+    const entry = selectedImage;
+    const sourceDpi = clampPositiveNumber(entry.grid?.dpi, 100);
+    return (entry.image.height * targetDpi / sourceDpi) * scale;
+});
+const positions = computeLayoutPositions(displayWidths, displayHeights, layout, spacing, targetDpi, shouldSnapToGrid);
+
+if (onProgress) {
+    onProgress(92);
+}
+
+return selectedWithMetadata.map(({ selectedImage, sourceMeta, metadataMatched }, index) => {
+
+    if (!sourceMeta) {
+        console.warn(`No metadata match found for selected map "${selectedImage.name}". Importing without wall data.`);
     }
 
-    return selectedWithMetadata.map(({ selectedImage, sourceMeta, metadataMatched }, index) => {
+    const sourceDpi = clampPositiveNumber(selectedImage.grid?.dpi, 100);
+    const mapPlacement = sourceMeta?.mapPlacement;
+    let position = positions[index];
+    let resolvedScale: Vector2 = { x: 1, y: 1 };
+    let resolvedRotation = 0;
+    let resolvedZIndex: number | undefined = undefined;
 
-        if (!sourceMeta) {
-            console.warn(`No metadata match found for selected map "${selectedImage.name}". Importing without wall data.`);
-        }
-
-        const sourceDpi = clampPositiveNumber(selectedImage.grid?.dpi, 100);
-        const mapPlacement = sourceMeta?.mapPlacement;
-        let position = positions[index];
-        let resolvedScale: Vector2 = { x: 1, y: 1 };
-        let resolvedRotation = 0;
-        let resolvedZIndex: number | undefined = undefined;
-
-        if (mapPlacement) {
-            const targetDpiRatio = targetDpi / sourceDpi;
-            const mappedX = typeof mapPlacement.x === 'number' && Number.isFinite(mapPlacement.x)
-                ? mapPlacement.x * targetDpiRatio
-                : undefined;
-            const mappedY = typeof mapPlacement.y === 'number' && Number.isFinite(mapPlacement.y)
-                ? mapPlacement.y * targetDpiRatio
-                : undefined;
-            if (typeof mappedX === 'number' || typeof mappedY === 'number') {
-                position = {
-                    x: typeof mappedX === 'number' ? mappedX : position.x,
-                    y: typeof mappedY === 'number' ? mappedY : position.y,
-                };
-            }
-
-            const baseWidth = (selectedImage.image.width * targetDpi) / sourceDpi;
-            const baseHeight = (selectedImage.image.height * targetDpi) / sourceDpi;
-            const targetWidth = typeof mapPlacement.targetWidth === 'number' && Number.isFinite(mapPlacement.targetWidth)
-                ? mapPlacement.targetWidth * targetDpiRatio
-                : undefined;
-            const targetHeight = typeof mapPlacement.targetHeight === 'number' && Number.isFinite(mapPlacement.targetHeight)
-                ? mapPlacement.targetHeight * targetDpiRatio
-                : undefined;
-            const widthScale = targetWidth && baseWidth > 0 ? targetWidth / baseWidth : undefined;
-            const heightScale = targetHeight && baseHeight > 0 ? targetHeight / baseHeight : undefined;
-            const explicitScaleX = typeof mapPlacement.scaleX === 'number' && Number.isFinite(mapPlacement.scaleX)
-                ? mapPlacement.scaleX
-                : undefined;
-            const explicitScaleY = typeof mapPlacement.scaleY === 'number' && Number.isFinite(mapPlacement.scaleY)
-                ? mapPlacement.scaleY
-                : undefined;
-            resolvedScale = {
-                x: widthScale ?? explicitScaleX ?? 1,
-                y: heightScale ?? explicitScaleY ?? 1,
+    if (mapPlacement) {
+        const targetDpiRatio = targetDpi / sourceDpi;
+        const mappedX = typeof mapPlacement.x === 'number' && Number.isFinite(mapPlacement.x)
+            ? mapPlacement.x * targetDpiRatio
+            : undefined;
+        const mappedY = typeof mapPlacement.y === 'number' && Number.isFinite(mapPlacement.y)
+            ? mapPlacement.y * targetDpiRatio
+            : undefined;
+        if (typeof mappedX === 'number' || typeof mappedY === 'number') {
+            position = {
+                x: typeof mappedX === 'number' ? mappedX : position.x,
+                y: typeof mappedY === 'number' ? mappedY : position.y,
             };
-
-            if (typeof mapPlacement.rotation === 'number' && Number.isFinite(mapPlacement.rotation)) {
-                resolvedRotation = mapPlacement.rotation;
-            }
-            const elevation = typeof mapPlacement.elevation === 'number' && Number.isFinite(mapPlacement.elevation)
-                ? mapPlacement.elevation
-                : 0;
-            const z = typeof mapPlacement.z === 'number' && Number.isFinite(mapPlacement.z)
-                ? mapPlacement.z
-                : 0;
-            const sort = typeof mapPlacement.sort === 'number' && Number.isFinite(mapPlacement.sort)
-                ? mapPlacement.sort
-                : (typeof mapPlacement.zIndex === 'number' && Number.isFinite(mapPlacement.zIndex)
-                    ? mapPlacement.zIndex
-                    : 0);
-            const orderIndex = typeof mapPlacement.orderIndex === 'number' && Number.isFinite(mapPlacement.orderIndex)
-                ? mapPlacement.orderIndex
-                : index;
-            // Foundry stacks by several depth hints (elevation + z/sort + draw order).
-            // Collapse these into one deterministic OBR z-index.
-            resolvedZIndex = Math.round(
-                elevation * 1_000_000 +
-                z * 1_000 +
-                sort * 10 +
-                orderIndex
-            );
         }
 
-        return {
-            displayName: selectedImage.name || sourceMeta?.displayName || `Map ${index + 1}`,
-            metadataMatched,
-            wallData: sourceMeta?.wallData,
-            image: selectedImage.image,
-            grid: selectedImage.grid,
-            position,
-            rotation: resolvedRotation,
-            scale: resolvedScale,
-            zIndex: resolvedZIndex,
+        const baseWidth = (selectedImage.image.width * targetDpi) / sourceDpi;
+        const baseHeight = (selectedImage.image.height * targetDpi) / sourceDpi;
+        const targetWidth = typeof mapPlacement.targetWidth === 'number' && Number.isFinite(mapPlacement.targetWidth)
+            ? mapPlacement.targetWidth * targetDpiRatio
+            : undefined;
+        const targetHeight = typeof mapPlacement.targetHeight === 'number' && Number.isFinite(mapPlacement.targetHeight)
+            ? mapPlacement.targetHeight * targetDpiRatio
+            : undefined;
+        const widthScale = targetWidth && baseWidth > 0 ? targetWidth / baseWidth : undefined;
+        const heightScale = targetHeight && baseHeight > 0 ? targetHeight / baseHeight : undefined;
+        const explicitScaleX = typeof mapPlacement.scaleX === 'number' && Number.isFinite(mapPlacement.scaleX)
+            ? mapPlacement.scaleX
+            : undefined;
+        const explicitScaleY = typeof mapPlacement.scaleY === 'number' && Number.isFinite(mapPlacement.scaleY)
+            ? mapPlacement.scaleY
+            : undefined;
+        resolvedScale = {
+            x: widthScale ?? explicitScaleX ?? 1,
+            y: heightScale ?? explicitScaleY ?? 1,
         };
-    });
+
+        if (typeof mapPlacement.rotation === 'number' && Number.isFinite(mapPlacement.rotation)) {
+            resolvedRotation = mapPlacement.rotation;
+        }
+        const elevation = typeof mapPlacement.elevation === 'number' && Number.isFinite(mapPlacement.elevation)
+            ? mapPlacement.elevation
+            : 0;
+        const z = typeof mapPlacement.z === 'number' && Number.isFinite(mapPlacement.z)
+            ? mapPlacement.z
+            : 0;
+        const sort = typeof mapPlacement.sort === 'number' && Number.isFinite(mapPlacement.sort)
+            ? mapPlacement.sort
+            : (typeof mapPlacement.zIndex === 'number' && Number.isFinite(mapPlacement.zIndex)
+                ? mapPlacement.zIndex
+                : 0);
+        const orderIndex = typeof mapPlacement.orderIndex === 'number' && Number.isFinite(mapPlacement.orderIndex)
+            ? mapPlacement.orderIndex
+            : index;
+        // Foundry stacks by several depth hints (elevation + z/sort + draw order).
+        // Collapse these into one deterministic OBR z-index.
+        resolvedZIndex = Math.round(
+            elevation * 1_000_000 +
+            z * 1_000 +
+            sort * 10 +
+            orderIndex
+        );
+    }
+
+    return {
+        displayName: selectedImage.name || sourceMeta?.displayName || `Map ${index + 1}`,
+        metadataMatched,
+        wallData: sourceMeta?.wallData,
+        image: selectedImage.image,
+        grid: selectedImage.grid,
+        position,
+        rotation: resolvedRotation,
+        scale: resolvedScale,
+        zIndex: resolvedZIndex,
+    };
+});
 }
 
 export async function addMapsToCurrentScene(
@@ -2270,6 +2631,7 @@ export async function addMapsToCurrentScene(
     const targetDpi = await OBR.scene.grid.getDpi();
     const scale = clampPositiveNumber(options.scale, 1);
     const includeWalls = options.includeWalls ?? true;
+    const includeDrawings = options.includeDrawings ?? true;
     const includeLights = options.lightOptions?.includeLights ?? true;
     const lockMaps = options.lockMaps ?? true;
     const prepared = await prepareMapSources(sources, targetDpi, options);
@@ -2325,7 +2687,7 @@ export async function addMapsToCurrentScene(
         .filter((entry) => !entry.metadataMatched)
         .map((entry) => entry.displayName);
 
-    if (!includeWalls && !includeLights) {
+    if (!includeWalls && !includeDrawings && !includeLights) {
         options.onProgress?.(100);
         return {
             importedMapCount: positionedPrepared.length,
@@ -2334,7 +2696,8 @@ export async function addMapsToCurrentScene(
         };
     }
 
-    const fogItems: Item[] = [];
+    const importedItems: Item[] = [];
+    let addedFogFeatures = false;
     let wallsAppliedToMapCount = 0;
     for (const entry of positionedPrepared) {
         if (!entry.wallData) continue;
@@ -2343,25 +2706,39 @@ export async function addMapsToCurrentScene(
             x: entry.scale.x * scale,
             y: entry.scale.y * scale,
         };
+        if (includeDrawings && entry.wallData.drawings && entry.wallData.drawings.length > 0) {
+            const drawings = applyMapRotationToImportedItems(
+                await createDrawingItems(entry.wallData, entry.position, sourceScale, targetDpi),
+                entry.position,
+                entry.rotation
+            );
+            if (drawings.length > 0) {
+                importedItems.push(...drawings);
+                addedFeaturesForMap = true;
+            }
+        }
         if (includeWalls) {
             const walls = await createWallItems(entry.wallData, entry.position, sourceScale, targetDpi);
             if (walls.length > 0) {
-                fogItems.push(...walls);
+                importedItems.push(...walls);
                 addedFeaturesForMap = true;
+                addedFogFeatures = true;
             }
             if (entry.wallData.portals && entry.wallData.portals.length > 0) {
                 const doors = await createDoorItems(entry.wallData, entry.position, sourceScale, targetDpi);
                 if (doors.length > 0) {
-                    fogItems.push(...doors);
+                    importedItems.push(...doors);
                     addedFeaturesForMap = true;
+                    addedFogFeatures = true;
                 }
             }
         }
         if (includeLights && entry.wallData.lights && entry.wallData.lights.length > 0) {
             const lights = await createLightItems(entry.wallData, entry.position, sourceScale, targetDpi, options.lightOptions);
             if (lights.length > 0) {
-                fogItems.push(...lights);
+                importedItems.push(...lights);
                 addedFeaturesForMap = true;
+                addedFogFeatures = true;
             }
         }
         if (addedFeaturesForMap) {
@@ -2369,9 +2746,11 @@ export async function addMapsToCurrentScene(
         }
     }
 
-    if (fogItems.length > 0) {
-        await addItemsInBatches(fogItems, BATCH_SIZE);
-        await OBR.scene.fog.setFilled(true);
+    if (importedItems.length > 0) {
+        await addItemsInBatches(importedItems, BATCH_SIZE);
+        if (addedFogFeatures) {
+            await OBR.scene.fog.setFilled(true);
+        }
     }
 
     options.onProgress?.(100);
@@ -2398,6 +2777,7 @@ export async function addWallsToCurrentSceneWithLayout(
     const targetDpi = await OBR.scene.grid.getDpi();
     const scale = clampPositiveNumber(options.scale, 1);
     const includeWalls = options.includeWalls ?? true;
+    const includeDrawings = options.includeDrawings ?? true;
     const includeLights = options.lightOptions?.includeLights ?? true;
     const spacing = Math.max(0, Math.round(options.spacing ?? targetDpi));
     const shouldSnapToGrid = options.snapToGrid ?? true;
@@ -2455,6 +2835,133 @@ export async function addWallsToCurrentSceneWithLayout(
 
     let placementOffset: Vector2 = { x: 0, y: 0 };
     const existingMaps = await OBR.scene.items.getItems((item) => item.layer === 'MAP');
+    const existingMapTransformByStrictName = new Map<string, {
+        id: string;
+        name: string;
+        position: Vector2;
+        scale: Vector2;
+        rotation: number;
+    }[]>();
+    const existingMapTransformsByLooseName = new Map<string, Array<{
+        id: string;
+        name: string;
+        position: Vector2;
+        scale: Vector2;
+        rotation: number;
+    }>>();
+    const strictNameToMapIds = new Map<string, Set<string>>();
+    const looseNameToMapIds = new Map<string, Set<string>>();
+    const appendUniqueTransform = (
+        transformsByName: Map<string, Array<{
+            id: string;
+            name: string;
+            position: Vector2;
+            scale: Vector2;
+            rotation: number;
+        }>>,
+        seenIdsByName: Map<string, Set<string>>,
+        normalizedName: string,
+        transform: {
+            id: string;
+            name: string;
+            position: Vector2;
+            scale: Vector2;
+            rotation: number;
+        }
+    ): void => {
+        const seenIds = seenIdsByName.get(normalizedName) ?? new Set<string>();
+        if (seenIds.has(transform.id)) {
+            return;
+        }
+        seenIds.add(transform.id);
+        seenIdsByName.set(normalizedName, seenIds);
+        const transforms = transformsByName.get(normalizedName) ?? [];
+        transforms.push(transform);
+        transformsByName.set(normalizedName, transforms);
+    };
+    for (const mapItem of existingMaps) {
+        const mapId = typeof mapItem.id === 'string' ? mapItem.id : '';
+        if (!mapId) continue;
+        const mapName = typeof mapItem.name === 'string' ? mapItem.name : '';
+        const strictNormalizedMapName = normalizeNameForMatching(mapName);
+        if (!strictNormalizedMapName) continue;
+        const looseNormalizedMapName = normalizeNameForLooseMatching(mapName);
+        const mapPosition = (mapItem as { position?: unknown }).position as Vector2 | undefined;
+        const mapScale = (mapItem as { scale?: unknown }).scale as Vector2 | undefined;
+        if (
+            !mapPosition
+            || typeof mapPosition.x !== 'number'
+            || typeof mapPosition.y !== 'number'
+        ) {
+            continue;
+        }
+        const resolvedScale: Vector2 = {
+            x: typeof mapScale?.x === 'number' && Number.isFinite(mapScale.x) ? mapScale.x : 1,
+            y: typeof mapScale?.y === 'number' && Number.isFinite(mapScale.y) ? mapScale.y : 1,
+        };
+        const mapRotation = (mapItem as { rotation?: unknown }).rotation;
+        const resolvedRotation =
+            typeof mapRotation === "number" && Number.isFinite(mapRotation)
+                ? mapRotation
+                : 0;
+        const transform = {
+            id: mapId,
+            name: mapName,
+            position: { x: mapPosition.x, y: mapPosition.y },
+            scale: resolvedScale,
+            rotation: resolvedRotation,
+        };
+        appendUniqueTransform(
+            existingMapTransformByStrictName,
+            strictNameToMapIds,
+            strictNormalizedMapName,
+            transform
+        );
+        if (looseNormalizedMapName) {
+            appendUniqueTransform(
+                existingMapTransformsByLooseName,
+                looseNameToMapIds,
+                looseNormalizedMapName,
+                transform
+            );
+        }
+    }
+
+    const resolveExistingMapTransform = (
+        sourceName: string
+    ): {
+        transform?: {
+            name: string;
+            position: Vector2;
+            scale: Vector2;
+            rotation: number;
+        };
+        matchType: 'strict' | 'loose' | 'none' | 'ambiguous-strict' | 'ambiguous-loose';
+    } => {
+        const strictKey = normalizeNameForMatching(sourceName);
+        if (!strictKey) {
+            return { matchType: 'none' };
+        }
+        const strictMatches = existingMapTransformByStrictName.get(strictKey) ?? [];
+        if (strictMatches.length === 1) {
+            return { transform: strictMatches[0], matchType: 'strict' };
+        }
+        if (strictMatches.length > 1) {
+            return { matchType: 'ambiguous-strict' };
+        }
+        const looseKey = normalizeNameForLooseMatching(sourceName);
+        if (!looseKey) {
+            return { matchType: 'none' };
+        }
+        const looseMatches = existingMapTransformsByLooseName.get(looseKey) ?? [];
+        if (looseMatches.length === 1) {
+            return { transform: looseMatches[0], matchType: 'loose' };
+        }
+        if (looseMatches.length > 1) {
+            return { matchType: 'ambiguous-loose' };
+        }
+        return { matchType: 'none' };
+    };
     if (existingMaps.length > 0) {
         const bounds = await OBR.scene.items.getItemBounds(existingMaps.map((item) => item.id));
         const placementMode = options.placement ?? 'RIGHT';
@@ -2474,8 +2981,17 @@ export async function addWallsToCurrentSceneWithLayout(
     }
 
     const unmatchedSelectionNames: string[] = [];
-    const fogItems: Item[] = [];
+    const importedItems: Item[] = [];
+    let addedFogFeatures = false;
     let wallsAppliedToMapCount = 0;
+    const matchedSourceTransforms = sources.map((source) => {
+        const match = resolveExistingMapTransform(source.name);
+        return {
+            source,
+            transform: match.transform,
+            matchType: match.matchType,
+        };
+    });
 
     for (let i = 0; i < sources.length; i++) {
         const source = sources[i];
@@ -2485,43 +3001,155 @@ export async function addWallsToCurrentSceneWithLayout(
             continue;
         }
 
-        const position = {
-            x: positions[i].x + placementOffset.x,
-            y: positions[i].y + placementOffset.y,
-        };
-        const sourceScale = { x: scale, y: scale };
+        const wallDataSourceDpi = clampPositiveNumber(
+            wallData.resolution?.pixels_per_grid ?? source.dpi,
+            100
+        );
+        const sourceMatch = matchedSourceTransforms[i];
+        const directExistingMapTransform = sourceMatch.transform;
+
+        let position = directExistingMapTransform
+            ? {
+                x: directExistingMapTransform.position.x,
+                y: directExistingMapTransform.position.y,
+            }
+            : {
+                x: positions[i].x + placementOffset.x,
+                y: positions[i].y + placementOffset.y,
+            };
+        let sourceScale = directExistingMapTransform
+            ? {
+                x: directExistingMapTransform.scale.x,
+                y: directExistingMapTransform.scale.y,
+            }
+            : { x: scale, y: scale };
+        let sourceRotation = directExistingMapTransform
+            ? directExistingMapTransform.rotation
+            : 0;
+        if (!directExistingMapTransform) {
+            const sourcePlacementX = source.mapPlacement?.x;
+            const sourcePlacementY = source.mapPlacement?.y;
+            const sourceSceneName = (source.sourceSceneName ?? '').trim().toLowerCase();
+            const anchorCandidate = matchedSourceTransforms.find((candidate) => {
+                const candidatePlacementX = candidate.source.mapPlacement?.x;
+                const candidatePlacementY = candidate.source.mapPlacement?.y;
+                const candidateSceneName = (candidate.source.sourceSceneName ?? '').trim().toLowerCase();
+                const sameSourceScene = sourceSceneName || candidateSceneName
+                    ? sourceSceneName === candidateSceneName
+                    : true;
+                return !!candidate.transform
+                    && sameSourceScene
+                    && typeof sourcePlacementX === 'number'
+                    && Number.isFinite(sourcePlacementX)
+                    && typeof sourcePlacementY === 'number'
+                    && Number.isFinite(sourcePlacementY)
+                    && typeof candidatePlacementX === 'number'
+                    && Number.isFinite(candidatePlacementX)
+                    && typeof candidatePlacementY === 'number'
+                    && Number.isFinite(candidatePlacementY);
+            });
+
+            if (
+                anchorCandidate
+                && anchorCandidate.transform
+                && typeof sourcePlacementX === 'number'
+                && typeof sourcePlacementY === 'number'
+            ) {
+                const anchorPlacementX = anchorCandidate.source.mapPlacement?.x as number;
+                const anchorPlacementY = anchorCandidate.source.mapPlacement?.y as number;
+                const anchorScale = anchorCandidate.transform.scale;
+                const anchorDpiRatio = targetDpi / wallDataSourceDpi;
+                const deltaFoundryX = anchorPlacementX - sourcePlacementX;
+                const deltaFoundryY = anchorPlacementY - sourcePlacementY;
+                const anchorRotation = anchorCandidate.transform.rotation;
+                const sourceOffsetInAnchorSpace = {
+                    x: deltaFoundryX * anchorDpiRatio * anchorScale.x,
+                    y: deltaFoundryY * anchorDpiRatio * anchorScale.y,
+                };
+                const sourceOffsetInSceneSpace = rotatePointAroundOrigin(
+                    sourceOffsetInAnchorSpace,
+                    { x: 0, y: 0 },
+                    anchorRotation
+                );
+
+                position = {
+                    x: anchorCandidate.transform.position.x - sourceOffsetInSceneSpace.x,
+                    y: anchorCandidate.transform.position.y - sourceOffsetInSceneSpace.y,
+                };
+                sourceScale = {
+                    x: anchorScale.x,
+                    y: anchorScale.y,
+                };
+                sourceRotation = anchorRotation;
+            }
+        }
 
         let addedFeaturesForMap = false;
-        if (includeWalls) {
-            const walls = await createWallItems(wallData, position, sourceScale, targetDpi);
-            if (walls.length > 0) {
-                fogItems.push(...walls);
+        if (includeDrawings && wallData.drawings && wallData.drawings.length > 0) {
+            const drawings = applyMapRotationToImportedItems(
+                await createDrawingItems(wallData, position, sourceScale, targetDpi),
+                position,
+                sourceRotation
+            );
+            if (drawings.length > 0) {
+                importedItems.push(...drawings);
                 addedFeaturesForMap = true;
+            }
+        }
+        if (includeWalls) {
+            const walls = applyMapRotationToImportedItems(
+                await createWallItems(wallData, position, sourceScale, targetDpi),
+                position,
+                sourceRotation
+            );
+            if (walls.length > 0) {
+                importedItems.push(...walls);
+                addedFeaturesForMap = true;
+                addedFogFeatures = true;
             }
 
             if (wallData.portals && wallData.portals.length > 0) {
-                const doors = await createDoorItems(wallData, position, sourceScale, targetDpi);
+                const doors = applyMapRotationToImportedItems(
+                    await createDoorItems(wallData, position, sourceScale, targetDpi),
+                    position,
+                    sourceRotation
+                );
                 if (doors.length > 0) {
-                    fogItems.push(...doors);
+                    importedItems.push(...doors);
                     addedFeaturesForMap = true;
+                    addedFogFeatures = true;
                 }
             }
         }
         if (includeLights && wallData.lights && wallData.lights.length > 0) {
-            const lights = await createLightItems(wallData, position, sourceScale, targetDpi, options.lightOptions);
+            const lights = applyMapRotationToImportedItems(
+                await createLightItems(
+                    wallData,
+                    position,
+                    sourceScale,
+                    targetDpi,
+                    options.lightOptions
+                ),
+                position,
+                sourceRotation
+            );
             if (lights.length > 0) {
-                fogItems.push(...lights);
+                importedItems.push(...lights);
                 addedFeaturesForMap = true;
+                addedFogFeatures = true;
             }
         }
         if (addedFeaturesForMap) {
             wallsAppliedToMapCount += 1;
         }
+
     }
 
-    if (fogItems.length > 0) {
-        await addItemsInBatches(fogItems, BATCH_SIZE);
-        await OBR.scene.fog.setFilled(true);
+    if (importedItems.length > 0) {
+        await addItemsInBatches(importedItems, BATCH_SIZE);
+        if (addedFogFeatures) {
+            await OBR.scene.fog.setFilled(true);
+        }
     }
 
     options.onProgress?.(100);
@@ -2544,6 +3172,7 @@ export async function createSceneWithMultipleMaps(
     const targetDpi = DEFAULT_NEW_SCENE_GRID_DPI;
     const scale = clampPositiveNumber(options.scale, 1);
     const includeWalls = options.includeWalls ?? true;
+    const includeDrawings = options.includeDrawings ?? true;
     const includeLights = options.lightOptions?.includeLights ?? true;
     const lockMaps = options.lockMaps ?? true;
     const prepared = await prepareMapSources(sources, targetDpi, options);
@@ -2563,9 +3192,9 @@ export async function createSceneWithMultipleMaps(
         return builder.build();
     });
 
-    let addedFogFeatureItems = false;
+    let addedFogFeatures = false;
     let wallsAppliedToMapCount = 0;
-    if (includeWalls || includeLights) {
+    if (includeWalls || includeDrawings || includeLights) {
         for (const entry of prepared) {
             if (!entry.wallData) continue;
             let addedFeaturesForMap = false;
@@ -2573,18 +3202,29 @@ export async function createSceneWithMultipleMaps(
                 x: entry.scale.x * scale,
                 y: entry.scale.y * scale,
             };
+            if (includeDrawings && entry.wallData.drawings && entry.wallData.drawings.length > 0) {
+                const drawings = applyMapRotationToImportedItems(
+                    await createDrawingItems(entry.wallData, entry.position, sourceScale, targetDpi),
+                    entry.position,
+                    entry.rotation
+                );
+                if (drawings.length > 0) {
+                    addedFeaturesForMap = true;
+                    sceneItems.push(...drawings);
+                }
+            }
             if (includeWalls) {
                 const walls = await createWallItems(entry.wallData, entry.position, sourceScale, targetDpi);
                 if (walls.length > 0) {
-                    addedFogFeatureItems = true;
                     addedFeaturesForMap = true;
+                    addedFogFeatures = true;
                     sceneItems.push(...walls);
                 }
                 if (entry.wallData.portals && entry.wallData.portals.length > 0) {
                     const doors = await createDoorItems(entry.wallData, entry.position, sourceScale, targetDpi);
                     if (doors.length > 0) {
-                        addedFogFeatureItems = true;
                         addedFeaturesForMap = true;
+                        addedFogFeatures = true;
                         sceneItems.push(...doors);
                     }
                 }
@@ -2592,8 +3232,8 @@ export async function createSceneWithMultipleMaps(
             if (includeLights && entry.wallData.lights && entry.wallData.lights.length > 0) {
                 const lights = await createLightItems(entry.wallData, entry.position, sourceScale, targetDpi, options.lightOptions);
                 if (lights.length > 0) {
-                    addedFogFeatureItems = true;
                     addedFeaturesForMap = true;
+                    addedFogFeatures = true;
                     sceneItems.push(...lights);
                 }
             }
@@ -2607,7 +3247,7 @@ export async function createSceneWithMultipleMaps(
         .name(options.sceneName?.trim() || 'Multi Map Scene')
         .gridType('SQUARE')
         .items(sceneItems)
-        .fogFilled(addedFogFeatureItems);
+        .fogFilled(addedFogFeatures);
 
     const firstMapGridScale = sources.find(m => m.wallData?.gridScale)?.wallData?.gridScale;
     if (firstMapGridScale) {
@@ -2622,7 +3262,7 @@ export async function createSceneWithMultipleMaps(
 
     return {
         importedMapCount: prepared.length,
-        wallsAppliedToMapCount: (includeWalls || includeLights) ? wallsAppliedToMapCount : 0,
+        wallsAppliedToMapCount,
         unmatchedSelectionNames: prepared
             .filter((entry) => !entry.metadataMatched)
             .map((entry) => entry.displayName),
@@ -2827,6 +3467,7 @@ export async function uploadSceneFromVTT(
     const defaultPosition: Vector2 = { x: 0, y: 0 };
     const defaultScale: Vector2 = { x: 1, y: 1 };
     const includeWalls = fogImportOptions.includeWalls ?? true;
+    const includeDrawings = fogImportOptions.includeDrawings ?? true;
     const lightOptions = fogImportOptions.lightOptions;
 
     const wallItems = includeWalls
@@ -2834,13 +3475,18 @@ export async function uploadSceneFromVTT(
         : [];
     let doorItems: Item[] = [];
     let lightItems: Item[] = [];
+    let drawingItems: Item[] = [];
     if (includeWalls && vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
         doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
+    }
+    if (includeDrawings && vttMapDataSource.drawings && vttMapDataSource.drawings.length > 0) {
+        drawingItems = await createDrawingItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
     }
     if (vttMapDataSource.lights && vttMapDataSource.lights.length > 0) {
         lightItems = await createLightItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI, lightOptions);
     }
-    const allItems = [...wallItems, ...doorItems, ...lightItems];
+    const allItems = [...wallItems, ...doorItems, ...drawingItems, ...lightItems];
+    const hasFogFeatures = wallItems.length > 0 || doorItems.length > 0 || lightItems.length > 0;
 
     let sceneBuilder = buildSceneUpload()
         .name(file.name.replace(/\.[^/.]+$/, ""))
@@ -2852,7 +3498,7 @@ export async function uploadSceneFromVTT(
     }
 
     if (allItems.length > 0) {
-        sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
+        sceneBuilder = sceneBuilder.items(allItems).fogFilled(hasFogFeatures);
     }
 
     const sceneToUpload = sceneBuilder.build();
@@ -2917,6 +3563,7 @@ export async function uploadFoundryScene(
     const defaultPosition: Vector2 = { x: 0, y: 0 };
     const defaultScale: Vector2 = { x: 1, y: 1 };
     const includeWalls = fogImportOptions.includeWalls ?? true;
+    const includeDrawings = fogImportOptions.includeDrawings ?? true;
     const lightOptions = fogImportOptions.lightOptions;
 
     const wallItems = includeWalls
@@ -2924,13 +3571,18 @@ export async function uploadFoundryScene(
         : [];
     let doorItems: Item[] = [];
     let lightItems: Item[] = [];
+    let drawingItems: Item[] = [];
     if (includeWalls && vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
         doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
+    }
+    if (includeDrawings && vttMapDataSource.drawings && vttMapDataSource.drawings.length > 0) {
+        drawingItems = await createDrawingItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
     }
     if (vttMapDataSource.lights && vttMapDataSource.lights.length > 0) {
         lightItems = await createLightItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI, lightOptions);
     }
-    const allItems = [...wallItems, ...doorItems, ...lightItems];
+    const allItems = [...wallItems, ...doorItems, ...drawingItems, ...lightItems];
+    const hasFogFeatures = wallItems.length > 0 || doorItems.length > 0 || lightItems.length > 0;
 
     let sceneBuilder = buildSceneUpload()
         .name(name)
@@ -2942,7 +3594,7 @@ export async function uploadFoundryScene(
     }
 
     if (allItems.length > 0) {
-        sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
+        sceneBuilder = sceneBuilder.items(allItems).fogFilled(hasFogFeatures);
     }
 
     const sceneToUpload = sceneBuilder.build();
@@ -3021,19 +3673,25 @@ export async function uploadMediaSceneWithWallData(
     const defaultPosition: Vector2 = { x: 0, y: 0 };
     const defaultScale: Vector2 = { x: 1, y: 1 };
     const includeWalls = fogImportOptions.includeWalls ?? true;
+    const includeDrawings = fogImportOptions.includeDrawings ?? true;
     const lightOptions = fogImportOptions.lightOptions;
     const wallItems = includeWalls
         ? await createWallItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI)
         : [];
     let doorItems: Item[] = [];
     let lightItems: Item[] = [];
+    let drawingItems: Item[] = [];
     if (includeWalls && vttMapDataSource.portals && vttMapDataSource.portals.length > 0) {
         doorItems = await createDoorItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
+    }
+    if (includeDrawings && vttMapDataSource.drawings && vttMapDataSource.drawings.length > 0) {
+        drawingItems = await createDrawingItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI);
     }
     if (vttMapDataSource.lights && vttMapDataSource.lights.length > 0) {
         lightItems = await createLightItems(vttMapDataSource, defaultPosition, defaultScale, DEFAULT_NEW_SCENE_GRID_DPI, lightOptions);
     }
-    const allItems = [...wallItems, ...doorItems, ...lightItems];
+    const allItems = [...wallItems, ...doorItems, ...drawingItems, ...lightItems];
+    const hasFogFeatures = wallItems.length > 0 || doorItems.length > 0 || lightItems.length > 0;
 
     let sceneBuilder = buildSceneUpload()
         .name(normalizedName)
@@ -3045,7 +3703,7 @@ export async function uploadMediaSceneWithWallData(
     }
 
     if (allItems.length > 0) {
-        sceneBuilder = sceneBuilder.items(allItems).fogFilled(true);
+        sceneBuilder = sceneBuilder.items(allItems).fogFilled(hasFogFeatures);
     }
 
     onStage?.('Uploading scene');
@@ -3074,6 +3732,7 @@ export async function addItemsFromData(
     context: boolean,
     options: {
         includeWalls?: boolean;
+        includeDrawings?: boolean;
         lightOptions?: LightImportOptions;
     } = {}
 ): Promise<void> {
@@ -3157,7 +3816,9 @@ export async function addItemsFromData(
     }
 
     const includeWalls = options.includeWalls ?? true;
+    const includeDrawings = options.includeDrawings ?? true;
     const includeLights = options.lightOptions?.includeLights ?? true;
+    let addedAnyItems = false;
     let addedAnyFogItems = false;
 
     if (includeWalls) {
@@ -3165,6 +3826,7 @@ export async function addItemsFromData(
         if (walls.length > 0) {
             await addItemsInBatches(walls, BATCH_SIZE);
             addedAnyFogItems = true;
+            addedAnyItems = true;
         }
 
         if (processedData.portals && processedData.portals.length > 0) {
@@ -3172,6 +3834,7 @@ export async function addItemsFromData(
             if (doors.length > 0) {
                 await addItemsInBatches(doors, BATCH_SIZE);
                 addedAnyFogItems = true;
+                addedAnyItems = true;
             }
         }
     }
@@ -3181,20 +3844,38 @@ export async function addItemsFromData(
         if (lights.length > 0) {
             await addItemsInBatches(lights, BATCH_SIZE);
             addedAnyFogItems = true;
+            addedAnyItems = true;
+        }
+    }
+    if (includeDrawings && processedData.drawings && processedData.drawings.length > 0) {
+        const drawings = await createDrawingItems(processedData, position, scale, dpi);
+        if (drawings.length > 0) {
+            await addItemsInBatches(drawings, BATCH_SIZE);
+            addedAnyItems = true;
         }
     }
 
-    if (addedAnyFogItems) {
-        await OBR.scene.fog.setFilled(true);
+    if (addedAnyItems) {
+        if (addedAnyFogItems) {
+            await OBR.scene.fog.setFilled(true);
+        }
         await OBR.notification.show("Import complete!", "SUCCESS");
         return;
     }
 
-    const noDataMessage = includeWalls && includeLights
-        ? "No walls, doors, or lights were found for the selected import options."
-        : includeWalls
-            ? "No walls or doors were found for the selected import options."
-            : "No lights were found for the selected import options.";
+    const noDataMessage = includeWalls && includeLights && includeDrawings
+        ? "No walls, doors, lights, or drawings were found for the selected import options."
+        : includeWalls && includeLights
+            ? "No walls, doors, or lights were found for the selected import options."
+            : includeWalls && includeDrawings
+                ? "No walls, doors, or drawings were found for the selected import options."
+                : includeLights && includeDrawings
+                    ? "No lights or drawings were found for the selected import options."
+                    : includeWalls
+                        ? "No walls or doors were found for the selected import options."
+                        : includeLights
+                            ? "No lights were found for the selected import options."
+                            : "No drawings were found for the selected import options.";
     await OBR.notification.show(noDataMessage, "INFO");
 }
 
@@ -3203,6 +3884,7 @@ export async function addItemsFromVTT(
     context: boolean,
     options: {
         includeWalls?: boolean;
+        includeDrawings?: boolean;
         lightOptions?: LightImportOptions;
     } = {}
 ): Promise<void> {
