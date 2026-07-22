@@ -60,15 +60,18 @@ export interface VTTMapData {
 }
 
 export interface FoundryVTTWall {
+    _id?: string;
     c: number[];  // coordinates [x1, y1, x2, y2]
     move?: number;
     sense?: number;
     door: number; // 0 for normal wall, 1 for door
     ds?: number;
     sound?: number;
+    flags?: Record<string, unknown>;
 }
 
 export interface FoundryVTTLight {
+    _id?: string;
     x: number;
     y: number;
     hidden?: boolean;
@@ -96,6 +99,34 @@ export interface FoundryVTTLight {
     color?: string;
     luminosity?: number;
     attenuation?: number;
+    flags?: Record<string, unknown>;
+}
+
+export interface FoundryVTTTile {
+    _id?: string;
+    name?: string;
+    img?: string;
+    texture?: {
+        src?: string;
+        scaleX?: number;
+        scaleY?: number;
+        offsetX?: number;
+        offsetY?: number;
+        rotation?: number;
+        anchorX?: number;
+        anchorY?: number;
+    };
+    x?: number;
+    y?: number;
+    width?: number;
+    height?: number;
+    rotation?: number;
+    hidden?: boolean;
+    alpha?: number;
+    elevation?: number;
+    z?: number;
+    sort?: number;
+    flags?: Record<string, unknown>;
 }
 
 export interface FoundryShapeData {
@@ -135,9 +166,12 @@ export interface FoundryVTTDrawing {
     fontSize?: number;
     bezierFactor?: number;
     texture?: string;
+    interface?: boolean;
+    flags?: Record<string, unknown>;
 }
 
 export interface FoundryVTTData {
+    _id?: string;
     name: string;
     width: number;
     height: number;
@@ -147,11 +181,18 @@ export interface FoundryVTTData {
     padding?: number;
     shiftX?: number;
     shiftY?: number;
+    img?: string;
     background?: {
         offsetX?: number;
         offsetY?: number;
         src?: string;
+        scaleX?: number;
+        scaleY?: number;
+        rotation?: number;
+        anchorX?: number;
+        anchorY?: number;
     };
+    tiles?: Array<FoundryVTTTile | string>;
     walls?: FoundryVTTWall[];
     lights?: FoundryVTTLight[];
     drawings?: Array<FoundryVTTDrawing | string>;

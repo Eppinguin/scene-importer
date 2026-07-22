@@ -9,6 +9,14 @@ import OBR, {
 } from "@owlbear-rodeo/sdk";
 import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTWall, type FoundryVTTLight, type FoundryVTTDrawing, type VTTDrawing } from "./vttTypes";
 import { createWallItems, createDoorItems, createLightItems, createDrawingItems, type LightImportOptions } from "./vttItems";
+import {
+    selectFoundryLogicalMapFeatures,
+    type FoundryLogicalMap,
+} from "./foundryScenePlan";
+import {
+    FOUNDRY_MAP_IDENTITY_KEY,
+    type FoundryMapIdentity,
+} from "./foundryMapMetadata";
 export type { LightImportOptions } from "./vttItems";
 
 type VTTData = VTTMapData;
@@ -139,7 +147,9 @@ function convertFoundryDrawingsToVTTDrawings(
     sourceDrawings: Array<FoundryVTTDrawing | string>,
     offsetX: number,
     offsetY: number,
-    gridSize: number
+    gridSize: number,
+    transformPoint: (point: Vector2) => Vector2 = (point) => point,
+    rotationOffset = 0
 ): VTTDrawing[] {
     const drawings: VTTDrawing[] = [];
 
@@ -148,8 +158,12 @@ function convertFoundryDrawingsToVTTDrawings(
 
         const rawX = Number(drawing.x ?? 0);
         const rawY = Number(drawing.y ?? 0);
-        const x = (Number.isFinite(rawX) ? rawX : 0) - offsetX;
-        const y = (Number.isFinite(rawY) ? rawY : 0) - offsetY;
+        const transformedPosition = transformPoint({
+            x: Number.isFinite(rawX) ? rawX : 0,
+            y: Number.isFinite(rawY) ? rawY : 0,
+        });
+        const x = transformedPosition.x - offsetX;
+        const y = transformedPosition.y - offsetY;
 
         const shape = drawing.shape;
         const rawType = drawing.type ?? drawing.t ?? shape?.type;
@@ -217,7 +231,7 @@ function convertFoundryDrawingsToVTTDrawings(
             height: Number.isFinite(height) ? height / gridSize : undefined,
             radius: Number.isFinite(radius) ? radius / gridSize : undefined,
             points: points.length >= 4 ? points : undefined,
-            rotation: Number.isFinite(rotation) ? rotation : 0,
+            rotation: Number.isFinite(rotation) ? rotation + rotationOffset : rotationOffset,
             hidden: !!drawing.hidden,
             locked: !!drawing.locked,
             zIndex: Math.round(elevation * 1_000_000 + z * 1_000 + sort),
@@ -243,7 +257,16 @@ function convertFoundryDrawingsToVTTDrawings(
     return drawings;
 }
 
-export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
+export type FoundryConversionOptions = {
+    origin?: Vector2;
+    mapSizePixels?: Vector2;
+    sourceRotation?: number;
+};
+
+export function convertFoundryToVTTData(
+    foundryData: FoundryVTTData,
+    options: FoundryConversionOptions = {}
+): VTTData {
     let padX = 0;
     let padY = 0;
     const sourceWalls = Array.isArray(foundryData.walls) ? foundryData.walls : [];
@@ -289,32 +312,56 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
     const bgShiftX = foundryData.shiftX || (foundryData.background && foundryData.background.offsetX) || 0;
     const bgShiftY = foundryData.shiftY || (foundryData.background && foundryData.background.offsetY) || 0;
 
-    const offsetX = padX + bgShiftX;
-    const offsetY = padY + bgShiftY;
+    const offsetX = options.origin?.x ?? (padX + bgShiftX);
+    const offsetY = options.origin?.y ?? (padY + bgShiftY);
+    const sourceRotation = Number.isFinite(options.sourceRotation)
+        ? options.sourceRotation as number
+        : 0;
+    const mapSizePixels = options.mapSizePixels ?? {
+        x: foundryData.width,
+        y: foundryData.height,
+    };
+    const sourceCenter = {
+        x: offsetX + mapSizePixels.x / 2,
+        y: offsetY + mapSizePixels.y / 2,
+    };
+    const transformSourcePoint = (point: Vector2): Vector2 =>
+        sourceRotation === 0
+            ? point
+            : rotatePointAroundOrigin(point, sourceCenter, -sourceRotation);
 
     const walls: Vector2[][] = sourceWalls
         .filter(wall => wall.door === 0) // Non-door walls
-        .map(wall => [
-            { x: (wall.c[0] - offsetX) / gridSize, y: (wall.c[1] - offsetY) / gridSize },
-            { x: (wall.c[2] - offsetX) / gridSize, y: (wall.c[3] - offsetY) / gridSize }
-        ]);
+        .map(wall => {
+            const start = transformSourcePoint({ x: wall.c[0], y: wall.c[1] });
+            const end = transformSourcePoint({ x: wall.c[2], y: wall.c[3] });
+            return [
+                { x: (start.x - offsetX) / gridSize, y: (start.y - offsetY) / gridSize },
+                { x: (end.x - offsetX) / gridSize, y: (end.y - offsetY) / gridSize }
+            ];
+        });
 
     const portals = sourceWalls
         .filter(wall => wall.door === 1) // Door walls
-        .map(wall => ({
-            position: { x: 0, y: 0 }, // Not actually used by OBR sdk in same way
-            bounds: [
-                { x: (wall.c[0] - offsetX) / gridSize, y: (wall.c[1] - offsetY) / gridSize },
-                { x: (wall.c[2] - offsetX) / gridSize, y: (wall.c[3] - offsetY) / gridSize }
-            ],
-            rotation: 0,
-            closed: wall.ds === 0, // Assuming ds=0 means closed, ds=1 means open
-            freestanding: false
-        }));
+        .map(wall => {
+            const start = transformSourcePoint({ x: wall.c[0], y: wall.c[1] });
+            const end = transformSourcePoint({ x: wall.c[2], y: wall.c[3] });
+            return {
+                position: { x: 0, y: 0 }, // Not actually used by OBR sdk in same way
+                bounds: [
+                    { x: (start.x - offsetX) / gridSize, y: (start.y - offsetY) / gridSize },
+                    { x: (end.x - offsetX) / gridSize, y: (end.y - offsetY) / gridSize }
+                ],
+                rotation: 0,
+                closed: wall.ds === 0, // Assuming ds=0 means closed, ds=1 means open
+                freestanding: false
+            };
+        });
 
     const lights = sourceLights
         .filter((light) => typeof light.x === 'number' && typeof light.y === 'number')
         .map((light) => {
+            const transformedPosition = transformSourcePoint({ x: light.x, y: light.y });
             const config = light.config ?? {};
             const brightDistance = Number(config.bright ?? light.bright ?? 0);
             const dimDistance = Number(config.dim ?? light.dim ?? 0);
@@ -331,7 +378,7 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
                 : 360;
             const rawRotation = Number(config.rotation ?? light.rotation ?? 0);
             const rotation = Number.isFinite(rawRotation)
-                ? ((rawRotation % 360) + 360) % 360
+                ? normalizeDegrees(rawRotation - sourceRotation)
                 : 0;
             const rawColor = config.color ?? light.color;
             const tintAlpha = Number(config.tintAlpha ?? light.tintAlpha ?? 1);
@@ -342,8 +389,8 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
 
             return {
                 position: {
-                    x: (light.x - offsetX) / gridSize,
-                    y: (light.y - offsetY) / gridSize,
+                    x: (transformedPosition.x - offsetX) / gridSize,
+                    y: (transformedPosition.y - offsetY) / gridSize,
                 },
                 range,
                 color,
@@ -359,12 +406,19 @@ export function convertFoundryToVTTData(foundryData: FoundryVTTData): VTTData {
             };
         })
         .filter((light) => light.range > 0);
-    const drawings = convertFoundryDrawingsToVTTDrawings(sourceDrawings, offsetX, offsetY, gridSize);
+    const drawings = convertFoundryDrawingsToVTTDrawings(
+        sourceDrawings,
+        offsetX,
+        offsetY,
+        gridSize,
+        transformSourcePoint,
+        -sourceRotation
+    );
 
     return {
         resolution: {
             map_origin: { x: 0, y: 0 },
-            map_size: { x: foundryData.width / gridSize, y: foundryData.height / gridSize },
+            map_size: { x: mapSizePixels.x / gridSize, y: mapSizePixels.y / gridSize },
             pixels_per_grid: gridSize
         },
         gridScale: gridScaleStr,
@@ -417,7 +471,9 @@ export interface MapImportSource {
     mediaBlob: Blob | File;
     dpi?: number;
     wallData?: VTTMapData;
+    sourceKey?: string;
     sourceSceneName?: string;
+    foundryMapIdentity?: FoundryMapIdentity;
     mapPlacement?: {
         x?: number;
         y?: number;
@@ -523,7 +579,9 @@ interface PreparedMapImportSource {
     file: File;
     dpi: number;
     wallData?: VTTMapData;
+    sourceKey?: string;
     sourceSceneName?: string;
+    foundryMapIdentity?: FoundryMapIdentity;
     mapPlacement?: MapImportSource['mapPlacement'];
 }
 
@@ -537,6 +595,7 @@ interface ResolvedMapImportSource {
     rotation: number;
     scale: Vector2;
     zIndex?: number;
+    foundryMapIdentity?: FoundryMapIdentity;
 }
 
 interface SelectedImageCandidate {
@@ -2344,7 +2403,9 @@ async function prepareMapSources(
                 file: processedAsset.file,
                 dpi: processedAsset.dpi,
                 wallData: source.wallData,
+                sourceKey: source.sourceKey,
                 sourceSceneName: source.sourceSceneName,
+                foundryMapIdentity: source.foundryMapIdentity,
                 mapPlacement: source.mapPlacement,
             });
 
@@ -2648,6 +2709,7 @@ async function prepareMapSources(
             rotation: resolvedRotation,
             scale: resolvedScale,
             zIndex: resolvedZIndex,
+            foundryMapIdentity: sourceMeta?.foundryMapIdentity,
         };
     });
 }
@@ -2713,6 +2775,11 @@ export async function addMapsToCurrentScene(
             .visible(true);
         if (typeof entry.zIndex === 'number' && Number.isFinite(entry.zIndex)) {
             builder = builder.zIndex(entry.zIndex);
+        }
+        if (entry.foundryMapIdentity) {
+            builder = builder.metadata({
+                [FOUNDRY_MAP_IDENTITY_KEY]: entry.foundryMapIdentity,
+            });
         }
         return builder.build();
     });
@@ -2871,39 +2938,22 @@ export async function addWallsToCurrentSceneWithLayout(
 
     let placementOffset: Vector2 = { x: 0, y: 0 };
     const existingMaps = await OBR.scene.items.getItems((item) => item.layer === 'MAP');
-    const existingMapTransformByStrictName = new Map<string, {
+    type ExistingMapTransform = {
         id: string;
         name: string;
         position: Vector2;
         scale: Vector2;
         rotation: number;
-    }[]>();
-    const existingMapTransformsByLooseName = new Map<string, Array<{
-        id: string;
-        name: string;
-        position: Vector2;
-        scale: Vector2;
-        rotation: number;
-    }>>();
+    };
+    const existingMapTransformByStrictName = new Map<string, ExistingMapTransform[]>();
+    const existingMapTransformsByLooseName = new Map<string, ExistingMapTransform[]>();
     const strictNameToMapIds = new Map<string, Set<string>>();
     const looseNameToMapIds = new Map<string, Set<string>>();
     const appendUniqueTransform = (
-        transformsByName: Map<string, Array<{
-            id: string;
-            name: string;
-            position: Vector2;
-            scale: Vector2;
-            rotation: number;
-        }>>,
+        transformsByName: Map<string, ExistingMapTransform[]>,
         seenIdsByName: Map<string, Set<string>>,
         normalizedName: string,
-        transform: {
-            id: string;
-            name: string;
-            position: Vector2;
-            scale: Vector2;
-            rotation: number;
-        }
+        transform: ExistingMapTransform
     ): void => {
         const seenIds = seenIdsByName.get(normalizedName) ?? new Set<string>();
         if (seenIds.has(transform.id)) {
@@ -2966,12 +3016,7 @@ export async function addWallsToCurrentSceneWithLayout(
     const resolveExistingMapTransform = (
         sourceName: string
     ): {
-        transform?: {
-            name: string;
-            position: Vector2;
-            scale: Vector2;
-            rotation: number;
-        };
+        transform?: ExistingMapTransform;
         matchType: 'strict' | 'loose' | 'none' | 'ambiguous-strict' | 'ambiguous-loose';
     } => {
         const strictKey = normalizeNameForMatching(sourceName);
@@ -3224,6 +3269,11 @@ export async function createSceneWithMultipleMaps(
             .visible(true);
         if (typeof entry.zIndex === 'number' && Number.isFinite(entry.zIndex)) {
             builder = builder.zIndex(entry.zIndex);
+        }
+        if (entry.foundryMapIdentity) {
+            builder = builder.metadata({
+                [FOUNDRY_MAP_IDENTITY_KEY]: entry.foundryMapIdentity,
+            });
         }
         return builder.build();
     });
@@ -3761,6 +3811,173 @@ async function addItemsInBatches(items: Item[], batchSize: number): Promise<void
             await new Promise(resolve => setTimeout(resolve, 250));
         }
     }
+}
+
+export type FoundryLogicalMapImportOptions = {
+    scope?: "selected-map" | "full-scene";
+    includeWalls?: boolean;
+    includeDrawings?: boolean;
+    lightOptions?: LightImportOptions;
+    anchorLayer?: FoundryLogicalMap["primaryLayer"];
+};
+
+export type FoundryLogicalMapImportResult = {
+    logicalMapId: string;
+    logicalMapLabel: string;
+    wallCount: number;
+    doorCount: number;
+    lightCount: number;
+    drawingItemCount: number;
+};
+
+function rotateFogPathsOntoImage(
+    items: Item[],
+    imagePosition: Vector2,
+    rotation: number
+): Item[] {
+    const normalizedRotation = normalizeDegrees(rotation);
+    if (normalizedRotation === 0) return items;
+    return items.map((item) => {
+        const pathItem = item as Item & { commands?: Array<Array<number>> };
+        if (item.layer !== "FOG" || !Array.isArray(pathItem.commands)) {
+            return applyMapRotationToImportedItems(
+                [item],
+                imagePosition,
+                normalizedRotation
+            )[0];
+        }
+        const itemPosition = item.position ?? imagePosition;
+        const commands = pathItem.commands.map((command) => {
+            if (!Array.isArray(command) || command.length < 3) return command;
+            const next = [...command];
+            for (let index = 1; index + 1 < next.length; index += 2) {
+                const x = next[index];
+                const y = next[index + 1];
+                if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+                const rotated = rotatePointAroundOrigin(
+                    { x: itemPosition.x + x, y: itemPosition.y + y },
+                    imagePosition,
+                    normalizedRotation
+                );
+                next[index] = rotated.x;
+                next[index + 1] = rotated.y;
+            }
+            return next;
+        });
+        return {
+            ...item,
+            position: { x: 0, y: 0 },
+            rotation: 0,
+            commands,
+        };
+    });
+}
+
+export async function addFoundryLogicalMapToExistingMap(
+    foundryData: FoundryVTTData,
+    logicalMap: FoundryLogicalMap,
+    anchorMapId: string,
+    options: FoundryLogicalMapImportOptions = {}
+): Promise<FoundryLogicalMapImportResult> {
+    if (!await OBR.scene.isReady()) {
+        throw new Error("Scene is not ready. Please wait for the scene to finish loading.");
+    }
+    const anchorId = anchorMapId.trim();
+    if (!anchorId) {
+        throw new Error("No selected OBR map was provided.");
+    }
+    const anchorItems = await OBR.scene.items.getItems([anchorId]);
+    const anchorItem = anchorItems[0] as Item & {
+        image?: { width?: unknown; height?: unknown };
+        grid?: { dpi?: unknown };
+    };
+    if (!anchorItem || anchorItem.layer !== "MAP") {
+        throw new Error("The selected OBR map is no longer available.");
+    }
+    const imageWidth = Number(anchorItem.image?.width);
+    const imageHeight = Number(anchorItem.image?.height);
+    const imageDpi = Number(anchorItem.grid?.dpi);
+    if (
+        !Number.isFinite(imageWidth) || imageWidth <= 0 ||
+        !Number.isFinite(imageHeight) || imageHeight <= 0 ||
+        !Number.isFinite(imageDpi) || imageDpi <= 0
+    ) {
+        throw new Error("The selected OBR item does not contain usable map dimensions.");
+    }
+
+    const scope = options.scope ?? "selected-map";
+    const selectedData = selectFoundryLogicalMapFeatures(
+        foundryData,
+        logicalMap,
+        scope
+    );
+    const anchorLayer =
+        options.anchorLayer && logicalMap.layers.some((layer) => layer.id === options.anchorLayer?.id)
+            ? options.anchorLayer
+            : logicalMap.primaryLayer;
+    const processedData = convertFoundryToVTTData(selectedData, {
+        origin: {
+            x: anchorLayer.footprint.x,
+            y: anchorLayer.footprint.y,
+        },
+        mapSizePixels: {
+            x: anchorLayer.footprint.width,
+            y: anchorLayer.footprint.height,
+        },
+        sourceRotation: anchorLayer.footprint.rotation,
+    });
+    const targetDpi = await OBR.scene.grid.getDpi();
+    const anchorScale = anchorItem.scale ?? { x: 1, y: 1 };
+    const renderedWidth = (imageWidth * targetDpi / imageDpi) * anchorScale.x;
+    const renderedHeight = (imageHeight * targetDpi / imageDpi) * anchorScale.y;
+    const sourceWidth = anchorLayer.footprint.width;
+    const sourceHeight = anchorLayer.footprint.height;
+    const sourceGridSize = processedData.resolution.pixels_per_grid;
+    const importScale = {
+        x: (renderedWidth / sourceWidth) * (sourceGridSize / targetDpi),
+        y: (renderedHeight / sourceHeight) * (sourceGridSize / targetDpi),
+    };
+    const includeWalls = options.includeWalls ?? true;
+    const includeDrawings = options.includeDrawings ?? true;
+    const includeLights = options.lightOptions?.includeLights ?? true;
+    const position = anchorItem.position;
+    const wallItems = includeWalls
+        ? await createWallItems(processedData, position, importScale, targetDpi)
+        : [];
+    const doorItems = includeWalls
+        ? await createDoorItems(processedData, position, importScale, targetDpi)
+        : [];
+    const lightItems = includeLights
+        ? await createLightItems(
+            processedData,
+            position,
+            importScale,
+            targetDpi,
+            options.lightOptions
+        )
+        : [];
+    const drawingItems = includeDrawings
+        ? await createDrawingItems(processedData, position, importScale, targetDpi)
+        : [];
+    const allItems = rotateFogPathsOntoImage(
+        [...wallItems, ...doorItems, ...lightItems, ...drawingItems],
+        position,
+        anchorItem.rotation
+    );
+    if (allItems.length > 0) {
+        await addItemsInBatches(allItems, BATCH_SIZE);
+        if (wallItems.length > 0 || doorItems.length > 0 || lightItems.length > 0) {
+            await OBR.scene.fog.setFilled(true);
+        }
+    }
+    return {
+        logicalMapId: logicalMap.id,
+        logicalMapLabel: logicalMap.label,
+        wallCount: wallItems.length,
+        doorCount: doorItems.length,
+        lightCount: lightItems.length,
+        drawingItemCount: drawingItems.length,
+    };
 }
 
 export async function addItemsFromData(

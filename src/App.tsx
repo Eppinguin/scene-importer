@@ -9,6 +9,7 @@ import {
   extractImageFromZip,
   addMapsToCurrentScene,
   addWallsToCurrentSceneWithLayout,
+  addFoundryLogicalMapToExistingMap,
   createSceneWithMultipleMaps,
   MapSelectionPendingError,
   type MapWorkflowResult,
@@ -59,6 +60,11 @@ import {
   type FoundryGroupedFolderNode,
   type FoundrySceneGroupingItem,
 } from "./foundrySceneGrouping";
+import {
+  buildFoundryScenePlan,
+  type FoundryLogicalMap,
+} from "./foundryScenePlan";
+import type { FoundryMapIdentity } from "./foundryMapMetadata";
 import type { FoundryVTTData, VTTMapData } from "./vttTypes";
 
 type SceneData = (FoundryVTTData | VTTMapData) & {
@@ -93,6 +99,7 @@ type PairedImportSelection = {
 
 type PendingMapSelectionAction = "add-current" | "multi-scene";
 type CompanionWallData = FoundryVTTData | VTTMapData;
+type ContextMultiMapImportMode = "selected-only" | "full-rooted";
 type MapWorkflowRunOptions = {
   forceSelectionPrompt?: boolean;
   resetSelectionCache?: boolean;
@@ -158,6 +165,30 @@ const getSceneMapSources = (
     return [];
   }
   return getFoundrySceneMapSources(sceneData);
+};
+
+const buildFoundryMapSourceKey = (
+  scene: SceneInfo,
+  mapPath: string,
+  index: number,
+): string => {
+  const sceneId =
+    typeof scene.data._id === "string" && scene.data._id.trim().length > 0
+      ? scene.data._id.trim()
+      : (scene.name || "scene").trim().toLowerCase();
+  return `${sceneId}::${index}::${mapPath.trim()}`;
+};
+
+const normalizeAnchorMatchName = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/\.[^/.]+$/, "")
+    .replace(/[_\s-]+/g, "")
+    .trim();
+
+const getMapPathBaseName = (path: string): string => {
+  const segments = path.trim().split("/");
+  return segments[segments.length - 1] || path;
 };
 
 const getSceneFolderId = (sceneData: SceneData): string | null => {
@@ -321,8 +352,14 @@ const hashMapSourceSignature = (value: string): string => {
 };
 
 function App() {
-  const isContextMenuMode =
-    new URLSearchParams(window.location.search).get("context") === "true";
+  const queryParams = new URLSearchParams(window.location.search);
+  const isContextMenuMode = queryParams.get("context") === "true";
+  const contextAnchorMapId = queryParams.get("anchorMapId")?.trim() || "";
+  const contextAnchorMapName = queryParams.get("anchorMapName")?.trim() || "";
+  const contextAnchorSceneId = queryParams.get("anchorSceneId")?.trim() || "";
+  const contextAnchorLogicalMapId =
+    queryParams.get("anchorLogicalMapId")?.trim() || "";
+  const contextAnchorLayerId = queryParams.get("anchorLayerId")?.trim() || "";
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedWallDataFile, setSelectedWallDataFile] = useState<File | null>(
     null,
@@ -367,6 +404,9 @@ function App() {
   const [lockImportedMaps, setLockImportedMaps] = useState(true);
   const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
   const [multiSceneName, setMultiSceneName] = useState("Multi Map Scene");
+  const [contextMultiMapImportMode, setContextMultiMapImportMode] =
+    useState<ContextMultiMapImportMode>("selected-only");
+  const [contextLogicalMapId, setContextLogicalMapId] = useState("");
   const [pendingMapSelection, setPendingMapSelection] = useState<{
     token: string;
     action: PendingMapSelectionAction;
@@ -475,6 +515,116 @@ function App() {
   const selectedScenes = selectedSceneIndexes
     .map((idx) => availableScenes[idx])
     .filter((scene): scene is SceneInfo => !!scene);
+  const selectedContextScene = isContextMenuMode
+    ? availableScenes[selectedSceneIndex]
+    : undefined;
+  const contextFoundryPlan = useMemo(() => {
+    if (!isContextMenuMode || !selectedContextScene) return null;
+    if (!isFoundryVTTData(selectedContextScene.data)) return null;
+    return buildFoundryScenePlan(selectedContextScene.data);
+  }, [isContextMenuMode, selectedContextScene]);
+  const contextLogicalMapOptions = useMemo(() => {
+    const maps = contextFoundryPlan?.maps ?? [];
+    const normalizedAnchorName = normalizeAnchorMatchName(contextAnchorMapName);
+    return maps.map((map) => {
+      const normalizedLabel = normalizeAnchorMatchName(map.label);
+      const normalizedTerms = map.matchTerms
+        .map(normalizeAnchorMatchName)
+        .filter(Boolean);
+      let matchScore = 0;
+      if (normalizedAnchorName) {
+        if (normalizedLabel === normalizedAnchorName) matchScore = 5;
+        else if (normalizedTerms.includes(normalizedAnchorName)) matchScore = 4;
+        else if (
+          normalizedTerms.some(
+            (term) =>
+              term.includes(normalizedAnchorName) ||
+              normalizedAnchorName.includes(term),
+          )
+        ) {
+          matchScore = 2;
+        }
+      }
+      return {
+        id: map.id,
+        label: map.label,
+        detail: `${map.wallIndexes.length} wall/door segment(s) · ${map.layers.length} image layer(s)`,
+        matchScore,
+        map,
+      };
+    });
+  }, [contextAnchorMapName, contextFoundryPlan]);
+  const contextRecommendedLogicalMapId = useMemo(() => {
+    if (contextLogicalMapOptions.length === 0) return "";
+    if (
+      contextFoundryPlan &&
+      contextAnchorSceneId === contextFoundryPlan.sceneId &&
+      contextLogicalMapOptions.some(
+        (option) => option.id === contextAnchorLogicalMapId,
+      )
+    ) {
+      return contextAnchorLogicalMapId;
+    }
+    if (contextLogicalMapOptions.length === 1) {
+      return contextLogicalMapOptions[0].id;
+    }
+    const highestScore = Math.max(
+      ...contextLogicalMapOptions.map((option) => option.matchScore),
+    );
+    if (highestScore <= 0) return "";
+    const bestMatches = contextLogicalMapOptions.filter(
+      (option) => option.matchScore === highestScore,
+    );
+    return bestMatches.length === 1 ? bestMatches[0].id : "";
+  }, [
+    contextAnchorLogicalMapId,
+    contextAnchorSceneId,
+    contextFoundryPlan,
+    contextLogicalMapOptions,
+  ]);
+  const resolvedContextLogicalMapId =
+    contextLogicalMapOptions.some((option) => option.id === contextLogicalMapId)
+      ? contextLogicalMapId
+      : contextRecommendedLogicalMapId;
+  const resolvedContextLogicalMap: FoundryLogicalMap | undefined =
+    contextLogicalMapOptions.find(
+      (option) => option.id === resolvedContextLogicalMapId,
+    )?.map;
+  const resolvedContextAnchorLayer = useMemo(() => {
+    if (!resolvedContextLogicalMap) return undefined;
+    if (
+      contextFoundryPlan &&
+      contextAnchorSceneId === contextFoundryPlan.sceneId &&
+      contextAnchorLogicalMapId === resolvedContextLogicalMap.id
+    ) {
+      const metadataLayer = resolvedContextLogicalMap.layers.find(
+        (layer) => layer.id === contextAnchorLayerId,
+      );
+      if (metadataLayer) return metadataLayer;
+    }
+
+    const normalizedAnchorName = normalizeAnchorMatchName(contextAnchorMapName);
+    if (normalizedAnchorName) {
+      const matchingLayer = resolvedContextLogicalMap.layers.find((layer) =>
+        [layer.path, getMapPathBaseName(layer.path)].some(
+          (term) => normalizeAnchorMatchName(term) === normalizedAnchorName,
+        ),
+      );
+      if (matchingLayer) return matchingLayer;
+    }
+    return resolvedContextLogicalMap.primaryLayer;
+  }, [
+    contextAnchorLayerId,
+    contextAnchorLogicalMapId,
+    contextAnchorMapName,
+    contextAnchorSceneId,
+    contextFoundryPlan,
+    resolvedContextLogicalMap,
+  ]);
+  const contextHasMultiMapScene =
+    isContextMenuMode && contextLogicalMapOptions.length > 1;
+  const contextNeedsLogicalMapChoice =
+    contextHasMultiMapScene && !resolvedContextLogicalMapId;
   const sceneGroupingItems = useMemo<FoundrySceneGroupingItem[]>(
     () =>
       availableScenes.map((scene, index) => ({
@@ -1029,6 +1179,14 @@ function App() {
       setSelectedSceneIndex(selectedSceneIndices[0]);
     }
   }, [selectedSceneIndices, selectedSceneIndex]);
+
+  useEffect(() => {
+    if (!contextLogicalMapId) return;
+    const currentSelectionIsValid = contextLogicalMapOptions.some(
+      (option) => option.id === contextLogicalMapId,
+    );
+    if (!currentSelectionIsValid) setContextLogicalMapId("");
+  }, [contextLogicalMapId, contextLogicalMapOptions]);
 
   useEffect(() => {
     if (availableScenes.length !== 0) return;
@@ -1978,6 +2136,7 @@ function App() {
       if (!isFoundryVTTData(scene.data)) continue;
       const wallData = convertFoundryToVTTData(scene.data);
       const mapSources = getSceneMapSources(scene.data);
+      const foundryPlan = buildFoundryScenePlan(scene.data);
       for (let index = 0; index < mapSources.length; index++) {
         const mapSource = mapSources[index];
         const mapPath = mapSource.path;
@@ -1992,12 +2151,25 @@ function App() {
             mapSources.length > 1
               ? `${scene.name || "Map"} (${index + 1})`
               : scene.name || "Map";
+          const logicalMap = foundryPlan.maps.find((candidate) =>
+            candidate.layers.some((layer) => layer.id === mapSource.id),
+          );
+          const foundryMapIdentity: FoundryMapIdentity | undefined = logicalMap
+            ? {
+                version: 1,
+                sceneId: foundryPlan.sceneId,
+                logicalMapId: logicalMap.id,
+                layerId: mapSource.id,
+              }
+            : undefined;
           sources.push({
             name: mapName,
             mediaBlob,
             dpi: wallData.resolution.pixels_per_grid,
             wallData: index === 0 ? wallData : undefined,
+            sourceKey: buildFoundryMapSourceKey(scene, mapPath, index),
             sourceSceneName: scene.name || "Scene",
+            foundryMapIdentity,
             mapPlacement: mapSource.placement,
           });
         } catch (error) {
@@ -2588,10 +2760,90 @@ function App() {
       await OBR.notification.show(noFogDataMessage, "INFO");
       return;
     }
+    const shouldUseContextFoundryLogicalMap =
+      isContextMenuMode &&
+      !!selectedContextScene &&
+      !!contextFoundryPlan &&
+      contextFoundryPlan.maps.length > 0;
+    if (shouldUseContextFoundryLogicalMap) {
+      if (!contextAnchorMapId) {
+        await OBR.notification.show(
+          "No anchor map was provided. Re-open Import Walls from the target map and try again.",
+          "ERROR",
+        );
+        return;
+      }
+      if (!resolvedContextLogicalMap) {
+        await OBR.notification.show(
+          "Choose which Foundry map matches the selected OBR map.",
+          "ERROR",
+        );
+        return;
+      }
+    }
 
     setIsLoading(true);
     try {
-      if (!isContextMenuMode && hasMapWorkflowSources) {
+      if (
+        shouldUseContextFoundryLogicalMap &&
+        selectedContextScene &&
+        contextFoundryPlan &&
+        resolvedContextLogicalMap
+      ) {
+        const result = await addFoundryLogicalMapToExistingMap(
+          selectedContextScene.data as FoundryVTTData,
+          resolvedContextLogicalMap,
+          contextAnchorMapId,
+          {
+            scope:
+              contextMultiMapImportMode === "full-rooted"
+                ? "full-scene"
+                : "selected-map",
+            includeWalls: includeWallsWithMaps,
+            includeDrawings: includeImportedDrawings,
+            lightOptions: buildLightImportOptions(),
+            anchorLayer: resolvedContextAnchorLayer,
+          },
+        );
+        const importedCount =
+          result.wallCount +
+          result.doorCount +
+          result.lightCount +
+          result.drawingItemCount;
+        if (importedCount === 0) {
+          await OBR.notification.show(
+            `No enabled scene features were found for ${result.logicalMapLabel}.`,
+            "INFO",
+          );
+        } else {
+          const scopeLabel =
+            contextMultiMapImportMode === "full-rooted"
+              ? "the full Foundry scene"
+              : result.logicalMapLabel;
+          await OBR.notification.show(
+            `Imported ${importedCount} scene item(s) from ${scopeLabel}.`,
+            "SUCCESS",
+          );
+        }
+        if (contextMultiMapImportMode === "selected-only") {
+          const ambiguousCount =
+            (includeWallsWithMaps
+              ? resolvedContextLogicalMap.ambiguousWallIndexes.length
+              : 0) +
+            (includeImportedLights
+              ? resolvedContextLogicalMap.ambiguousLightIndexes.length
+              : 0) +
+            (includeImportedDrawings
+              ? resolvedContextLogicalMap.ambiguousDrawingIndexes.length
+              : 0);
+          if (ambiguousCount > 0) {
+            await OBR.notification.show(
+              `Skipped ${ambiguousCount} scene feature(s) that overlap this map and another map. Nothing uncertain was imported.`,
+              "WARNING",
+            );
+          }
+        }
+      } else if (!isContextMenuMode && hasMapWorkflowSources) {
         const sources = await buildMapImportSources();
         const result = await addWallsToCurrentSceneWithLayout(sources, {
           layout: layoutMode,
@@ -3220,6 +3472,47 @@ function App() {
                 </div>
               </Box>
             )}
+
+            {isContextMenuMode && contextNeedsLogicalMapChoice && (
+              <Box className="options notice-card">
+                <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
+                  Which map is already on the table?
+                </Typography>
+                <Typography variant="body2" className="notice-text">
+                  This Foundry scene contains several maps and the selected OBR
+                  map could not be identified safely. Choose the matching map;
+                  its composed image layers are handled automatically.
+                </Typography>
+                <FormControl fullWidth size="small">
+                  <InputLabel id="context-logical-map-label">
+                    Foundry map
+                  </InputLabel>
+                  <Select
+                    labelId="context-logical-map-label"
+                    label="Foundry map"
+                    value={contextLogicalMapId}
+                    onChange={(event) =>
+                      setContextLogicalMapId(event.target.value as string)
+                    }
+                    disabled={isLoading}>
+                    {contextLogicalMapOptions.map((option) => (
+                      <MenuItem key={option.id} value={option.id}>
+                        <Box
+                          sx={{ display: "flex", flexDirection: "column" }}>
+                          <Typography variant="body2">
+                            {option.label}
+                          </Typography>
+                          <Typography variant="caption" sx={{ opacity: 0.75 }}>
+                            {option.detail}
+                          </Typography>
+                        </Box>
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+              </Box>
+            )}
+
           </Stack>
 
           {hoveredSceneThumb && (
@@ -3437,6 +3730,47 @@ function App() {
                             />
                           )}
                         </Box>
+                      </Box>
+                    )}
+
+                    {isContextMenuMode && contextHasMultiMapScene && (
+                      <Box className="advanced-option-group">
+                        <Typography
+                          variant="caption"
+                          className="advanced-option-group-heading">
+                          Context multi-map behavior
+                        </Typography>
+                        <Stack spacing={0.8}>
+                          <FormControl fullWidth size="small">
+                            <InputLabel id="context-multi-map-mode-label">
+                              Import mode
+                            </InputLabel>
+                            <Select
+                              labelId="context-multi-map-mode-label"
+                              label="Import mode"
+                              value={contextMultiMapImportMode}
+                              onChange={(event) =>
+                                setContextMultiMapImportMode(
+                                  event.target
+                                    .value as ContextMultiMapImportMode,
+                                )
+                              }
+                              disabled={isLoading}>
+                              <MenuItem value="selected-only">
+                                Selected map only (default)
+                              </MenuItem>
+                              <MenuItem value="full-rooted">
+                                Entire Foundry scene aligned here
+                              </MenuItem>
+                            </Select>
+                          </FormControl>
+                          <Typography variant="caption" className="help-text">
+                            The default imports only features belonging to the
+                            matching map. The entire-scene option preserves all
+                            Foundry positions using this map as the alignment
+                            root.
+                          </Typography>
+                        </Stack>
                       </Box>
                     )}
 
@@ -3959,16 +4293,25 @@ function App() {
                     (!includeWallsWithMaps &&
                       !includeImportedDrawings &&
                       !includeImportedLights) ||
+                    (!!contextFoundryPlan &&
+                      contextFoundryPlan.maps.length > 0 &&
+                      (!contextAnchorMapId || !resolvedContextLogicalMapId)) ||
                     (availableScenes.length > 0 &&
                       !selectedSceneHasEnabledFogData)
                   }>
                   {isLoading
                     ? "Uploading..."
+                    : !!contextFoundryPlan &&
+                        contextFoundryPlan.maps.length > 0 &&
+                        !contextAnchorMapId
+                      ? "Re-open From Target Map"
+                    : contextNeedsLogicalMapChoice
+                      ? "Choose Matching Map"
                     : !includeWallsWithMaps &&
                         !includeImportedDrawings &&
                         !includeImportedLights
                       ? "Enable Walls/Doors, Drawings, or Lights"
-                      : availableScenes.length > 0 &&
+                    : availableScenes.length > 0 &&
                           !selectedSceneHasEnabledFogData
                         ? includeWallsWithMaps &&
                           includeImportedDrawings &&
@@ -3985,6 +4328,9 @@ function App() {
                                   : includeImportedDrawings
                                     ? "No Drawings In Selected Scene"
                                     : "No Lights In Selected Scene"
+                        : contextHasMultiMapScene &&
+                            contextMultiMapImportMode === "full-rooted"
+                          ? "Import Entire Scene"
                         : "Import to Selected Map"}
                 </Button>
               </>

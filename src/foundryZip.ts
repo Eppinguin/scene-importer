@@ -54,6 +54,9 @@ export type FoundryZipExtractionResult = {
 };
 
 export type FoundrySceneMapSource = {
+  id: string;
+  kind: "background" | "tile";
+  sourceIndex: number;
   path: string;
   placement?: {
     x?: number;
@@ -164,6 +167,9 @@ export const getFoundrySceneMapSources = (
   for (const path of primaryPaths) {
     if (!path) continue;
     addSource({
+      id: `background:${path}`,
+      kind: "background",
+      sourceIndex: -1,
       path,
       placement: {
         x: offsetX,
@@ -184,6 +190,7 @@ export const getFoundrySceneMapSources = (
     if (!path) continue;
 
     const placementSource = tile as {
+      _id?: unknown;
       x?: unknown;
       y?: unknown;
       z?: unknown;
@@ -198,6 +205,12 @@ export const getFoundrySceneMapSources = (
       };
     };
     addSource({
+      id:
+        typeof placementSource._id === "string" && placementSource._id.trim()
+          ? placementSource._id.trim()
+          : `tile:${tileIndex}:${path}`,
+      kind: "tile",
+      sourceIndex: tileIndex,
       path,
       placement: {
         x: toFiniteOrUndefined(placementSource.x),
