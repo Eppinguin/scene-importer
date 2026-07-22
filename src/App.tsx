@@ -518,11 +518,20 @@ function App() {
   const selectedContextScene = isContextMenuMode
     ? availableScenes[selectedSceneIndex]
     : undefined;
+  const contextFoundrySceneData = useMemo(() => {
+    if (!isContextMenuMode) return null;
+    if (
+      selectedContextScene &&
+      isFoundryVTTData(selectedContextScene.data)
+    ) {
+      return selectedContextScene.data;
+    }
+    return isFoundryVTTData(selectedWallData) ? selectedWallData : null;
+  }, [isContextMenuMode, selectedContextScene, selectedWallData]);
   const contextFoundryPlan = useMemo(() => {
-    if (!isContextMenuMode || !selectedContextScene) return null;
-    if (!isFoundryVTTData(selectedContextScene.data)) return null;
-    return buildFoundryScenePlan(selectedContextScene.data);
-  }, [isContextMenuMode, selectedContextScene]);
+    if (!contextFoundrySceneData) return null;
+    return buildFoundryScenePlan(contextFoundrySceneData);
+  }, [contextFoundrySceneData]);
   const contextLogicalMapOptions = useMemo(() => {
     const maps = contextFoundryPlan?.maps ?? [];
     const normalizedAnchorName = normalizeAnchorMatchName(contextAnchorMapName);
@@ -1543,7 +1552,9 @@ function App() {
 
     setSelectedFile(fileObj);
     setSelectedWallDataFile(null);
-    setSelectedWallData(null);
+    setSelectedWallData(
+      foundryFormat ? (fileData as FoundryVTTData) : null,
+    );
     setSelectedRawFiles([]);
     setSelectedPairedImports([]);
     setAvailableScenes([]);
@@ -2041,10 +2052,9 @@ function App() {
       preferredCodec: preferredVideoCodec,
       keepAudio: !removeVideoAudio,
       forceTranscodeUnderLimit: forceVideoTranscode,
-      ...(abortSignal ? { abortSignal } : {}),
+      ...(abortSignal && { abortSignal }),
       ...(Number.isFinite(parsedMaxDimension) && parsedMaxDimension > 0
-        ? { maxDimension: parsedMaxDimension }
-        : {}),
+        && { maxDimension: parsedMaxDimension }),
     };
   };
 
@@ -2762,7 +2772,7 @@ function App() {
     }
     const shouldUseContextFoundryLogicalMap =
       isContextMenuMode &&
-      !!selectedContextScene &&
+      !!contextFoundrySceneData &&
       !!contextFoundryPlan &&
       contextFoundryPlan.maps.length > 0;
     if (shouldUseContextFoundryLogicalMap) {
@@ -2786,12 +2796,12 @@ function App() {
     try {
       if (
         shouldUseContextFoundryLogicalMap &&
-        selectedContextScene &&
+        contextFoundrySceneData &&
         contextFoundryPlan &&
         resolvedContextLogicalMap
       ) {
         const result = await addFoundryLogicalMapToExistingMap(
-          selectedContextScene.data as FoundryVTTData,
+          contextFoundrySceneData,
           resolvedContextLogicalMap,
           contextAnchorMapId,
           {

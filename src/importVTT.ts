@@ -7,7 +7,7 @@ import OBR, {
     type Item,
     type Vector2
 } from "@owlbear-rodeo/sdk";
-import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTWall, type FoundryVTTLight, type FoundryVTTDrawing, type VTTDrawing } from "./vttTypes";
+import { type VTTMapData, type UniversalVTT, type FoundryVTTData, type FoundryVTTDrawing, type VTTDrawing } from "./vttTypes";
 import { createWallItems, createDoorItems, createLightItems, createDrawingItems, type LightImportOptions } from "./vttItems";
 import {
     selectFoundryLogicalMapFeatures,
@@ -17,6 +17,11 @@ import {
     FOUNDRY_MAP_IDENTITY_KEY,
     type FoundryMapIdentity,
 } from "./foundryMapMetadata";
+import {
+    isFoundryVTTData,
+    isUniversalVTTData,
+} from "./vttGuards";
+export { hasMapImage, isFoundryVTTData, isUniversalVTTData } from "./vttGuards";
 export type { LightImportOptions } from "./vttItems";
 
 type VTTData = VTTMapData;
@@ -26,49 +31,6 @@ import JSZip from 'jszip';
 const DEFAULT_NEW_SCENE_GRID_DPI = 150;
 const DYNAMIC_FOG_LIGHT_KEY = "rodeo.owlbear.dynamic-fog/light";
 const CHROMODYNAMIC_LIGHT_KEY = "com.desain.chromodynamic/light";
-
-export function isFoundryVTTData(data: unknown): data is FoundryVTTData {
-    const d = data as Partial<FoundryVTTData>;
-    const hasNumericGrid = typeof d.grid === 'number';
-    const hasGridObject = typeof d.grid === 'object' && d.grid !== null && 'size' in d.grid;
-    const isSceneReferenceId = (value: unknown): value is string =>
-        typeof value === 'string' && value.trim().length > 0;
-    const isWallObject = (value: unknown): value is Partial<FoundryVTTWall> =>
-        typeof value === 'object'
-        && value !== null
-        && Array.isArray((value as Partial<FoundryVTTWall>).c)
-        && (value as Partial<FoundryVTTWall>).c!.length === 4;
-    const isLightObject = (value: unknown): value is Partial<FoundryVTTLight> =>
-        typeof value === 'object' && value !== null;
-    const hasValidWalls = d.walls === undefined || (
-        Array.isArray(d.walls)
-        && d.walls.every((w: unknown) =>
-            isSceneReferenceId(w) || isWallObject(w))
-    );
-    const hasValidLights = d.lights === undefined || (
-        Array.isArray(d.lights)
-        && d.lights.every((light: unknown) => isSceneReferenceId(light) || isLightObject(light))
-    );
-    return !!d
-        && typeof d.width === 'number'
-        && typeof d.height === 'number'
-        && (hasNumericGrid || hasGridObject)
-        && hasValidWalls
-        && hasValidLights;
-}
-
-export function isUniversalVTTData(data: unknown): data is UniversalVTT {
-    const d = data as Partial<UniversalVTT>;
-    return !!d
-        && typeof d.format === 'number'
-        && !!d.resolution
-        && (Array.isArray(d.line_of_sight) || Array.isArray(d.objects_line_of_sight) || Array.isArray(d.lights));
-}
-
-// Helper function to detect if VTT data contains an image
-export function hasMapImage(data: unknown): boolean {
-    return !!(data && typeof data === 'object' && 'image' in data && (data as { image?: string }).image);
-}
 
 function normalizeFoundryColor(value: unknown, fallback: string): string {
     if (typeof value === 'string') {
@@ -1800,7 +1762,7 @@ async function compressVideo(
                         keyFrameInterval: codecDefaultsForPass.keyFrameIntervalSeconds,
                         hardwareAcceleration,
                         forceTranscode: true,
-                        ...(resizeConfig ?? {}),
+                        ...resizeConfig,
                     },
                     audio: options.keepAudio === false ? { discard: true } : undefined,
                 });
@@ -2151,7 +2113,7 @@ function applyMapRotationToImportedItems(
                 [DYNAMIC_FOG_LIGHT_KEY]: adjustedDynamicFogLight,
                 ...(adjustedChromodynamic
                     ? { [CHROMODYNAMIC_LIGHT_KEY]: adjustedChromodynamic }
-                    : {}),
+                    : undefined),
             };
         }
 

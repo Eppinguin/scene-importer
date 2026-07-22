@@ -1,5 +1,5 @@
 import JSZip from "jszip";
-import { isFoundryVTTData } from "./importVTT";
+import { isFoundryVTTData } from "./vttGuards";
 import {
   extractFoldersFromLevelDB,
   extractScenesFromAdventureLevelDB,
