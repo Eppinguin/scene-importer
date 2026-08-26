@@ -7,7 +7,6 @@ icon: https://scene-importer.pages.dev/Logo.webp
 tags:
   - tool
   - fog
-  - other
 manifest: https://scene-importer.pages.dev/manifest.json
 learn-more: https://github.com/Eppinguin/scene-importer
 ---
